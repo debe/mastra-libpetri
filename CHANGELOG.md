@@ -7,6 +7,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The orchestrator core: a compiler and a kernel.** `compile()` turns a workflow description
+  into one Coloured Time Petri Net and `runWorkflow()` runs it to quiescence. The chain is the
+  arcs, not a loop in the engine: entry *i* owns an input place and its transition produces into
+  entry *i+1*'s place, or into `wf.done` for the last. Every run transition declares
+  `xor(success, failure)`, so a failing step deposits a token on a declared branch rather than
+  unwinding — and a runner that throws becomes a failed step rather than a lost token, which
+  matters because the executor consumes inputs before the action runs and does not restore them
+  ([EXEC-031]). `.sleep` compiles to `delayed` and `.sleepUntil` to `exact`; neither emits a
+  hard bound, because a restore starts every clock fresh ([CORE-073]) and an upper bound would
+  receive a fresh full budget. Measured: `deadlockFree` and `terminatesAtSink` both **proven**
+  via the SMT route on a four-entry chain, and a 60-second `.sleep` elapsing in virtual time
+  with two executors in one process on independent clocks ([TIME-015]).
 - **Repository scaffold.** TypeScript package, CI, the decision records, the divergence
   register, the requirement mapping and the milestone tracker. The toolchain is green end to
   end (`npm run check && npm test && npm run build`), with two gates that fail loudly rather

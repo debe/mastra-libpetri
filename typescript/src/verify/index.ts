@@ -1,2 +1,2 @@
-/** @packageDocumentation verify — see the root README for the architecture. */
-export {};
+export { verifyWorkflow, describeReport } from './properties.js';
+export type { PropertyReport, VerifyOptions } from './properties.js';

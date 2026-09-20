@@ -20,12 +20,26 @@
       `PrecompiledNetExecutor` and asserts the token moved
 
 ## M1 — Compiler, Mastra bootstrap, seam confirmation
-- [ ] Track A: `src/compiler` — `StepFlowEntry[]` -> one net. Per-step gadget as a `SubnetDef`
-      instantiated at the entry's positional path; join gadget; inclusive-branch routing with
-      the split threshold; loop gadget with a bounded iteration place; foreach with permits and
-      ν-minting; sleep/sleepUntil timing; mapping/agent/tool entries; one naming vocabulary with
-      a global-uniqueness assertion; `NetMap` (transition<->entry, place<->(entry,port));
-      structural hash as the compile-cache key; dot export
+- [x] Track A, first slice: the orchestrator core. `src/compiler/{names,types,compile}.ts`
+      emits a linear chain — entry *i* owns an input place, its transition produces into entry
+      *i+1*'s place or into `wf.done`, and every run transition declares `xor(success, failure)`
+      so a failing step deposits a token instead of unwinding. `.sleep` -> `delayed`,
+      `.sleepUntil` -> `exact`; no hard timing on any path that can cross a restore. One naming
+      vocabulary with a global-uniqueness assertion (`/` reserved for [MOD-013] prefixes, `.`
+      for our segments), `NetMap`, structural hash over shape and names only.
+      `src/engine/kernel.ts` seeds the entry place, runs to quiescence and classifies the
+      terminal marking — no loop in the engine, ordering from [EXEC-002] alone. Measured:
+      `deadlockFree` and `terminatesAtSink` both **proven via the SMT route** with Z3 on a
+      4-entry chain (6 places, 7 transitions after xor expansion, 1 P-invariant, 54ms/23ms);
+      a 60s `.sleep` elapses in virtual time with two executors in one process on independent
+      clocks
+- [ ] Track A, remaining: `.parallel` fork/join, `.branch` inclusive routing with the split
+      threshold, `.dowhile`/`.dountil` with a bounded iteration place, `.foreach` with permits
+      and ν-minting, mapping/agent/tool entries, dot export. The parallel join is designed and
+      not yet built: each arm emits into a shared `arrived` place, a high-priority
+      `join.fail` consumes `exactly(n)` arrived plus one `err` with a reset arc on `err`, and
+      `join.ok` consumes `exactly(n)` arrived under an inhibitor on `err` — the budget/fallback
+      idiom applied to a join, so a failing arm cannot strand its siblings
 - [ ] Track A: assert the instantiate -> fuse -> re-instantiate round-trip. Depth is
       unconstrained now that [MOD-031] is fixed, but it is the shape nested workflows take and
       a regression there is silent token loss rather than a build error

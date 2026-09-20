@@ -1,2 +1,2 @@
-/** @packageDocumentation engine — see the root README for the architecture. */
-export {};
+export { runWorkflow, classify } from './kernel.js';
+export type { RunOptions, RunOutcome } from './kernel.js';
