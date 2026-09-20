@@ -7,6 +7,35 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The four composite combinators compile.** `.parallel`, `.branch`, `.dowhile`/`.dountil` and
+  `.foreach` each became a gadget against a shared contract. Two shapes are worth naming because
+  the obvious version of each is wrong. A parallel arm deposits an arrival marker whether it
+  succeeded or failed, so an early failure cannot strand siblings that are still in flight; a
+  remembered `errSeen` marker plus an inhibitor decides the join's outcome structurally rather
+  than inside an action the verifier cannot see. And `.branch` is compiled as **inclusive** —
+  Mastra evaluates every condition concurrently and runs every truthy arm
+  (`handlers/control-flow.ts:396,540`) — so it is *n* independent per-arm `xor(run, skip)` gates,
+  not an exclusive choice. Measured: `deadlockFree` and `terminatesAtSink` proven across 30+
+  shapes, and mutation-tested for non-vacuity — removing the join inhibitor, the `errSeen` reset
+  or the arrival deposit each flips the verdict to `violated`.
+
+### Fixed
+
+- **A step id of `__proto__` silently discarded that arm's output.** The parallel join assembled
+  its result with `aggregate[id] = value`, and `obj['__proto__'] = v` is a setter call that
+  replaces the object's prototype rather than defining a key. Measured before the fix: the arm's
+  output vanished from `Object.keys`, `hasOwnProperty('__proto__')` was false, and its fields
+  reappeared as inherited properties on every downstream read. Arm ids are arbitrary
+  user-supplied Mastra step ids, so this was reachable input. Assembling through
+  `Object.fromEntries` defines it as an ordinary own key. No proof could have caught it — it
+  lives entirely inside an action, in the half the model does not see.
+- **`classify()` hid stranded tokens behind a terminal.** It checked `wf.failed`, then `wf.done`,
+  and scanned for strays only when neither was marked — so reaching a terminal *and* leaking were
+  never reported together, which is the combination that matters. Measured: six stranded tokens
+  returned as `{status: 'success'}`, with the test asserting that shape passing unchanged. The
+  residue scan now runs first and always, and `residue` appears only when non-empty, so every
+  existing `toEqual({status, output})` assertion became a leak detector without opting in.
+
 - **The orchestrator core: a compiler and a kernel.** `compile()` turns a workflow description
   into one Coloured Time Petri Net and `runWorkflow()` runs it to quiescence. The chain is the
   arcs, not a loop in the engine: entry *i* owns an input place and its transition produces into

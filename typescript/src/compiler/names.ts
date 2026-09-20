@@ -55,6 +55,22 @@ export class NameVocabulary {
     return this.#mint(`t.${pathSegment(path)}.${slug(stepId)}.wake`, `wake of entry ${pathSegment(path)}`);
   }
 
+  /** A place internal to a composite gadget (fork/join scratch, budgets, markers). */
+  entryPlace(path: EntryPath, stepId: string, role: string): string {
+    return this.#mint(
+      `s.${pathSegment(path)}.${slug(stepId)}.${role}`,
+      `${role} of entry ${pathSegment(path)}`,
+    );
+  }
+
+  /** A transition internal to a composite gadget (fork, join, retry, drain). */
+  entryTransition(path: EntryPath, stepId: string, role: string): string {
+    return this.#mint(
+      `t.${pathSegment(path)}.${slug(stepId)}.${role}`,
+      `${role} of entry ${pathSegment(path)}`,
+    );
+  }
+
   /**
    * Registers a name minted elsewhere (the workflow terminals) so the uniqueness check covers
    * the whole net rather than only the generated part.

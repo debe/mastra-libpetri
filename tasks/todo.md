@@ -33,13 +33,30 @@
       4-entry chain (6 places, 7 transitions after xor expansion, 1 P-invariant, 54ms/23ms);
       a 60s `.sleep` elapses in virtual time with two executors in one process on independent
       clocks
-- [ ] Track A, remaining: `.parallel` fork/join, `.branch` inclusive routing with the split
-      threshold, `.dowhile`/`.dountil` with a bounded iteration place, `.foreach` with permits
-      and ν-minting, mapping/agent/tool entries, dot export. The parallel join is designed and
-      not yet built: each arm emits into a shared `arrived` place, a high-priority
-      `join.fail` consumes `exactly(n)` arrived plus one `err` with a reset arc on `err`, and
-      `join.ok` consumes `exactly(n)` arrived under an inhibitor on `err` — the budget/fallback
-      idiom applied to a join, so a failing arm cannot strand its siblings
+- [x] Track A, composite gadgets: `.parallel`, `.branch`, `.dowhile`/`.dountil`, `.foreach`,
+      each in `src/compiler/gadgets/` against a shared `Gadget` contract, each built and then
+      **adversarially verified** by an independent agent. Measured: 162 tests across 15 files,
+      `deadlockFree` and `terminatesAtSink` proven for every gadget across 30+ shapes; no
+      stranded token found in ~80 hand-built executor scenarios that read the full residual
+      marking rather than the classifier's verdict. Non-vacuity was established by mutation for
+      parallel (removing the join inhibitor, the errSeen reset, or the arrival deposit each
+      flips the verdict to `violated`)
+- [x] Two defects found by verification and fixed: an arm id of `__proto__` silently replaced
+      the parallel aggregate's prototype instead of becoming a key, losing that arm's output
+      (`Object.fromEntries` defines it as an own key; regression test added); and `classify()`
+      checked the terminals before scanning for strays, so a run that reached `wf.done` *and*
+      stranded tokens reported a clean success — measured at six stranded tokens reported as
+      success. The scan now runs first and always, and `residue` is present only when non-empty
+      so every existing `toEqual` assertion became a leak detector without opting in
+- [ ] Track A, remaining: mapping/agent/tool entries, dot export, and the `.branch` wide-output
+      split threshold (`and` of k `xor`s flattens to `2^k` under [IO-016])
+- [ ] Known limits recorded, not closed: `foreach` at nested 2x2 returns `unknown` after 123s —
+      a scale limit, excluded from the committed proof and documented there; `placeBound` on its
+      results and faults places is `violated` by design, since item count is dynamic. The `loop`
+      allowance is provable only when seeded at the post-`start` marking
+      (`placeBound(budget, k)` proven, `k-1` violated); proving that `start` deposits exactly
+      `maxIterations` tokens needs an upstream output multiplicity or a `CompiledWorkflow`
+      carrying an initial marking
 - [ ] Track A: assert the instantiate -> fuse -> re-instantiate round-trip. Depth is
       unconstrained now that [MOD-031] is fixed, but it is the shape nested workflows take and
       a regression there is silent token loss rather than a build error
