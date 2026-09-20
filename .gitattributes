@@ -1,0 +1,7 @@
+# Linguist overrides — keep GitHub language stats accurate
+docs/**            linguist-documentation
+spec/**            linguist-documentation
+scripts/**         linguist-documentation
+patches/**         linguist-documentation
+*.svg              linguist-generated
+**/package-lock.json  linguist-generated

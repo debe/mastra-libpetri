@@ -1,0 +1,34 @@
+# Mastra clone (pinned commit; never committed)
+.mastra/
+.mastra-*/
+
+# TypeScript / Node
+node_modules/
+dist/
+*.tsbuildinfo
+*.tgz
+junit*.xml
+coverage/
+
+# Conformance artefacts
+conformance-results/
+
+# Live testbed runtime state
+.testbed/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Agent / harness metadata
+.claude/
+.code-graph/
+
+# Working notes kept out of the repository
+notes/
+
+# `code-graph-mcp adopt` writes a copy of its own instructions wherever it is run; the root
+# CLAUDE.md already carries that section.
+typescript/CLAUDE.md
