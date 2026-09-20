@@ -1,0 +1,22 @@
+# The Mastra tree this repository is developed and measured against.
+#
+# Two independent pins, because the two routes answer different questions.
+#
+# DIST is the published package. It grounds the compiler: @mastra/core ships its own
+# sourcemaps with `sourcesContent`, so `bootstrap-mastra.sh --dist` recovers the ORIGINAL
+# TypeScript of the workflow engine (~11.8k lines across default.ts, execution-engine.ts,
+# workflow.ts and handlers/) without cloning a monorepo. That is the artefact a user of this
+# engine actually runs against, so it is the right thing to compile for.
+#
+# REPO is the git checkout. It is needed only for conformance — running Mastra's own workflow
+# test suite under both engines — because the published package does not ship tests.
+#
+# A figure measured against one is not comparable with one measured against the other, and
+# neither is comparable with a figure measured against a linked libpetri tree.
+MASTRA_DIST_VERSION=1.67.0
+MASTRA_DIST_INTEGRITY=sha512-Z+kVa5SXpZ7c1xrycGOZ8tGFTDAeXYR+6rC8gAKY/m6Ac9dOPDaPCfQRmFHFxAgKIuxDj+bsauFPTnpkl9S4lw==
+MASTRA_DIST_SHASUM=bb0376675420cdb16c552f7fc9c4a1eb65b2acba
+
+# Filled in the first time --repo runs; unset means conformance has not been bootstrapped yet.
+MASTRA_REPO_URL=https://github.com/mastra-ai/mastra.git
+MASTRA_REPO_COMMIT=

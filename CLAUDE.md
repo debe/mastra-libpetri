@@ -62,14 +62,40 @@ unreleased — **TIME-015** (injectable clock), the **MOD-031** place-alias fix,
 uncommitted. npm publishes 6.0.0. The floor becomes `^6.1.0` the day it publishes.
 
 ```bash
-scripts/link-libpetri.sh --check   # verify the link and the pinned revision
-scripts/link-libpetri.sh --unlink  # restore the registry copy before measuring
+scripts/link-libpetri.sh --check       # verify the link; print the provenance line
+scripts/link-libpetri.sh --provenance  # the one line to quote beside any measurement
+scripts/link-libpetri.sh --strict      # as --check, but fail if the sibling tree is dirty
+scripts/link-libpetri.sh --unlink      # restore the registry copy before measuring
 ```
+
+**A revision identifies the linked tree only when that tree is clean, and it usually is not** —
+the [CORE-073] snapshot surface is deliberately uncommitted upstream, so the code that runs is a
+working-tree build no revision names. The pin matching `HEAD` while the build is dirty is a
+*silent* mis-attribution, which is why identity is content-addressed:
+`libpetri <rev>[+dirty] dist=<hash>`. Quote that, not the pin, next to any figure.
 
 `scripts/libpetri-pin` records the sibling revision. `src/internal/libpetri-surface.ts` asserts
 the surface at entry and `tests/upstream/libpetri-surface-gate.test.ts` gates the build, because
 a missing clock does not throw — the executor silently reads the machine clock, and a run that
 was supposed to be deterministic simply is not.
+
+### Mastra
+
+Never a fork and never a checked-in copy: `scripts/bootstrap-mastra.sh` puts a pinned tree under
+the gitignored `.mastra/`, and `scripts/mastra-pin` records what was used.
+
+```bash
+scripts/bootstrap-mastra.sh          # --dist: the published package (the default)
+scripts/bootstrap-mastra.sh --repo   # the monorepo clone; only conformance needs it
+scripts/bootstrap-mastra.sh --check  # what is present, and does it match the pin
+```
+
+`--dist` fetches `@mastra/core`, verifies it against a pinned sha512, and recovers the workflow
+engine's **original TypeScript from the sourcemaps the package publishes** — 53 files under
+`.mastra/src-extracted/src/workflows/`, including `default.ts`, `execution-engine.ts`,
+`workflow.ts` and `handlers/`. Read those, not the `.d.ts` files and not this repo's prose, when
+a question about Mastra's semantics comes up: a `.d.ts` gives a shape, and almost every
+divergence in `docs/divergences.md` rows 7–23 turned on behaviour a shape does not show.
 
 ### Verification
 
@@ -101,3 +127,25 @@ Sibling integrations (`n8n-libpetri`, `temporal-libpetri`, `adk-libpetri`) solve
 problems against different hosts. When one reports a libpetri bug, treat it as a question about
 this codebase until proven otherwise — that habit found a three-language correctness bug during
 planning. Cross-cutting libpetri gaps are raised upstream rather than worked around locally.
+
+<!-- code-graph-mcp:begin v2 -->
+## Code Graph (repo-wide AST index)
+
+AST + FTS + vector index of the whole repo — prefer over multi-round Grep/Read for
+structural queries (LSP only sees open files; this sees everything). Fastest path = Bash CLI:
+
+| Intent | Command |
+|--------|---------|
+| Who calls X / what X calls | `code-graph-mcp callgraph X` |
+| Impact before editing a fn | `code-graph-mcp impact X` |
+| Unfamiliar dir / module | `code-graph-mcp overview <dir>` |
+| Symbol source / signature | `code-graph-mcp show X` |
+| Concept search (no exact name) | `code-graph-mcp search "…"` (vector: MCP `semantic_code_search`) |
+| grep + AST context | `code-graph-mcp grep "pat" [paths] [-t lang] [-g glob] [-c]` |
+
+Not on PATH? A plugin-only install keeps its own copy — same commands, run
+`~/.cache/code-graph/bin/code-graph-mcp` (or `npm i -g @sdsrs/code-graph` once).
+
+Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.
+Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`
+<!-- code-graph-mcp:end -->

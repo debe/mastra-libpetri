@@ -48,8 +48,25 @@
       stranded tokens reported a clean success — measured at six stranded tokens reported as
       success. The scan now runs first and always, and `residue` is present only when non-empty
       so every existing `toEqual` assertion became a leak detector without opting in
-- [ ] Track A, remaining: mapping/agent/tool entries, dot export, and the `.branch` wide-output
-      split threshold (`and` of k `xor`s flattens to `2^k` under [IO-016])
+- [ ] Track A, the IR pass the audits force, and it comes before the rest of Track A because
+      every remaining item is measured against a shape that is about to change: `StepOutcome`
+      from 2 variants to 6 (`suspended`/`bailed`/`paused`/`tripwire` are assigned by
+      `handlers/step.ts:516-529`); `CompiledWorkflow`'s two sinks to the full terminal set,
+      since `donePlace` today conflates success with the bail→success rewrite and every proof
+      is narrower than it reads; the branch join's full-width downstream record; arms narrowed
+      to a single-step description; `sleep`/`sleepUntil` static-or-dynamic; `maxIterations`
+      renamed so the type says the bound is ours; and a run-scoped step-result store on the
+      engine side (**not** in `FlowToken`, so the P-invariants still hold), which unblocks
+      mapping, branch predicates and loop conditions at once
+- [ ] Track A, remaining after that: mapping/agent/tool entries, dot export, and the `.branch`
+      wide-output split threshold (`and` of k `xor`s flattens to `2^k` under [IO-016]) — the
+      threshold last, because how many keys the join emits is exactly what the full-width
+      record changes
+- [ ] Open question carried out of the audit, cheap and worth answering before renaming
+      anything: Mastra's `loop.predicate` and `conditional.predicates` are declarative,
+      serialisable guards present whenever the `.branch({predicate})` / `.dowhile({predicate})`
+      overloads are used. If a bound is derivable from one, `maxIterations` may be a checkable
+      bound for the declarative form rather than a permanent invention
 - [ ] Known limits recorded, not closed: `foreach` at nested 2x2 returns `unknown` after 123s —
       a scale limit, excluded from the committed proof and documented there; `placeBound` on its
       results and faults places is `violated` by design, since item count is dynamic. The `loop`
@@ -60,13 +77,62 @@
 - [ ] Track A: assert the instantiate -> fuse -> re-instantiate round-trip. Depth is
       unconstrained now that [MOD-031] is fixed, but it is the shape nested workflows take and
       a regression there is silent token loss rather than a build error
-- [ ] Track B: `tests/spikes` — pin every derived fact about libpetri against the installed
-      version: same-pass deposit invisibility, [EXEC-002] ready order and the all-immediate
-      fast path vs general path seam, reset-arc clock restart including the *intermediate*
-      disablement case of [TIME-012], `Out` validation exactness, compose name collisions,
-      ν tie-break
-- [ ] Track C: `scripts/bootstrap-mastra.sh` at a pinned commit, unpatched baseline run,
-      conformance matrix scaffolding, the two upstream PRs drafted in `patches/mastra/`
+- [x] Track C, the half that grounds everything else: `scripts/bootstrap-mastra.sh` +
+      `scripts/mastra-pin`. The plan assumed Mastra's semantics could only be read from a
+      monorepo clone. They cannot *only* be read that way — `@mastra/core` publishes `.js.map`
+      files carrying `sourcesContent`, so `--dist` recovers the workflow engine's **original
+      TypeScript** from the tarball: 53 files, ~11.8k lines (`default.ts` 1238,
+      `workflow.ts` 5284, `handlers/control-flow.ts` 1495, `execution-engine.ts` 251). Cheaper
+      than a clone and more correct to compile against, being the tree a user actually runs.
+      The tarball is verified against a pinned sha512 before extraction, and the recovery
+      asserts the seven load-bearing files appear rather than silently degrading to `.d.ts`.
+      `--repo` keeps the clone for the one thing the tarball cannot do: run Mastra's own tests
+- [x] Track C: the compiler audited against that source by four parallel agents — **61
+      blocker/major findings, 14 of them blockers**, each with a `file:line` citation. Three
+      reshape the IR rather than a gadget: `.sleep`/`.sleepUntil` accept a **function**
+      resolved per run, so neither can be a compile-time constant; a Mastra **loop has no
+      iteration bound at all**, so our `maxIterations` is a Layer 2 addition and not parity;
+      and `.parallel`/`.branch`/`loop`/`foreach` arms are typed `SingleStepEntry`, so our
+      `EntryDescription` arms model nets Mastra cannot express. The costliest is quieter: after
+      a `.branch`, Mastra hands the next entry a record keyed by **every declared arm** with
+      `undefined` for the skipped ones, where we emit only the arms that ran — a plausible
+      answer computed from the wrong object
+- [x] Track C: `src/mastra/{host.ts,adapt.ts}` — Mastra's graph types mirrored structurally
+      (so `@mastra/core` stays a type-only devDependency and nothing is imported at runtime)
+      and `adaptStepFlow(entries)` mapping real `StepFlowEntry[]` onto the compiler's
+      description, end to end through `compile()` and `runWorkflow`. Nine behaviours it would
+      get wrong are **refused at build time with a named error** rather than mis-compiled
+      (divergence rows 7–14, 16). The IR itself was left untouched: each required change is
+      recorded rather than applied, so the fix lands in one deliberate pass instead of racing
+      the gadgets
+- [x] Track B: `tests/spikes` — four spikes, 56 tests, pinning deposit visibility and `Out`
+      validation exactness, [EXEC-002] ready order and the fast-path seam, [TIME-010..012]
+      clock restart under an injected clock, and compose collisions + the
+      instantiate→fuse→re-instantiate round-trip + ν minting. Each was then **adversarially
+      verified by an independent agent that mutated the code and measured whether the test
+      flipped**. Reported honestly: three verdicts came back `partly-vacuous` and one
+      `unsound`, with named inert assertions in each — the spikes are useful and are not yet
+      the tripwire they claim to be
+- [x] Track B found two [NU-011] defects by measurement — the default ν scope was a
+      per-process counter rather than AC#5's 32-hex random token, and `'#'` was accepted in a
+      host-supplied scope although it is the scope separator, making two unrelated origins mint
+      one name. Both were pinned *as observed*, with assertions deliberately phrased to break
+      under the spec-conforming implementation. Both then broke mid-session when libpetri
+      implemented them (`randomExecutionScope`, `resolveExecutionScope`). The tests now pin the
+      fixed behaviour and keep the collision's arithmetic visible
+- [x] The pin gate was wrong, and the phase is what exposed it: `link-libpetri.sh --check`
+      passed while the code that actually ran was an **uncommitted working-tree build** no
+      revision names — the pin matched `HEAD`, the check passed, and every figure was
+      attributable to a revision that never produced it. Identity is now content-addressed —
+      `provenance: libpetri <rev>[+dirty] dist=<hash>` — with `--provenance` to quote beside a
+      measurement and `--strict` to refuse certifying a dirty tree. A dirty sibling stays
+      *expected* while [CORE-073] is unlanded; what changed is that it is no longer silent
+- [ ] Track B: the named inert assertions from the four adversarial verdicts, chiefly
+      `deposit-and-out`'s four `fastPathEligible` checks and `reset-clock`'s unreachable
+      `transition-clock-restarted` half. A spike that passes for the wrong reason is worse than
+      no spike, because it reads as coverage
+- [ ] Track C: unpatched baseline run, conformance matrix scaffolding, the two upstream PRs
+      drafted in `patches/mastra/` (`--repo` clone required)
 
 ## M2 — Engine (the kernel)
 - [ ] `PetriExecutionEngine extends ExecutionEngine` with its own `execute()`, registered via

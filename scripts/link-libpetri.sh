@@ -14,6 +14,8 @@
 #   scripts/link-libpetri.sh            link, building the sibling's dist/ if absent
 #   scripts/link-libpetri.sh --unlink   restore the registry copy
 #   scripts/link-libpetri.sh --check    verify the link without changing anything
+#   scripts/link-libpetri.sh --strict   as --check, but FAIL if the sibling tree is dirty
+#   scripts/link-libpetri.sh --provenance  print the one line to quote next to a measurement
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,6 +27,36 @@ PIN_FILE="$REPO_ROOT/scripts/libpetri-pin"
 
 die() { printf '%s\n' "error: $*" >&2; exit 1; }
 
+# A git revision identifies the linked tree only when that tree is clean. It usually is not:
+# the CORE-073 / ENV-014 snapshot surface is deliberately uncommitted upstream, so the code
+# that actually runs here is a working-tree build that no revision names. That is fine for
+# development and fatal for a reported number, and the failure is silent — the pin matches
+# HEAD, the check passes, and the figure is attributed to a revision that never produced it.
+#
+# So the identity reported is content-addressed: the revision, whether the tree is dirty, and
+# a hash of the built artifact the package actually imports. Two different dirty states get
+# two different fingerprints.
+fingerprint_dist() {
+  [ -d "$SIBLING/dist" ] || { echo "unbuilt"; return 0; }
+  find "$SIBLING/dist" -name '*.js' -type f -exec shasum -a 256 {} + \
+    | awk '{print $1}' | sort | shasum -a 256 | cut -c1-12
+}
+
+sibling_rev() { git -C "$(dirname "$SIBLING")" rev-parse --short HEAD 2>/dev/null || echo unknown; }
+
+sibling_dirty() {
+  git -C "$(dirname "$SIBLING")" diff --quiet -- typescript 2>/dev/null && return 1
+  return 0
+}
+
+# The one line to paste next to any figure measured against a linked tree.
+provenance() {
+  local rev dirty
+  rev="$(sibling_rev)"
+  if sibling_dirty; then dirty="+dirty"; else dirty=""; fi
+  printf 'libpetri %s%s dist=%s\n' "$rev" "$dirty" "$(fingerprint_dist)"
+}
+
 check_pin() {
   [ -f "$PIN_FILE" ] || { echo "note: no $PIN_FILE yet; skipping revision check"; return 0; }
   local want have
@@ -35,6 +67,16 @@ check_pin() {
     echo "         'works on this machine' is not a checkable claim; update scripts/libpetri-pin" >&2
     echo "         once you have confirmed the newer revision." >&2
   fi
+
+  echo "provenance: $(provenance)"
+  if sibling_dirty; then
+    echo "warning: the sibling's typescript/ tree has uncommitted changes, so the pinned" >&2
+    echo "         revision does NOT describe the code that runs. Expected while CORE-073" >&2
+    echo "         is unlanded, but no figure measured here may be attributed to $want." >&2
+    echo "         Quote the provenance line above instead, or --unlink and measure." >&2
+    [ "${STRICT:-0}" = "1" ] && die "refusing to certify a dirty tree (--strict)"
+  fi
+  return 0
 }
 
 case "${1:-}" in
@@ -51,8 +93,19 @@ case "${1:-}" in
     check_pin
     exit 0
     ;;
+  --strict)
+    [ -L "$TARGET" ] || die "not linked: $TARGET"
+    STRICT=1 check_pin
+    echo "certified: clean tree, safe to attribute figures to the pin"
+    exit 0
+    ;;
+  --provenance)
+    [ -L "$TARGET" ] || die "not linked: $TARGET"
+    provenance
+    exit 0
+    ;;
   '') ;;
-  *) die "unknown argument: $1" ;;
+  *) die "unknown argument: $1 (expected --check, --strict, --provenance or --unlink)" ;;
 esac
 
 [ -d "$SIBLING" ] || die "no sibling libpetri at $SIBLING (set LIBPETRI_DIR to override)"
