@@ -169,6 +169,12 @@
       `provenance: libpetri <rev>[+dirty] dist=<hash>` — with `--provenance` to quote beside a
       measurement and `--strict` to refuse certifying a dirty tree. A dirty sibling stays
       *expected* while [CORE-073] is unlanded; what changed is that it is no longer silent
+- [ ] The IR pass's own inert tests: its six verifiers named **28** tests that pass for reasons
+      other than the one they state (parallel 3, branch 6, loop 5, foreach 5, leaf 5, adapter 4),
+      listed with the mutation that exposed each in the phase's verdicts. The recurring one: at
+      runtime the joins' precedence is decided by declaration order, so the precedence tests stay
+      green with an inhibitor removed — those inhibitors are pinned by proofs only. Not fixed in
+      the phase; recorded so the suite is not read as more coverage than it is
 - [ ] Track B: the named inert assertions from the four adversarial verdicts, chiefly
       `deposit-and-out`'s four `fastPathEligible` checks and `reset-clock`'s unreachable
       `transition-clock-restarted` half. A spike that passes for the wrong reason is worse than
