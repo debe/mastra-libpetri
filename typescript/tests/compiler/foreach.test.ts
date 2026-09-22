@@ -1,388 +1,627 @@
 import { describe, expect, it } from 'vitest';
-import { PrecompiledNetExecutor, tokenOf } from 'libpetri';
-import { compile } from '../../src/compiler/index.js';
-import { foreachGadget } from '../../src/compiler/gadgets/foreach.js';
-import { classify, type RunOutcome } from '../../src/engine/index.js';
+import { Transition, delayed, type Timing } from 'libpetri';
+import { compile, type Gadget } from '../../src/compiler/index.js';
+import { foreachGadget, itemsOf, MAX_FOREACH_LANES } from '../../src/compiler/gadgets/foreach.js';
+import { runWorkflowDetailed, type RunReport } from '../../src/engine/index.js';
 import type {
   CompiledWorkflow,
   EntryDescription,
-  FlowToken,
+  StepCall,
+  StepDescription,
   StepOutcome,
-  StepRunner,
-  WorkflowDescription,
 } from '../../src/compiler/types.js';
+import { RecordingRunner } from '../fixtures/runner.js';
+
+/**
+ * `.foreach`, run — against Mastra's `executeForeach` (`@mastra/core@1.67.0`,
+ * `handlers/control-flow.ts:952-1495`, recovered from its sourcemaps):
+ *
+ * - `:1225`, `:1228-1272`: a fastq queue of width `concurrency`, items pushed in index order,
+ *   admission fluid.
+ * - `:1087-1090`, `:1141`, `:1217`: the first non-success item — failed, bailed, paused or
+ *   suspended — kills the queue: nothing queued starts, in-flight items finish.
+ * - `:1130`, `:1210`: the reported failure is the first **in time**.
+ * - `:1136`, `:1373-1406`: a bail or pause is the foreach's result, first in time.
+ * - `:1119-1124`, `:1411-1412`: a suspension reports the **lowest** suspended index.
+ * - `:1315-1316`, `:1373`, `:1410`: precedence failed > bailed/paused > suspended > success.
+ * - `:1189-1191`: `results[k] = output` only for a defined output — an `undefined` leaves a hole.
+ * - `:1050`, `:1228`, `:1272`: no array check; `length` and `[k]` are read directly.
+ * - `entry.ts:811-812`, `default.ts:1152-1153`: the aggregate is recorded under the **body** id.
+ * - `utils.ts:786-796`: concurrency clamps to 1 when not a finite number >= 1, else floors.
+ *
+ * Every run asserts the outcome with `toEqual`, and `classify` adds a `residue` key whenever a
+ * token is left anywhere, so each of these is also a stranded-token check.
+ */
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * Records when each item entered and left the body, and how many were inside at once.
- *
- * `holdUntil` is a barrier rather than a sleep: an item stays inside the body until that many
- * are in flight, so "did they overlap" is answered by the net admitting them and not by a timer
- * that could go either way on a loaded machine. `total` releases the tail, where fewer items
- * remain than the barrier wants. `graceMs` is only a backstop, so a net that *cannot* overlap
- * fails the assertion instead of hanging the suite.
- */
-class LaneRunner implements StepRunner {
-  readonly trace: string[] = [];
-  inFlight = 0;
-  maxInFlight = 0;
-  entered = 0;
+interface Deferred {
+  readonly promise: Promise<void>;
+  resolve(): void;
+}
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
 
-  constructor(
-    private readonly options: {
-      readonly holdUntil?: number;
-      readonly total?: number;
-      readonly graceMs?: number;
-      readonly durations?: Readonly<Record<string, number>>;
-      readonly failOn?: readonly string[];
-    } = {},
-  ) {}
-
-  async run(_stepId: string, input: unknown): Promise<StepOutcome> {
-    const label = String(input);
-    this.entered++;
-    this.inFlight++;
-    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
-    this.trace.push(`enter:${label}`);
-
-    await this.hold(label);
-
-    this.inFlight--;
-    this.trace.push(`exit:${label}`);
-    if (this.options.failOn?.includes(label)) return { status: 'failed', error: `boom:${label}` };
-    return { status: 'success', output: `${label}!` };
-  }
-
-  exits(): string[] {
-    return this.trace.filter((e) => e.startsWith('exit:'));
-  }
-
-  private async hold(label: string): Promise<void> {
-    const duration = this.options.durations?.[label];
-    if (duration !== undefined) return sleep(duration);
-
-    const target = this.options.holdUntil;
-    if (target === undefined) return;
-
-    const deadline = Date.now() + (this.options.graceMs ?? 500);
-    while (
-      this.inFlight < target &&
-      this.entered !== this.options.total &&
-      Date.now() < deadline
-    ) {
-      await sleep(1);
-    }
+/** Polls a condition; the deadline is a backstop, so a net that cannot get there fails instead of hanging. */
+async function until(condition: () => boolean, graceMs = 2_000): Promise<void> {
+  const deadline = Date.now() + graceMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('condition not reached within the grace period');
+    await sleep(1);
   }
 }
 
-/** For structural assertions only: compiling must not call a step. */
-const inert: StepRunner = {
-  async run(): Promise<StepOutcome> {
-    throw new Error('inert runner must not be called');
-  },
-};
+const body = (extra: Omit<StepDescription, 'kind' | 'id'> = {}): StepDescription => ({ kind: 'step', id: 'body', ...extra });
+const foreach = (concurrency: number, b: StepDescription = body()): EntryDescription => ({
+  kind: 'foreach',
+  id: 'items',
+  body: b,
+  concurrency,
+});
 
-function workflow(concurrency: number): WorkflowDescription {
-  return {
-    id: 'batch',
-    entries: [{ kind: 'foreach', id: 'items', body: { kind: 'step', id: 'body' }, concurrency }],
+function build(entries: readonly EntryDescription[], gadget?: Gadget): CompiledWorkflow {
+  return compile({ id: 'batch', entries }, gadget ? { gadgets: { foreach: gadget } } : {});
+}
+
+type Plan = (label: string, call: StepCall) => StepOutcome | Promise<StepOutcome>;
+const succeed: Plan = (label) => ({ status: 'success', output: `${label}!` });
+
+/**
+ * A runner whose `body` step follows `plan` per item and logs every item that starts and
+ * finishes. Other steps echo their input, so a step before a foreach hands it the array intact.
+ */
+function itemRunner(plan: Plan = succeed) {
+  const log = {
+    trace: [] as string[],
+    started: [] as string[],
+    finished: [] as string[],
+    inFlight: 0,
+    maxInFlight: 0,
+  };
+  const runner = new RecordingRunner({
+    steps: {
+      body: async (input, call) => {
+        const label = String(input);
+        log.started.push(label);
+        log.trace.push(`enter:${label}`);
+        log.inFlight++;
+        log.maxInFlight = Math.max(log.maxInFlight, log.inFlight);
+        try {
+          return await plan(label, call);
+        } finally {
+          log.inFlight--;
+          log.finished.push(label);
+          log.trace.push(`exit:${label}`);
+        }
+      },
+    },
+  });
+  return { runner, log };
+}
+
+async function run(
+  entries: readonly EntryDescription[],
+  input: unknown,
+  runner: RecordingRunner,
+  gadget?: Gadget,
+): Promise<RunReport> {
+  return runWorkflowDetailed(build(entries, gadget), input, { runner, timeoutMs: 10_000 });
+}
+
+// -------------------------------------------------------------------------------------------
+// Mutated copies, for the non-vacuity checks. The gadget is wrapped, never edited: the wrapper
+// compiles the real foreach and rebuilds the named transitions with one safeguard removed.
+// -------------------------------------------------------------------------------------------
+
+interface Mutation {
+  readonly transition: RegExp;
+  readonly dropInhibitor?: RegExp;
+  readonly dropReset?: RegExp;
+  readonly dropInput?: RegExp;
+  readonly timing?: Timing;
+}
+
+function rebuild(t: Transition, m: Mutation): Transition {
+  const b = Transition.builder(t.name)
+    .inputs(...t.inputSpecs.filter((spec) => !(m.dropInput?.test(spec.place.name) ?? false)))
+    .outputs(t.outputSpec!)
+    .timing(m.timing ?? t.timing)
+    .priority(t.priority)
+    .action(t.action);
+  for (const arc of t.inhibitors) if (!(m.dropInhibitor?.test(arc.place.name) ?? false)) b.inhibitor(arc.place);
+  for (const arc of t.reads) b.read(arc.place);
+  for (const arc of t.resets) if (!(m.dropReset?.test(arc.place.name) ?? false)) b.reset(arc.place);
+  return b.build();
+}
+
+function mutated(...mutations: Mutation[]): Gadget {
+  return (entry, next, ctx) => {
+    const result = foreachGadget(entry, next, ctx);
+    let touched = 0;
+    const transitions = result.transitions.map((t) =>
+      mutations.reduce((acc, m) => {
+        if (!m.transition.test(acc.name)) return acc;
+        touched++;
+        return rebuild(acc, m);
+      }, t),
+    );
+    if (touched === 0) throw new Error('mutation matched no transition — the check would be vacuous');
+    return { ...result, transitions };
   };
 }
 
-function build(concurrency: number, runner: StepRunner): CompiledWorkflow {
-  return compile(workflow(concurrency), { runner, gadgets: { foreach: foreachGadget } });
-}
+// ===========================================================================================
 
-/**
- * Runs to quiescence and reports **every** place still holding a token, not just the outcome.
- *
- * `classify` reads the failure terminal first, so a failing run that also stranded tokens still
- * classifies as `failed`. The strand is the thing worth asserting — a token nobody can consume
- * is a hang in production and an unbounded place in the model — so the marking is read directly.
- */
-async function run(
-  concurrency: number,
-  input: unknown,
-  runner: StepRunner,
-): Promise<{ outcome: RunOutcome; held: readonly string[] }> {
-  const compiled = build(concurrency, runner);
-  const executor = new PrecompiledNetExecutor(
-    compiled.net,
-    new Map([[compiled.entryPlace, [tokenOf<FlowToken>({ data: input })]]]),
-  );
-  const marking = await executor.run(10_000, 'close');
-  const held = [...compiled.net.places]
-    .filter((place) => marking.tokenCount(place) > 0)
-    .map((place) => place.name)
-    .sort();
-  return { outcome: classify(compiled, marking), held };
-}
+describe('foreach: dispatch and order', () => {
+  it('runs items one at a time at concurrency 1, and records the array under the body id', async () => {
+    const { runner, log } = itemRunner();
+    const report = await run([foreach(1)], ['a', 'b', 'c'], runner);
 
-/** The same, for shapes the single-entry helpers cannot express (nesting, a foreach mid-chain). */
-async function runEntries(
-  entries: readonly EntryDescription[],
-  input: unknown,
-  runner: StepRunner,
-): Promise<{ outcome: RunOutcome; held: readonly string[] }> {
-  const compiled = compile({ id: 'batch', entries }, { runner, gadgets: { foreach: foreachGadget } });
-  const executor = new PrecompiledNetExecutor(
-    compiled.net,
-    new Map([[compiled.entryPlace, [tokenOf<FlowToken>({ data: input })]]]),
-  );
-  const marking = await executor.run(10_000, 'close');
-  const held = [...compiled.net.places]
-    .filter((place) => marking.tokenCount(place) > 0)
-    .map((place) => place.name)
-    .sort();
-  return { outcome: classify(compiled, marking), held };
-}
+    expect(log.trace).toEqual(['enter:a', 'exit:a', 'enter:b', 'exit:b', 'enter:c', 'exit:c']);
+    expect(report.outcome).toEqual({ status: 'success', output: ['a!', 'b!', 'c!'] });
+    // The leaf recorded each item under `body` as it ran; the aggregate is the last write.
+    expect(report.stepResults.get('body')).toEqual({ status: 'success', output: ['a!', 'b!', 'c!'] });
+  });
 
-const foreachEntry = (
-  concurrency: number,
-  body: EntryDescription,
-  id: string,
-): EntryDescription => ({ kind: 'foreach', id, body, concurrency });
+  it('admits fluidly: a freed lane takes the next item while its sibling is still running', async () => {
+    const aMayFinish = deferred();
+    const { runner, log } = itemRunner(async (label) => {
+      if (label === 'a') await aMayFinish.promise;
+      // `c` can only start once `b`'s lane is free — and it releases `a`, so the run completing
+      // at all proves `c` started while `a` was still in flight.
+      if (label === 'c') aMayFinish.resolve();
+      return { status: 'success', output: `${label}!` };
+    });
+    const report = await run([foreach(2)], ['a', 'b', 'c'], runner);
 
-/**
- * For chains where the foreach is not the only entry: records `stepId` as well as the input, so
- * "the body never ran" can be asserted separately from "the surrounding steps ran", and passes
- * the array through untouched so the entry *before* a foreach still hands it an array.
- */
-class ChainRunner implements StepRunner {
-  readonly calls: string[] = [];
+    expect(log.trace.indexOf('enter:c')).toBeLessThan(log.trace.indexOf('exit:a'));
+    expect(report.outcome).toEqual({ status: 'success', output: ['a!', 'b!', 'c!'] });
+  });
 
-  constructor(private readonly failOn: readonly string[] = []) {}
+  it('never has more items in flight than the concurrency', async () => {
+    const items = ['a', 'b', 'c', 'd', 'e', 'f', 'g'];
+    const { runner, log } = itemRunner(async (label) => {
+      // Hold each item until three are inside or every item has started: reaching the end at all
+      // is the overlap, and `maxInFlight` is the cap.
+      await until(() => log.inFlight >= 3 || log.started.length === items.length);
+      return { status: 'success', output: `${label}!` };
+    });
+    const report = await run([foreach(3)], items, runner);
 
-  async run(stepId: string, input: unknown): Promise<StepOutcome> {
-    this.calls.push(stepId);
-    if (stepId !== 'body') return { status: 'success', output: input };
-    const label = String(input);
-    if (this.failOn.includes(label)) return { status: 'failed', error: `boom:${label}` };
-    return { status: 'success', output: `${label}!` };
-  }
-}
+    expect(log.maxInFlight).toBe(3);
+    expect(report.outcome).toEqual({ status: 'success', output: items.map((i) => `${i}!`) });
+  });
 
-describe('foreach', () => {
-  it('runs items strictly one at a time at concurrency 1', async () => {
-    const runner = new LaneRunner();
-    const { outcome, held } = await run(1, ['a', 'b', 'c'], runner);
+  it('keeps input order when items finish in reverse', async () => {
+    const finished = new Map([['quick', deferred()], ['medium', deferred()], ['slow', deferred()]]);
+    const { runner, log } = itemRunner(async (label) => {
+      await until(() => log.started.length === 3);
+      if (label === 'medium') await finished.get('quick')!.promise;
+      if (label === 'slow') await finished.get('medium')!.promise;
+      finished.get(label)!.resolve();
+      return { status: 'success', output: `${label}!` };
+    });
+    const report = await run([foreach(3)], ['slow', 'medium', 'quick'], runner);
 
-    // Sequencing is the single permit, not an iterator: no item may enter before the previous
-    // one has left.
-    expect(runner.trace).toEqual([
-      'enter:a', 'exit:a',
-      'enter:b', 'exit:b',
-      'enter:c', 'exit:c',
+    expect(log.finished).toEqual(['quick', 'medium', 'slow']);
+    expect(report.outcome).toEqual({ status: 'success', output: ['slow!', 'medium!', 'quick!'] });
+  });
+
+  it('leaves a hole where an item produced undefined, as results[k] = output does', async () => {
+    const { runner } = itemRunner((label) => ({ status: 'success', output: label === 'b' ? undefined : `${label}!` }));
+
+    const middle = await run([foreach(1)], ['a', 'b', 'c'], runner);
+    const output = (middle.outcome as { output: unknown[] }).output;
+    expect(output).toHaveLength(3);
+    expect(1 in output).toBe(false);
+    expect(output[0]).toBe('a!');
+    expect(output[2]).toBe('c!');
+
+    // A trailing `undefined` shortens the array: its length is one past the last defined index.
+    const trailing = await run([foreach(1)], ['a', 'b'], runner);
+    expect(trailing.outcome).toEqual({ status: 'success', output: ['a!'] });
+    expect((trailing.outcome as { output: unknown[] }).output).toHaveLength(1);
+  });
+
+  it('succeeds with [] on an empty array without running the body', async () => {
+    const { runner } = itemRunner();
+    const report = await run([foreach(3)], [], runner);
+
+    expect(runner.calls).toEqual([]);
+    expect(report.outcome).toEqual({ status: 'success', output: [] });
+    expect(report.stepResults.get('body')).toEqual({ status: 'success', output: [] });
+  });
+
+  it('hands the array to the entry after it, and runs nothing after a failure', async () => {
+    const entries: EntryDescription[] = [{ kind: 'step', id: 'before' }, foreach(2), { kind: 'step', id: 'after' }];
+
+    const ok = itemRunner();
+    const passed = await run(entries, ['a', 'b', 'c'], ok.runner);
+    expect(passed.outcome).toEqual({ status: 'success', output: ['a!', 'b!', 'c!'] });
+    expect(ok.runner.calls.filter((c) => c !== 'body')).toEqual(['before', 'after']);
+
+    const bad = itemRunner((label) =>
+      label === 'b' ? { status: 'failed', error: 'boom:b' } : { status: 'success', output: `${label}!` },
+    );
+    const failed = await run(entries, ['a', 'b', 'c'], bad.runner);
+    expect(failed.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:b' });
+    expect(bad.runner.calls).not.toContain('after');
+  });
+});
+
+describe('foreach: input that is not an array (row 22)', () => {
+  it('iterates a string by UTF-16 code unit, as prevOutput[k] does', async () => {
+    const { runner } = itemRunner();
+    const report = await run([foreach(2)], 'abc', runner);
+    expect(report.outcome).toEqual({ status: 'success', output: ['a!', 'b!', 'c!'] });
+  });
+
+  it('iterates an array-like by its length', async () => {
+    const { runner } = itemRunner();
+    const report = await run([foreach(1)], { length: 2, 0: 'x', 1: 'y' }, runner);
+    expect(report.outcome).toEqual({ status: 'success', output: ['x!', 'y!'] });
+  });
+
+  it.each([
+    ['a plain object', { a: 1 }],
+    ['a number', 42],
+    ['a boolean', true],
+    ['a NaN length', { length: 'many' }],
+  ])('succeeds with [] on %s, whose length is not a positive number', async (_what, input) => {
+    const { runner } = itemRunner();
+    const report = await run([foreach(2)], input, runner);
+    expect(runner.calls).toEqual([]);
+    expect(report.outcome).toEqual({ status: 'success', output: [] });
+  });
+
+  it.each([
+    ['null', null, TypeError],
+    ['undefined', undefined, TypeError],
+    ['an infinite length', { length: Infinity }, RangeError],
+  ])('fails on %s, where Mastra rejects the run or never finishes', async (_what, input, kind) => {
+    const { runner } = itemRunner();
+    const report = await run([foreach(2)], input, runner);
+
+    expect(runner.calls).toEqual([]);
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: expect.any(kind) });
+    expect(report.stepResults.get('body')).toEqual({ status: 'failed', error: expect.any(kind) });
+  });
+
+  it('reads items exactly as the for-loop does', () => {
+    expect(itemsOf('i', [1, , 3])).toEqual([1, undefined, 3]);
+    expect(itemsOf('i', { length: 2.5, 0: 'a' })).toEqual(['a', undefined, undefined]);
+    expect(itemsOf('i', { length: '2', 0: 'a', 1: 'b' })).toEqual(['a', 'b']);
+    expect(itemsOf('i', { length: -1 })).toEqual([]);
+    expect(() => itemsOf('i', { length: Symbol('n') })).toThrow(TypeError);
+  });
+});
+
+describe('foreach: fail-fast (row 18)', () => {
+  it('starts no item after a failure at concurrency 1', async () => {
+    const { runner, log } = itemRunner((label) =>
+      label === 'a' ? { status: 'failed', error: 'boom:a' } : { status: 'success', output: `${label}!` },
+    );
+    const report = await run([foreach(1)], ['a', 'b', 'c'], runner);
+
+    expect(runner.calls).toEqual(['body']);
+    expect(log.started).toEqual(['a']);
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:a' });
+    expect(report.stepResults.get('body')).toEqual({ status: 'failed', error: 'boom:a' });
+  });
+
+  it('stops after a later failure too, having run everything before it', async () => {
+    const { runner, log } = itemRunner((label) =>
+      label === 'b' ? { status: 'failed', error: 'boom:b' } : { status: 'success', output: `${label}!` },
+    );
+    const report = await run([foreach(1)], ['a', 'b', 'c', 'd'], runner);
+
+    expect(log.started).toEqual(['a', 'b']);
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:b' });
+  });
+
+  it('lets in-flight items finish and starts none of the queued ones at concurrency 3', async () => {
+    let failedAt = 0;
+    const { runner, log } = itemRunner(async (label) => {
+      await until(() => log.started.length >= 3);
+      if (label === 'a') {
+        failedAt = Date.now();
+        return { status: 'failed', error: 'boom:a' };
+      }
+      // `b` and `c` are still running when `a`'s failure lands, and finish well after it.
+      await until(() => failedAt > 0);
+      await sleep(20);
+      return { status: 'success', output: `${label}!` };
+    });
+    const report = await run([foreach(3)], ['a', 'b', 'c', 'd', 'e', 'f'], runner);
+
+    expect(log.started).toEqual(['a', 'b', 'c']);
+    expect([...log.finished].sort()).toEqual(['a', 'b', 'c']);
+    expect(runner.calls).toHaveLength(3);
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:a' });
+    expect(report.stepResults.get('body')).toEqual({ status: 'failed', error: 'boom:a' });
+  });
+
+  it('reports the first failure in time, not the lowest index', async () => {
+    const { runner, log } = itemRunner(async (label) => {
+      await until(() => log.started.length >= 3);
+      if (label === 'c') return { status: 'failed', error: 'boom:c' };
+      await until(() => log.finished.includes('c'));
+      await sleep(5);
+      return label === 'a' ? { status: 'failed', error: 'boom:a' } : { status: 'success', output: `${label}!` };
+    });
+    const report = await run([foreach(3)], ['a', 'b', 'c'], runner);
+
+    // `.parallel()` would say `a` here (lowest arm index); a foreach keeps the first to settle.
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:c' });
+  });
+
+  it('ends as tripwire when the failing item carries one, and stops dispatch', async () => {
+    const { runner, log } = itemRunner((label) =>
+      label === 'a'
+        ? { status: 'failed', error: new Error('blocked'), tripwire: { reason: 'policy' } }
+        : { status: 'success', output: `${label}!` },
+    );
+    const report = await run([foreach(1)], ['a', 'b'], runner);
+
+    expect(log.started).toEqual(['a']);
+    expect(report.outcome).toEqual({ status: 'tripwire', stepId: 'body', tripwire: { reason: 'policy' } });
+  });
+
+  it('treats a throwing runner as a failed item', async () => {
+    const { runner, log } = itemRunner((label) => {
+      if (label === 'a') throw new Error('crashed');
+      return { status: 'success', output: `${label}!` };
+    });
+    const report = await run([foreach(1)], ['a', 'b'], runner);
+
+    expect(log.started).toEqual(['a']);
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: new Error('crashed') });
+  });
+
+  it('retries an item inside its own lane before anything counts as a failure', async () => {
+    const { runner, log } = itemRunner((label, call) =>
+      label === 'a' && call.attempt === 0
+        ? { status: 'failed', error: 'flaky' }
+        : { status: 'success', output: `${label}!` },
+    );
+    const report = await run([foreach(1, body({ retries: 1 }))], ['a', 'b'], runner);
+
+    expect(runner.attempts).toEqual([
+      { stepId: 'body', attempt: 0 },
+      { stepId: 'body', attempt: 1 },
+      { stepId: 'body', attempt: 0 },
     ]);
-    expect(runner.maxInFlight).toBe(1);
-    expect(outcome).toEqual({ status: 'success', output: ['a!', 'b!', 'c!'] });
-    expect(held).toEqual(['wf.done']);
+    expect(log.started).toEqual(['a', 'a', 'b']);
+    expect(report.outcome).toEqual({ status: 'success', output: ['a!', 'b!'] });
   });
 
-  it('overlaps items above concurrency 1', async () => {
-    const runner = new LaneRunner({ holdUntil: 2, total: 4 });
-    const { outcome } = await run(2, ['a', 'b', 'c', 'd'], runner);
+  it('fails fast on a non-retryable failure without spending the retries', async () => {
+    const { runner, log } = itemRunner((label) =>
+      label === 'a' ? { status: 'failed', error: 'fatal', nonRetryable: true } : { status: 'success', output: `${label}!` },
+    );
+    const report = await run([foreach(1, body({ retries: 3 }))], ['a', 'b'], runner);
 
-    // The barrier only releases once two items are inside the body at the same time, so
-    // reaching the end at all is the overlap.
-    expect(runner.maxInFlight).toBe(2);
-    expect(runner.trace.slice(0, 2)).toEqual(['enter:a', 'enter:b']);
-    expect(outcome).toEqual({ status: 'success', output: ['a!', 'b!', 'c!', 'd!'] });
+    expect(log.started).toEqual(['a']);
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'fatal' });
+  });
+});
+
+describe('foreach: bail, pause and suspend', () => {
+  it('ends the run as a success carrying the bail output, and stops dispatch', async () => {
+    const { runner, log } = itemRunner((label) =>
+      label === 'b' ? { status: 'bailed', output: 'early' } : { status: 'success', output: `${label}!` },
+    );
+    const report = await run([foreach(1)], ['a', 'b', 'c'], runner);
+
+    expect(log.started).toEqual(['a', 'b']);
+    expect(report.outcome).toEqual({ status: 'success', output: 'early', bailed: true });
+    // Rewritten to 'success' when the bail ends the run, as Mastra rewrites the object its
+    // stepResults holds (`default.ts:926-928`).
+    expect(report.stepResults.get('body')).toEqual({ status: 'success', output: 'early' });
   });
 
-  it('caps in-flight work at the permit count', async () => {
-    const items = ['a', 'b', 'c', 'd', 'e', 'f'];
-    const runner = new LaneRunner({ holdUntil: 3, total: items.length });
-    const { outcome, held } = await run(3, items, runner);
+  it('pauses at the foreach path when a nested workflow item pauses', async () => {
+    const { runner, log } = itemRunner((label) =>
+      label === 'a' ? { status: 'paused' } : { status: 'success', output: `${label}!` },
+    );
+    const report = await run([{ kind: 'step', id: 'before' }, foreach(1, body({ source: 'workflow' }))], ['a', 'b'], runner);
 
-    // Three permits, three lanes, never a fourth item inside — the cap is the marking, so
-    // there is no window in which a fourth could slip through.
-    expect(runner.maxInFlight).toBe(3);
-    expect(outcome.status).toBe('success');
-    expect(held).toEqual(['wf.done']);
+    expect(log.started).toEqual(['a']);
+    // Mastra runs each item at the foreach's own execution path, so [1], not the lane's [1, 0].
+    expect(report.outcome).toEqual({ status: 'paused', stepId: 'body', path: [1] });
+    expect(report.stepResults.get('body')).toEqual({ status: 'paused' });
   });
 
-  it('holds the cap and the order over many more items than lanes', async () => {
-    const items = Array.from({ length: 20 }, (_, i) => `i${i}`);
-    const runner = new LaneRunner({ holdUntil: 4, total: items.length });
-    const { outcome, held } = await run(4, items, runner);
+  it('takes the first bail or pause in time', async () => {
+    // `a` pauses and `b` bails; `first` settles, then the other one.
+    const race = (first: string) => {
+      const r = itemRunner(async (label) => {
+        await until(() => r.log.started.length >= 2);
+        if (label !== first) {
+          await until(() => r.log.finished.includes(first));
+          await sleep(5);
+        }
+        return label === 'a' ? { status: 'paused' } : { status: 'bailed', output: 'bail:b' };
+      });
+      return r;
+    };
 
-    // Five cursor rounds through four lanes: the cap is a property of the marking, not of how
-    // many items happen to be in the array.
-    expect(runner.maxInFlight).toBe(4);
-    expect(outcome).toEqual({ status: 'success', output: items.map((i) => `${i}!`) });
-    expect(held).toEqual(['wf.done']);
+    const pauseFirst = race('a');
+    const paused = await run([foreach(2)], ['a', 'b'], pauseFirst.runner);
+    expect(paused.outcome).toEqual({ status: 'paused', stepId: 'body', path: [0] });
+
+    const bailFirst = race('b');
+    const bailed = await run([foreach(2)], ['a', 'b'], bailFirst.runner);
+    expect(bailed.outcome).toEqual({ status: 'success', output: 'bail:b', bailed: true });
   });
 
-  it('keeps output in input order when items finish out of order', async () => {
-    const runner = new LaneRunner({ durations: { slow: 60, medium: 25, quick: 1 } });
-    const { outcome } = await run(3, ['slow', 'medium', 'quick'], runner);
+  it('lets a failure outrank a bail that happened first', async () => {
+    const { runner, log } = itemRunner(async (label) => {
+      await until(() => log.started.length >= 2);
+      if (label === 'a') return { status: 'bailed', output: 'early' };
+      await until(() => log.finished.includes('a'));
+      await sleep(5);
+      return { status: 'failed', error: 'boom:b' };
+    });
+    const report = await run([foreach(2)], ['a', 'b'], runner);
 
-    // Completion order is the reverse of input order...
-    expect(runner.exits()).toEqual(['exit:quick', 'exit:medium', 'exit:slow']);
-    // ...and the output is not, because the index rides in the slot token and the join sorts
-    // on it. Firing order carries no meaning.
-    expect(outcome).toEqual({ status: 'success', output: ['slow!', 'medium!', 'quick!'] });
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:b' });
+    expect(report.stepResults.get('body')).toEqual({ status: 'failed', error: 'boom:b' });
   });
 
-  it('completes immediately on an empty array without running the body', async () => {
-    const runner = new LaneRunner();
-    const { outcome, held } = await run(2, [], runner);
+  it('lets a bail outrank a suspension that happened first', async () => {
+    const { runner, log } = itemRunner(async (label) => {
+      await until(() => log.started.length >= 2);
+      if (label === 'a') return { status: 'suspended', payload: { ask: 'a' } };
+      await until(() => log.finished.includes('a'));
+      await sleep(5);
+      return { status: 'bailed', output: 'early' };
+    });
+    const report = await run([foreach(2)], ['a', 'b'], runner);
 
-    expect(runner.trace).toEqual([]);
-    expect(outcome).toEqual({ status: 'success', output: [] });
-    // No permit is seeded on the empty branch, so there is nothing left to strand.
-    expect(held).toEqual(['wf.done']);
+    expect(report.outcome).toEqual({ status: 'success', output: 'early', bailed: true });
   });
 
-  it('routes a failing item to the failure terminal without stranding its siblings', async () => {
-    const runner = new LaneRunner({ failOn: ['b'] });
-    const { outcome, held } = await run(2, ['a', 'b', 'c', 'd'], runner);
+  it('suspends at the lowest suspended index, whatever order they suspended in', async () => {
+    const { runner, log } = itemRunner(async (label) => {
+      await until(() => log.started.length >= 3);
+      if (label === 'c') return { status: 'suspended', payload: { ask: 'c' } };
+      await until(() => log.finished.includes('c'));
+      await sleep(5);
+      return label === 'a'
+        ? { status: 'suspended', payload: { ask: 'a' }, output: 'partial' }
+        : { status: 'success', output: `${label}!` };
+    });
+    const report = await run([foreach(3)], ['a', 'b', 'c'], runner);
 
-    expect(outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:b' });
-    // Every sibling still ran: the failed item gave its permit back like any other.
-    expect(runner.exits().sort()).toEqual(['exit:a', 'exit:b', 'exit:c', 'exit:d']);
-    // And nothing is left anywhere — no orphaned permit, slot, result or cursor. This is the
-    // assertion that a "route the failure straight to wf.failed" design silently fails.
-    expect(held).toEqual(['wf.failed']);
+    expect(report.outcome).toEqual({ status: 'suspended', stepId: 'body', path: [0], payload: { ask: 'a' } });
+    // Mastra's per-index record keeps no `suspendOutput`, so the foreach's suspension has none.
+    expect(report.stepResults.get('body')).toEqual({ status: 'suspended', payload: { ask: 'a' } });
   });
 
-  it('reports a non-array input as a failure rather than hanging', async () => {
-    const { outcome, held } = await run(2, 'not-an-array', new LaneRunner());
+  it('stops dispatch on a suspension too', async () => {
+    const { runner, log } = itemRunner((label) =>
+      label === 'a' ? { status: 'suspended', payload: 'wait' } : { status: 'success', output: `${label}!` },
+    );
+    const report = await run([foreach(1)], ['a', 'b', 'c'], runner);
 
-    expect(outcome.status).toBe('failed');
-    expect(held).toEqual(['wf.failed']);
+    expect(log.started).toEqual(['a']);
+    expect(report.outcome).toEqual({ status: 'suspended', stepId: 'body', path: [0], payload: 'wait' });
+  });
+});
+
+describe('foreach: structure', () => {
+  const lanesOf = (compiled: CompiledWorkflow): number =>
+    [...compiled.net.places].filter((p) => /^s\.0\.items\.lane\d+\.permit$/.test(p.name)).length;
+
+  it.each([
+    [1, 1],
+    [3, 3],
+    [2.9, 2],
+    [0, 1],
+    [-2, 1],
+    [0.5, 1],
+    [Number.NaN, 1],
+    [Infinity, 1],
+  ])('clamps concurrency %s to %s lanes, as resolveForeachConcurrency does', (concurrency, lanes) => {
+    expect(lanesOf(build([foreach(concurrency)]))).toBe(lanes);
   });
 
-  it('puts the concurrency limit in the net, as one permit place per lane', () => {
-    const compiled = build(3, inert);
-    const places = [...compiled.net.places].map((place) => place.name);
-
-    // A runtime concurrency option would leave no trace here, and could prove nothing.
-    expect(places).toContain('s.0.items.lane0.permit');
-    expect(places).toContain('s.0.items.lane2.permit');
-    expect(places).not.toContain('s.0.items.lane3.permit');
+  it('refuses more lanes than it can compile', () => {
+    expect(lanesOf(build([foreach(MAX_FOREACH_LANES)]))).toBe(MAX_FOREACH_LANES);
+    expect(() => build([foreach(MAX_FOREACH_LANES + 1)])).toThrow(/lane limit/);
   });
 
-  it('instantiates the body once per lane so two items never share places', () => {
-    const compiled = build(3, inert);
-    const bodies = [...compiled.net.transitions]
-      .map((transition) => transition.name)
+  it('instantiates the body once per lane', () => {
+    const runs = [...build([foreach(3)]).net.transitions]
+      .map((t) => t.name)
       .filter((name) => name.endsWith('.body.run'))
       .sort();
-
-    expect(bodies).toEqual(['t.0-0.body.run', 't.0-1.body.run', 't.0-2.body.run']);
+    expect(runs).toEqual(['t.0-0.body.run', 't.0-1.body.run', 't.0-2.body.run']);
   });
 
-  it('rejects a concurrency a permit place cannot represent', () => {
-    expect(() => build(0, inert)).toThrow(/integer >= 1/);
-    expect(() => build(2.5, inert)).toThrow(/integer >= 1/);
-    expect(() => build(1_000, inert)).toThrow(/lane limit/);
+  it('cannot be given a combinator as its body', () => {
+    const nested = { kind: 'foreach', id: 'inner', body: body(), concurrency: 1 };
+    // @ts-expect-error — a foreach body is a single step, as Mastra's SingleStepEntry is.
+    const typed: EntryDescription = { kind: 'foreach', id: 'items', body: nested, concurrency: 2 };
+    expect(() => build([typed])).toThrow(/body must be a single step/);
   });
 
-  // ---------------------------------------------------------------------------------------
-  // Stranded-token hunt.
-  //
-  // `classify` reads `wf.failed` first, so a failing run that *also* left a permit, slot,
-  // cursor or result behind still reports `failed` — the outcome assertion alone cannot see
-  // the defect. Every case below therefore asserts the residual marking exactly. A token with
-  // no enabled consumer is a hang in production and an unbounded place in the model.
-  // ---------------------------------------------------------------------------------------
+  it('inhibits every start on every other lane’s non-success outcome, and kills the queue on each settle', () => {
+    const lanes = [0, 1, 2];
+    const transitions = [...build([foreach(lanes.length)]).net.transitions];
+    const outcomesOf = (l: number): string[] =>
+      ['failed', 'bailed', 'suspended', 'paused'].map((o) => `s.0.items.lane${l}.${o}`);
 
-  it('leaves nothing behind when several items fail at once', async () => {
-    const runner = new LaneRunner({ failOn: ['b', 'c'], holdUntil: 3, total: 4 });
-    const { outcome, held } = await run(3, ['a', 'b', 'c', 'd'], runner);
+    for (const lane of lanes) {
+      const start = transitions.find((t) => t.name === `t.0.items.lane${lane}.start`)!;
+      // Its own lane needs no arc: while that outcome is pending the lane holds a slot, not a permit.
+      const others = lanes.filter((l) => l !== lane).flatMap(outcomesOf);
+      expect(start.inhibitors.map((a) => a.place.name).sort()).toEqual(others.sort());
+    }
+    const settles = transitions.filter((t) => /\.lane\d+\.(fail|bail|pause|suspend)$/.test(t.name));
+    expect(settles).toHaveLength(4 * lanes.length);
+    for (const settle of settles) expect(settle.resets.map((a) => a.place.name)).toEqual(['s.0.items.cursor']);
+  });
+});
 
-    // Two faults and two results coexist at the moment `abort` fires: `all(faults)` drains the
-    // first pair, `reset(results)` is the consumer for the second. Drop either and a token
-    // survives quiescence.
-    expect(outcome.status).toBe('failed');
-    expect(runner.exits().sort()).toEqual(['exit:a', 'exit:b', 'exit:c', 'exit:d']);
-    expect(held).toEqual(['wf.failed']);
+describe('foreach: each safeguard is load-bearing (mutated copies)', () => {
+  const failA: Plan = (label) =>
+    label === 'a' ? { status: 'failed', error: 'boom:a' } : { status: 'success', output: `${label}!` };
+
+  it('without the reset on the cursor, items after a failure run', async () => {
+    const intact = itemRunner(failA);
+    await run([foreach(1)], ['a', 'b', 'c'], intact.runner);
+    expect(intact.log.started).toEqual(['a']);
+
+    const broken = itemRunner(failA);
+    await run([foreach(1)], ['a', 'b', 'c'], broken.runner, mutated({ transition: /\.lane\d+\.fail$/, dropReset: /cursor/ }));
+    expect(broken.log.started).toEqual(['a', 'b', 'c']);
   });
 
-  it('leaves nothing behind when every item fails', async () => {
-    const items = ['a', 'b', 'c', 'd'];
-    const { outcome, held } = await run(2, items, new LaneRunner({ failOn: items }));
+  it('without the start inhibitors, an item starts in the window before a failure is recorded', async () => {
+    // The window is ordinarily one firing wide. Widening it — delaying the failure's settle by
+    // 50ms in both copies — makes it observable: `b` finishes inside it and frees its lane.
+    const slowSettle: Mutation = { transition: /\.lane\d+\.fail$/, timing: delayed(50) };
+    const plan: Plan = async (label) => {
+      if (label === 'a') return { status: 'failed', error: 'boom:a' };
+      await sleep(10);
+      return { status: 'success', output: `${label}!` };
+    };
 
-    // `results` is empty here, so `join` is not merely inhibited by `faults` — `all(results)`
-    // needs at least one token ([IO-006]) and could not fire anyway. `abort` is the only exit.
-    expect(outcome.status).toBe('failed');
-    expect(held).toEqual(['wf.failed']);
-  });
+    const intact = itemRunner(plan);
+    const kept = await run([foreach(2)], ['a', 'b', 'c'], intact.runner, mutated(slowSettle));
+    expect(intact.log.started).toEqual(['a', 'b']);
+    expect(kept.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:a' });
 
-  it('leaves no idle permit behind when there are more lanes than items', async () => {
-    const { outcome, held } = await run(4, ['a'], new LaneRunner({ failOn: ['a'] }));
-
-    // Three lanes never start. `join`/`abort` *consume* every permit rather than reading past
-    // an inhibitor, which is what clears the ones that were never spent.
-    expect(outcome.status).toBe('failed');
-    expect(held).toEqual(['wf.failed']);
-  });
-
-  it('keeps a nested foreach failure inside its own lane', async () => {
-    const inner = foreachEntry(2, { kind: 'step', id: 'body' }, 'inner');
-    const runner = new LaneRunner({ failOn: ['c'] });
-    const { outcome, held } = await runEntries(
-      [foreachEntry(2, inner, 'outer')],
-      [['a', 'b'], ['c', 'd']],
-      runner,
+    const broken = itemRunner(plan);
+    await run(
+      [foreach(2)],
+      ['a', 'b', 'c'],
+      broken.runner,
+      mutated(slowSettle, { transition: /\.lane\d+\.start$/, dropInhibitor: /./ }),
     );
-
-    // The inner gadget's `ctx.failed` is the outer lane's local failure place. If the override
-    // were ignored the inner failure would reach `wf.failed` directly, leaving the outer lane's
-    // permit, slot and the sibling lane's result stranded — visible only in this marking.
-    expect(outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:c' });
-    expect(held).toEqual(['wf.failed']);
+    expect(broken.log.started).toEqual(['a', 'b', 'c']);
   });
 
-  it('leaves nothing behind when a nested foreach gets a non-array item', async () => {
-    const inner = foreachEntry(2, { kind: 'step', id: 'body' }, 'inner');
-    const { outcome, held } = await runEntries(
-      [foreachEntry(2, inner, 'outer')],
-      ['not-an-array', ['c']],
-      new LaneRunner(),
-    );
+  it('without waiting for every lane, the failure is decided under a running item and a token strands', async () => {
+    const plan: Plan = async (label) => {
+      if (label === 'a') return { status: 'failed', error: 'boom:a' };
+      await sleep(20);
+      return { status: 'success', output: `${label}!` };
+    };
 
-    // The inner `split` takes its third branch *inside* a lane, so the failure has to travel
-    // the same rescue/abort path a body failure does rather than short-circuiting.
-    expect(outcome.status).toBe('failed');
-    expect(held).toEqual(['wf.failed']);
-  });
+    const intact = itemRunner(plan);
+    const kept = await run([foreach(2)], ['a', 'b'], intact.runner);
+    expect(kept.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:a' });
 
-  it('leaves nothing behind when the foreach is not the last entry', async () => {
-    const entries: readonly EntryDescription[] = [
-      { kind: 'step', id: 'before' },
-      foreachEntry(2, { kind: 'step', id: 'body' }, 'items'),
-      { kind: 'step', id: 'after' },
-    ];
-
-    const ok = await runEntries(entries, ['a', 'b', 'c'], new ChainRunner());
-    expect(ok.outcome).toEqual({ status: 'success', output: ['a!', 'b!', 'c!'] });
-    expect(ok.held).toEqual(['wf.done']);
-
-    // `next` is a live input place rather than a terminal, so a leftover token here would be a
-    // second run of `after` rather than a quiet strand — and `after` must not run at all.
-    const failing = new ChainRunner(['b']);
-    const bad = await runEntries(entries, ['a', 'b', 'c'], failing);
-    expect(bad.outcome.status).toBe('failed');
-    expect(failing.calls).not.toContain('after');
-    expect(bad.held).toEqual(['wf.failed']);
-  });
-
-  it('leaves nothing behind on the empty-array skip branch mid-chain', async () => {
-    const entries: readonly EntryDescription[] = [
-      foreachEntry(3, { kind: 'step', id: 'body' }, 'items'),
-      { kind: 'step', id: 'after' },
-    ];
-    const runner = new ChainRunner();
-    const { outcome, held } = await runEntries(entries, [], runner);
-
-    // The "nothing happened" branch seeds no permit and no cursor at all, so there is no
-    // allowance left over for `join`/`abort` to have to clean up — and the successor still runs.
-    expect(runner.calls).toEqual(['after']);
-    expect(outcome).toEqual({ status: 'success', output: [] });
-    expect(held).toEqual(['wf.done']);
+    const broken = itemRunner(plan);
+    const lost = await run([foreach(2)], ['a', 'b'], broken.runner, mutated({ transition: /\.items\.fail$/, dropInput: /permit/ }));
+    expect(lost.outcome).toMatchObject({ status: 'failed', residue: expect.any(Array) });
   });
 });

@@ -1,6 +1,6 @@
 import type { Place, Transition } from 'libpetri';
 import type { NameVocabulary, EntryPath } from '../names.js';
-import type { EntryDescription, FailureToken, FlowToken, StepRunner } from '../types.js';
+import type { EntryDescription, Exits, FlowToken, StepDescription } from '../types.js';
 
 /**
  * What a gadget emitted.
@@ -20,28 +20,40 @@ export interface GadgetResult {
  * Everything a gadget needs, and deliberately nothing more.
  *
  * A gadget never reads external state and never decides ordering: it emits structure, and the
- * marking decides what runs ([ADR 0001]). `emitNested` is how a composite gadget compiles its
- * children without knowing what they are.
+ * marking decides what runs ([ADR 0001]). It holds **no runner** — the runner arrives per run
+ * through the run scope (`../scope.ts`), which is what lets one compiled net serve many runs.
  */
 export interface GadgetContext {
   readonly path: EntryPath;
   readonly names: NameVocabulary;
-  readonly runner: StepRunner;
-  /** The workflow's failure terminal. Every failure path ends here or at a gadget-local sink. */
-  readonly failed: Place<FailureToken>;
   /**
-   * Compiles a child entry so that its success token lands in `next`.
+   * Where this entry's non-success outcomes go. At the top level these are the workflow's
+   * terminals; a combinator passes its own places to its arms, so it can settle every arm before
+   * it decides the block's outcome.
+   */
+  readonly exits: Exits;
+  /**
+   * True when `next` is the workflow's success terminal, so the value deposited there is **the
+   * run's result** rather than the next entry's input.
    *
-   * `failed` overrides where the child routes failure. A composite gadget passes a
-   * gadget-local failure place so a failing child cannot strand its siblings: the gadget then
-   * waits for every branch to settle before deciding the composite's own outcome. Omitting it
-   * routes to the workflow terminal. Recording into the `NetMap` is handled by the builder.
+   * The two differ for `.parallel()` and `.branch()`. The next entry receives a record keyed by
+   * *every declared arm*, each read from the step results (`default.ts:1141-1149`), so a skipped
+   * or bailed arm is present as a key. The run's result is the block's own output, which keeps
+   * only the arms that ran in this block and succeeded (`handlers/control-flow.ts:286-295`).
+   */
+  readonly nextIsResult: boolean;
+  /**
+   * Compiles one step so that its success lands in `next` and each other outcome in `exits`.
+   *
+   * A combinator must pass all four exits explicitly — where an arm's `bail` or `suspend` goes
+   * is the combinator's decision, and making it choose is what keeps that decision visible.
+   * Recording into the `NetMap` is handled by the builder.
    */
   readonly emitNested: (
-    entry: EntryDescription,
+    step: StepDescription,
     path: EntryPath,
     next: Place<FlowToken>,
-    failed?: Place<FailureToken>,
+    exits: Exits,
   ) => GadgetResult;
 }
 

@@ -48,32 +48,74 @@
       stranded tokens reported a clean success — measured at six stranded tokens reported as
       success. The scan now runs first and always, and `residue` is present only when non-empty
       so every existing `toEqual` assertion became a leak detector without opting in
-- [ ] Track A, the IR pass the audits force, and it comes before the rest of Track A because
-      every remaining item is measured against a shape that is about to change: `StepOutcome`
-      from 2 variants to 6 (`suspended`/`bailed`/`paused`/`tripwire` are assigned by
-      `handlers/step.ts:516-529`); `CompiledWorkflow`'s two sinks to the full terminal set,
-      since `donePlace` today conflates success with the bail→success rewrite and every proof
-      is narrower than it reads; the branch join's full-width downstream record; arms narrowed
-      to a single-step description; `sleep`/`sleepUntil` static-or-dynamic; `maxIterations`
-      renamed so the type says the bound is ours; and a run-scoped step-result store on the
-      engine side (**not** in `FlowToken`, so the P-invariants still hold), which unblocks
-      mapping, branch predicates and loop conditions at once
-- [ ] Track A, remaining after that: mapping/agent/tool entries, dot export, and the `.branch`
-      wide-output split threshold (`and` of k `xor`s flattens to `2^k` under [IO-016]) — the
-      threshold last, because how many keys the join emits is exactly what the full-width
-      record changes
+- [x] Track A, the IR pass the audits forced ([ADR 0003]). The lead wrote the contract and
+      smoke-tested it end to end before anything was built on it; six agents then rebuilt every
+      gadget, the leaf suite and the adapter with disjoint file ownership, each followed by an
+      adversarial verifier that mutated **scratch copies** registered through the `gadgets`
+      override — never `src/`, which the other agents were running against. What changed:
+      five step outcomes (tripwire a field of `failed`, as in Mastra); every outcome routed to an
+      exit the enclosing context chooses, which settles where `bail` belongs; five terminal
+      places, each a declared sink, so `wf.done` no longer silently receives bailed runs; arms and
+      bodies narrowed to a single step, as Mastra types them; a run-scoped step-result store
+      reached through `executionContextProvider`, so a compiled net holds no runner and one net
+      serves every run; retries **unrolled**, one transition per attempt, so the ceiling is
+      structure; per-run waits; `.map()`, agent and tool entries compiled as steps with a
+      `source`. Closed divergence rows 7, 8, 11, 12, 17, 18, 19, 20; rows 9, 10, 13, 14, 16 stay
+      deliberate refusals. Measured: 562 tests across 22 files, `npm run check` clean, against
+      `libpetri 808171c dist=9adfac496ed2`, certified clean and fresh by `--strict`
+- [x] A third property, because the verifiers showed the first two blind to it:
+      `exactlyOneTerminal` — `quiescentCount(terminals, 1, 1)`. A step writing to both `next`
+      and `failed` leaves `deadlockFree` and `terminatesAtSink` **proven** and only this one
+      **violated** (`tests/verify/linear-chain.test.ts`). Every proof in the suite now asserts
+      all three. Measured proof cost for `.branch()` with k arms: 106ms at k=4, 1087ms at k=5,
+      and at k=6 enumeration gives way to SMT at 3.9s — the curve the split threshold is chosen
+      from. `.foreach()` proofs are the expensive ones: 3.9s at c=1, 14.8s at c=3, 20.9s with a
+      retrying body
+- [x] Defects the phase found in the lead's own contract, all fixed with tests: a literal
+      `.sleepUntil` compiled to `exact(epochMs)`, which libpetri measures **from enablement**, so
+      it waited about fifty-four years for a real date — carried untested since the M1 first
+      slice, and found by an agent told to test the leaf against Mastra rather than against its
+      author; a rejection carrying no reason read as success and skipped the wait; a top-level
+      bail left its step result `bailed` where Mastra rewrites it to `success`; any non-undefined
+      `tripwire` classified as a tripwire where Mastra requires an `Error` or a `reason`; a
+      malformed carried-in step result stranded a run instead of being refused at the boundary;
+      a Petri-vocabulary refusal message reaching Mastra users
+- [x] A libpetri executor hang, found by a verifier and reproduced against raw libpetri with no
+      code of ours: `PrecompiledNetExecutor` completes a 4097-place chain in ~120ms and spins
+      **synchronously** on a 4098-place one, so `run(timeout, 'close')` cannot interrupt it;
+      `BitmapNetExecutor` runs the same net in ~115ms. Reported upstream with the repro (U7).
+      Stopgap: `compile()` refuses nets above `MAX_NET_PLACES` (4096) and the adapter refuses
+      retries above 100 and `.foreach()` concurrency above 256, each by name — a hang no timeout
+      reaches is the worst failure there is (row 24)
+- [x] The loop bound's claim, corrected: the IR said `iterationBound` "makes termination
+      provable". It does not — every verified property ranges over quiescent markings only
+      ([VER-002]), and a loop cycling forever reaches none, so the loop verifier found that
+      disabling the bound leaves every proof green. The bound stops the loop at runtime by
+      construction, pinned by a structural test, and is now described that way in `types.ts`,
+      `properties.ts` and row 13
+- [ ] **Track A, contract completion — the next phase, and it comes before M2.** Four changes
+      each touch a type every gadget uses, so none can be bolted on after the engine exists:
+      (1) a structural cancellation path — a `_cancel` place in `GadgetContext` that every
+      gadget's starts are inhibited on, plus a `canceled` outcome at Mastra's four check points
+      (row 28); (2) `FailureToken` carries `path` and `nonRetryable`, which fixes duplicate-id
+      ranking and gives the codec an execution path for every failure (rows 33, 36);
+      (3) `foreachIndex` on `StepCall`, and a view path separate from the naming path, so the
+      Mastra runner can build Mastra's per-item context (row 32); (4) what the step-result
+      store holds for the codec — Mastra's `payload` and `metadata.iterationCount` too, or an
+      opaque host record beside the outcome (rows 27, 37)
+- [ ] Track A, remaining after that: dot export, and the `.branch` split threshold, now chosen
+      from the measured curve above
 - [ ] Open question carried out of the audit, cheap and worth answering before renaming
       anything: Mastra's `loop.predicate` and `conditional.predicates` are declarative,
       serialisable guards present whenever the `.branch({predicate})` / `.dowhile({predicate})`
       overloads are used. If a bound is derivable from one, `maxIterations` may be a checkable
       bound for the declarative form rather than a permanent invention
-- [ ] Known limits recorded, not closed: `foreach` at nested 2x2 returns `unknown` after 123s —
-      a scale limit, excluded from the committed proof and documented there; `placeBound` on its
-      results and faults places is `violated` by design, since item count is dynamic. The `loop`
-      allowance is provable only when seeded at the post-`start` marking
-      (`placeBound(budget, k)` proven, `k-1` violated); proving that `start` deposits exactly
-      `maxIterations` tokens needs an upstream output multiplicity or a `CompiledWorkflow`
-      carrying an initial marking
+- [ ] Known limits recorded, not closed. The `foreach` nested 2x2 `unknown` is gone — a foreach
+      can no longer contain a foreach. The `loop` allowance is provable only when seeded at the
+      post-`start` marking (`placeBound(budget, k)` proven, `k-1` violated): `start` writes `k`
+      tokens into one place its `and` names once, which libpetri accepts but its analyses model
+      as one token per named place ([IO-016]) — asked upstream whether that multiplicity is
+      intended and stable (U8). No property establishes termination (see above)
 - [ ] Track A: assert the instantiate -> fuse -> re-instantiate round-trip. Depth is
       unconstrained now that [MOD-031] is fixed, but it is the shape nested workflows take and
       a regression there is silent token loss rather than a build error
@@ -243,11 +285,18 @@ bump not yet run):
 - [x] U4 — [NU-011] Resume-Safe Fresh-Name Minting (MUST, new). Closes the collision where a
       resumed executor re-mints `fork#0` against restored names
 
-**Implemented, uncommitted:**
+- [x] U5 — [CORE-073] marking snapshot/restore (MUST) and [ENV-014] with the quiescence
+      framing, committed in `78e3b10` (TypeScript), `ac3dbe0` (Rust, Python), `c26a1db` (Java).
+      The pin moved to `808171c`; the tree is clean and its build fresh, so `--strict`
+      certifies it and figures are attributable to a revision for the first time
 
-- [ ] U5 — [CORE-073] marking snapshot/restore (now MUST) and [ENV-014] with the quiescence
-      framing. TS surface is `marking.snapshot()` / `Marking.fromSnapshot()` /
-      `executor.snapshot(): { marking, actionInFlight }`. M4 tracks it landing
+**Reported this phase, open upstream:**
+
+- [ ] U7 — `PrecompiledNetExecutor` spins synchronously on a 4098-place chain that
+      `BitmapNetExecutor` runs in ~115ms; no timeout can interrupt it. Repro sent to the libpetri
+      session. Our stopgap is `MAX_NET_PLACES`; lift it when fixed
+- [ ] U8 — question, not pressed: is depositing several tokens into one place an `and` names
+      once intended and stable? The loop gadget's `start` depends on it
 
 **Not pursued, deliberately:**
 

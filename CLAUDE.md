@@ -58,8 +58,8 @@ requirement IDs (`IO-015`, `EXEC-003`, `MOD-031`, `TIME-015`, …).
 Linked from a sibling checkout, not installed from the registry:
 `"libpetri": "file:../../libpetri/typescript"`. The engine calls surface that is committed but
 unreleased — **TIME-015** (injectable clock), the **MOD-031** place-alias fix, **NU-011**
-(resume-safe minting) — plus **CORE-073**/**ENV-014** snapshot, which is implemented but
-uncommitted. npm publishes 6.0.0. The floor becomes `^6.1.0` the day it publishes.
+(resume-safe minting) and **CORE-073**/**ENV-014** snapshot (committed in `78e3b10`). npm
+publishes 6.0.0. The floor becomes `^6.1.0` the day it publishes.
 
 ```bash
 scripts/link-libpetri.sh --check       # verify the link; print the provenance line
@@ -68,11 +68,12 @@ scripts/link-libpetri.sh --strict      # as --check, but fail if the sibling tre
 scripts/link-libpetri.sh --unlink      # restore the registry copy before measuring
 ```
 
-**A revision identifies the linked tree only when that tree is clean, and it usually is not** —
-the [CORE-073] snapshot surface is deliberately uncommitted upstream, so the code that runs is a
-working-tree build no revision names. The pin matching `HEAD` while the build is dirty is a
-*silent* mis-attribution, which is why identity is content-addressed:
-`libpetri <rev>[+dirty] dist=<hash>`. Quote that, not the pin, next to any figure.
+**A revision identifies the linked tree only when that tree is clean and its build is fresh.**
+The sibling is a peer session's working tree and is often mid-change, and `dist/` — what the
+package actually imports — is gitignored, so neither a matching `HEAD` nor a clean `git status`
+proves what ran. That was a *silent* mis-attribution once, which is why identity is
+content-addressed (`libpetri <rev>[+dirty] dist=<hash>`) and `--strict` also refuses a `dist/`
+older than any source file. Quote the provenance line, not the pin, next to any figure.
 
 `scripts/libpetri-pin` records the sibling revision. `src/internal/libpetri-surface.ts` asserts
 the surface at entry and `tests/upstream/libpetri-surface-gate.test.ts` gates the build, because

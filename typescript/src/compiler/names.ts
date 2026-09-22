@@ -33,9 +33,16 @@ export function slug(stepId: string): string {
   return cleaned.length > 0 ? cleaned : 'step';
 }
 
-/** Workflow-level terminals. Both are declared as sinks, or a completed run reads as stranded. */
+/**
+ * Workflow-level terminals, one per way a run can end. Every one is declared as a sink, or a run
+ * that ends there reads as stranded.
+ */
 export const WF_DONE = 'wf.done';
 export const WF_FAILED = 'wf.failed';
+/** `bail(result)` — reported as a success, kept apart so a proof about completion stays one. */
+export const WF_BAILED = 'wf.bailed';
+export const WF_SUSPENDED = 'wf.suspended';
+export const WF_PAUSED = 'wf.paused';
 
 export class NameVocabulary {
   readonly #seen = new Map<string, string>();

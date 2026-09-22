@@ -33,7 +33,10 @@
  *
  * `component` is `'WORKFLOW'` for a nested workflow — the one legal way to put control flow
  * under an arm or a loop body, because `Workflow implements Step`
- * (`workflow.ts:1721-1740`). Mastra runs it as one opaque step with its own run id.
+ * (`workflow.ts:1721-1740`). The `Workflow` constructor sets it through `MastraBase`
+ * (`workflow.ts:1789`), and Mastra tells a nested workflow apart by exactly this comparison
+ * (`step-entry.ts:61-70`). Mastra runs it as one opaque step with its own run id. A `Workflow`
+ * has no `retries` of its own, so it retries by the workflow-level `retryConfig`.
  */
 export interface Step {
   readonly id: string;
@@ -43,7 +46,12 @@ export interface Step {
   readonly component?: string;
 }
 
-/** Retry-bearing options on a declarative `agent` / `tool` entry (`step-entry.ts:35-45`). */
+/**
+ * Retry-bearing options on a declarative `agent` / `tool` entry. Mastra types the whole object
+ * as `any` (`types.d.ts:528,534`); `retries` is the one field the adapter reads, as
+ * `getEntryRetries` does (`step-entry.ts:35-45`), and the step Mastra materializes from the entry
+ * carries the same value (`step-factories.ts:52,69,108`).
+ */
 export interface DeclarativeEntryOptions {
   readonly retries?: number;
 }
@@ -87,11 +95,11 @@ export type SingleStepEntry =
       readonly mapConfig: unknown;
     };
 
-/** `.foreach(step, opts)` options (`types.d.ts:645-647`). */
+/** `.foreach(step, opts)` options (`types.d.ts:642-644`). */
 export interface ForeachOptions {
   /**
    * A number, or a resolver Mastra calls **per run** with the actual input array
-   * (`types.d.ts:626-644`, `utils.ts:786-796`). Mastra also keeps the caller's options object
+   * (`types.d.ts:623-641`, `utils.ts:786-796`). Mastra also keeps the caller's options object
    * by reference so an agentic workflow can mutate `concurrency` between build and execution
    * (`workflow.ts:2629-2636`).
    */

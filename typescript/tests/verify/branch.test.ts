@@ -1,356 +1,352 @@
-import { PrecompiledNetExecutor, tokenOf } from 'libpetri';
-import { describe, expect, it } from 'vitest';
+import {
+  Transition,
+  and,
+  enumerateBranches,
+  one,
+  outPlace,
+  place,
+  xor,
+  type Out,
+  type Place,
+  type TransitionAction,
+} from 'libpetri';
+import { afterAll, describe, expect, it } from 'vitest';
 import { compile } from '../../src/compiler/index.js';
-import { branchGadget } from '../../src/compiler/gadgets/branch.js';
+import { branchGadget, type ArmArrival, type GateToken } from '../../src/compiler/gadgets/branch.js';
+import type { Gadget } from '../../src/compiler/gadgets/types.js';
 import type {
   CompiledWorkflow,
   EntryDescription,
+  FailureToken,
   FlowToken,
-  StepOutcome,
-  StepRunner,
+  StepDescription,
   WorkflowDescription,
 } from '../../src/compiler/types.js';
-import { classify, type RunOutcome } from '../../src/engine/index.js';
-import { verifyWorkflow, describeReport } from '../../src/verify/index.js';
+import { runWorkflow } from '../../src/engine/index.js';
+import { describeReport, verifyWorkflow, type PropertyReport } from '../../src/verify/index.js';
+import { RecordingRunner } from '../fixtures/runner.js';
 
-/**
- * A runner that never fires but *can* answer the branch question.
- *
- * `inertRunner` cannot compile a branch at all — `branchGadget` demands `selectBranches` at
- * compile time. Verification is value-blind anyway: each gate declares both of its outcomes,
- * so what this would have returned never reaches the analysis.
- */
-const inertBranchRunner: StepRunner = {
-  async run(): Promise<StepOutcome> {
-    throw new Error('inert runner must not be called');
-  },
-  async selectBranches(): Promise<readonly number[]> {
-    throw new Error('inert runner must not be called');
-  },
-};
+const step = (id: string, extra: Omit<StepDescription, 'kind' | 'id'> = {}): StepDescription => ({
+  kind: 'step',
+  id,
+  ...extra,
+});
+const branch = (id: string, ...arms: StepDescription[]): EntryDescription => ({ kind: 'branch', id, arms });
+const workflow = (...entries: EntryDescription[]): WorkflowDescription => ({ id: 'triage', entries });
+const arms = (k: number): StepDescription[] => Array.from({ length: k }, (_, i) => step(`arm${i}`));
 
-function compileBranch(description: WorkflowDescription, runner: StepRunner): CompiledWorkflow {
-  return compile(description, { runner, gadgets: { branch: branchGadget } });
+/** Both properties, `proven` asserted explicitly: `isViolated()` is false on `unknown` too. */
+function expectProven(reports: readonly PropertyReport[]): void {
+  expect(reports.map((r) => r.property)).toEqual(['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal']);
+  for (const report of reports) expect(report.result.verdict.type, describeReport(report)).toBe('proven');
 }
 
-const step = (id: string): EntryDescription => ({ kind: 'step', id });
-const branch = (id: string, ...arms: EntryDescription[]): EntryDescription =>
-  ({ kind: 'branch', id, arms });
-const workflow = (...entries: EntryDescription[]): WorkflowDescription => ({ id: 'triage', entries });
+const verdictOf = (reports: readonly PropertyReport[], property: string): string =>
+  reports.find((r) => r.property === property)!.result.verdict.type;
 
+/**
+ * Every proof below is over the net `compile()` builds, from one token in the entry place, with
+ * all five workflow terminals declared as sinks (`verifyWorkflow`). Verification is value-blind,
+ * so each gate's run *and* skip legs, and each arm's five outcomes, are all explored — the proofs
+ * cover every subset of truthy arms and every mix of arm outcomes.
+ */
 const shapes: ReadonlyArray<readonly [string, WorkflowDescription]> = [
-  ['one arm', workflow(branch('route', step('email')))],
-  ['two arms', workflow(branch('route', step('email'), step('sms')))],
-  ['three arms', workflow(branch('route', step('email'), step('sms'), step('push')))],
+  ['one arm, last entry', workflow(branch('route', ...arms(1)))],
+  ['two arms, last entry', workflow(branch('route', ...arms(2)))],
+  ['three arms, last entry', workflow(branch('route', ...arms(3)))],
+  ['four arms, last entry', workflow(branch('route', ...arms(4)))],
+  ['two arms, middle entry', workflow(step('validate'), branch('route', ...arms(2)), step('audit'))],
+  ['two branches in sequence', workflow(branch('first', ...arms(2)), branch('second', step('x'), step('y')))],
+  ['empty branch, middle entry', workflow(step('validate'), branch('route'), step('audit'))],
   [
-    'five arms',
-    workflow(branch('route', ...[0, 1, 2, 3, 4].map((i) => step(`arm${i}`)))),
-  ],
-  [
-    'branch in a chain',
-    workflow(step('validate'), branch('route', step('email'), step('sms')), step('audit')),
-  ],
-  [
-    'branch nested in a branch',
-    workflow(branch('outer', branch('inner', step('shallow')), step('other'))),
-  ],
-  [
-    'branch of branches',
-    workflow(
-      branch(
-        'outer',
-        branch('left', step('a'), step('b')),
-        branch('right', step('c'), step('d')),
-      ),
-    ),
-  ],
-  [
-    // A `sleep` makes the net timed, which disqualifies the enumeration route ([VER-017] is
-    // untimed-only) and forces the SMT pipeline. Both routes have to land on `proven` or the
-    // gadget is only provable by accident of which route picked it up.
-    'timed arm, forcing the SMT route',
-    workflow(branch('route', step('email'), { kind: 'sleep', id: 'nap', durationMs: 50 })),
+    // A delayed retry makes the net timed, which rules out the enumeration route ([VER-017] is
+    // untimed-only) and forces the SMT pipeline, so both routes are exercised.
+    'arms with delayed retries (timed, SMT route)',
+    workflow(branch('route', step('a', { retries: 1, retryDelayMs: 50 }), step('b', { retries: 2 }))),
   ],
 ];
 
 describe('compiled branch, proved', () => {
   for (const [label, description] of shapes) {
     it(`is deadlock-free and terminates at a declared sink: ${label}`, async () => {
-      const reports = await verifyWorkflow(compileBranch(description, inertBranchRunner), {
-        timeoutMs: 120_000,
-      });
-
-      // Assert `proven` explicitly. `isViolated()` is false for `unknown` too, so asserting
-      // "not violated" would pass on a query that timed out and the test would be vacuous
-      // from then on.
-      for (const report of reports) {
-        expect(report.result.verdict.type, describeReport(report)).toBe('proven');
-      }
-      expect(reports.map((r) => r.property)).toEqual(['deadlockFree', 'terminatesAtSink']);
+      expectProven(await verifyWorkflow(compile(description), { timeoutMs: 120_000 }));
     }, 300_000);
   }
+
+  it('takes the SMT route for the timed shape', async () => {
+    const reports = await verifyWorkflow(compile(shapes[shapes.length - 1]![1]), { timeoutMs: 120_000 });
+    expectProven(reports);
+    for (const report of reports) expect(report.result.route).toBe('smt');
+  }, 300_000);
 });
 
-// ===================== stranded-token hunt =====================
+// ===================== scaling in the number of arms =====================
 
-interface Residue {
-  readonly outcome: RunOutcome;
-  /** Places outside the two terminals that still hold tokens once the net is quiescent. */
-  readonly residue: readonly string[];
+interface SizeRow {
+  readonly arms: number;
+  readonly transitions: number;
+  readonly branches: number;
+  readonly places: number;
+  readonly deadlockFree: string;
+  readonly terminatesAtSink: string;
 }
+const sizeRows: SizeRow[] = [];
 
 /**
- * Runs to quiescence and reports the outcome *and* what was left behind.
- *
- * `classify` reports `failed` the moment the failure terminal holds a token, so a run that
- * also stranded a sibling's token reads as a clean failure through `runWorkflow`. The residue
- * is the only way to see the failure mode this gadget exists to avoid, so these drive the
- * executor directly.
+ * Measured, so the IO-016 split threshold can be chosen from numbers rather than assumed. No
+ * transition here declares an `and` of `xor`s, so the enumerated branch count is linear in the
+ * number of arms; what grows exponentially is the reachable state space, because every subset of
+ * arms and every interleaving is genuinely reachable.
  */
-async function runAndInspect(compiled: CompiledWorkflow, input: unknown): Promise<Residue> {
-  const executor = new PrecompiledNetExecutor(
-    compiled.net,
-    new Map([[compiled.entryPlace, [tokenOf<FlowToken>({ data: input })]]]),
-    {},
-  );
-  const marking = await executor.run(5_000, 'close');
+describe('compiled branch, scaling in the number of arms', () => {
+  for (const k of [1, 2, 3, 4, 5, 6]) {
+    it(`proves both properties with ${k} arm(s) and counts the net`, async () => {
+      const compiled = compile(workflow(branch('route', ...arms(k))));
+      const transitions = [...compiled.net.transitions];
+      const branches = transitions.reduce((sum, t) => sum + enumerateBranches(t.outputSpec!).length, 0);
 
-  const terminals = new Set([compiled.donePlace.name, compiled.failedPlace.name]);
-  const residue: string[] = [];
-  for (const p of compiled.net.places) {
-    if (!terminals.has(p.name) && marking.tokenCount(p) > 0) {
-      residue.push(`${p.name} x${marking.tokenCount(p)}`);
-    }
+      const reports = await verifyWorkflow(compiled, { timeoutMs: 240_000 });
+
+      expectProven(reports);
+      // 2k + 8 transitions of the block's own, one per arm; decide 2 branches, each gate 2, each
+      // arm 5, every collect and join 1.
+      expect(transitions).toHaveLength(3 * k + 8);
+      expect(branches).toBe(8 * k + 9);
+      const cell = (p: string) => {
+        const r = reports.find((x) => x.property === p)!.result;
+        return `${r.verdict.type} via ${r.route} in ${Math.round(r.elapsedMs)}ms`;
+      };
+      sizeRows.push({
+        arms: k,
+        transitions: transitions.length,
+        branches,
+        places: compiled.net.places.size,
+        deadlockFree: cell('deadlockFree'),
+        terminatesAtSink: cell('terminatesAtSink'),
+      });
+    }, 600_000);
   }
-  return { outcome: classify(compiled, marking), residue: residue.sort() };
-}
 
-const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
+  afterAll(() => {
+    if (sizeRows.length > 0) console.table([...sizeRows].sort((a, b) => a.arms - b.arms));
+  });
+});
 
-/** A runner built from a selection function and per-step behaviours, including async ones. */
-function runnerWith(
-  select: (entryId: string, input: unknown) => unknown,
-  behaviour: Record<string, (input: unknown) => Promise<StepOutcome> | StepOutcome> = {},
-): StepRunner & { readonly calls: readonly string[] } {
-  const calls: string[] = [];
-  return {
-    calls,
-    async run(stepId: string, input: unknown): Promise<StepOutcome> {
-      calls.push(stepId);
-      const fn = behaviour[stepId];
-      return fn !== undefined ? await fn(input) : { status: 'success', output: input };
-    },
-    async selectBranches(entryId: string, input: unknown): Promise<readonly number[]> {
-      return select(entryId, input) as readonly number[];
-    },
+// ===================== non-vacuity: every safeguard is load-bearing =====================
+
+/**
+ * A copy of `branchGadget` with one of its transitions rebuilt. The mutation lives in the test,
+ * through the `gadgets` override, so the source is never edited to demonstrate a failure.
+ */
+function mutating(role: string, rebuild: (t: Transition, places: PlaceIndex) => readonly Transition[]): Gadget {
+  return (entry, next, ctx) => {
+    const result = branchGadget(entry, next, ctx);
+    const index = placeIndex(result.transitions);
+    let hit = 0;
+    const transitions = result.transitions.flatMap((t) => {
+      if (!t.name.endsWith(`.${role}`)) return [t];
+      hit += 1;
+      return rebuild(t, index);
+    });
+    expect(hit, `mutation target '${role}'`).toBe(1);
+    return { ...result, transitions };
   };
 }
 
-const threeArms = workflow(branch('route', step('email'), step('sms'), step('push')));
-const nested = workflow(branch('outer', branch('inner', step('a'), step('b')), step('slow')));
+type PlaceIndex = (role: string) => Place<unknown>;
 
-describe('branch gadget strands nothing', () => {
-  it('when an arm fails while a sibling is still in flight', async () => {
-    // The dangerous ordering for the *fail* side: the error lands while `arrived` is still
-    // short of n, so `join.fail` has to wait for the sibling rather than fire early and leave
-    // the sibling's marker with no consumer.
-    const runner = runnerWith(() => [0, 1], {
-      email: () => ({ status: 'failed', error: 'boom' }),
-      sms: async (input) => { await sleepMs(30); return { status: 'success', output: input }; },
+/** Finds a place of the branch block by its role suffix, from the arcs of its transitions. */
+function placeIndex(transitions: readonly Transition[]): PlaceIndex {
+  const all = new Map<string, Place<unknown>>();
+  for (const t of transitions) {
+    for (const spec of t.inputSpecs) all.set(spec.place.name, spec.place);
+    for (const arc of [...t.inhibitors, ...t.resets, ...t.reads]) all.set(arc.place.name, arc.place);
+    for (const p of t.outputPlaces()) all.set(p.name, p);
+  }
+  return (role) => {
+    const found = [...all.values()].find((p) => p.name.startsWith('s.0.') && p.name.endsWith(`.${role}`));
+    if (found === undefined) throw new Error(`no place with role '${role}'`);
+    return found;
+  };
+}
+
+interface Change {
+  readonly inputs?: Transition['inputSpecs'];
+  readonly outputs?: Out;
+  readonly dropInhibitor?: string;
+  readonly dropReset?: string;
+  readonly action?: TransitionAction;
+}
+
+/** The same transition with one arc changed, or its outputs and action replaced as a pair. */
+function rebuilt(t: Transition, change: Change): Transition {
+  const builder = Transition.builder(t.name)
+    .inputs(...(change.inputs ?? t.inputSpecs))
+    .outputs(change.outputs ?? t.outputSpec!)
+    .timing(t.timing)
+    .priority(t.priority)
+    .action(change.action ?? t.action);
+  for (const arc of t.inhibitors) if (!arc.place.name.endsWith(`.${change.dropInhibitor}`)) builder.inhibitor(arc.place);
+  for (const arc of t.resets) if (!arc.place.name.endsWith(`.${change.dropReset}`)) builder.reset(arc.place);
+  for (const arc of t.reads) builder.read(arc.place);
+  return builder.build();
+}
+
+const twoArms = workflow(branch('route', step('a'), step('b')));
+
+async function verifyMutant(gadget: Gadget): Promise<readonly PropertyReport[]> {
+  return verifyWorkflow(compile(twoArms, { gadgets: { branch: gadget } }), { timeoutMs: 120_000 });
+}
+
+describe('compiled branch, non-vacuity', () => {
+  it('the unmutated two-arm block is the baseline: both properties proven', async () => {
+    expectProven(await verifyWorkflow(compile(twoArms), { timeoutMs: 120_000 }));
+  });
+
+  it("join-ok's inhibitor on the failure marker: without it a failed block can succeed and strand the marker", async () => {
+    const reports = await verifyMutant(mutating('join-ok', (t) => [rebuilt(t, { dropInhibitor: 'err-seen' })]));
+    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+  });
+
+  it("join-ok's inhibitor on the suspension marker: without it a suspended block can succeed", async () => {
+    const reports = await verifyMutant(mutating('join-ok', (t) => [rebuilt(t, { dropInhibitor: 'susp-seen' })]));
+    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+  });
+
+  it("join-susp's inhibitor on the failure marker: without it failed no longer outranks suspended", async () => {
+    const reports = await verifyMutant(mutating('join-susp', (t) => [rebuilt(t, { dropInhibitor: 'err-seen' })]));
+    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+  });
+
+  it("join-fail's reset of the suspension marker: without it a failure beside a suspension strands a token", async () => {
+    const mutant = mutating('join-fail', (t) => [rebuilt(t, { dropReset: 'susp-seen' })]);
+
+    const reports = await verifyMutant(mutant);
+    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+
+    const runner = new RecordingRunner({
+      steps: { a: () => ({ status: 'failed', error: 'down' }), b: () => ({ status: 'suspended', payload: 'wait' }) },
+      branches: { route: () => [0, 1] },
+    });
+    const outcome = await runWorkflow(compile(twoArms, { gadgets: { branch: mutant } }), 'x', { runner });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'a', error: 'down', residue: ['s.0.route.susp-seen'] });
+  });
+
+  it("join-fail's all() on the failure marker: consuming one leaves the others behind", async () => {
+    const mutant = mutating('join-fail', (t, p) => [
+      rebuilt(t, { inputs: t.inputSpecs.map((spec) => (spec.type === 'all' ? one(p('err-seen')) : spec)) }),
+    ]);
+
+    const reports = await verifyMutant(mutant);
+    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+
+    const runner = new RecordingRunner({
+      steps: { a: () => ({ status: 'failed', error: 'a' }), b: () => ({ status: 'failed', error: 'b' }) },
+      branches: { route: () => [0, 1] },
+    });
+    const outcome = await runWorkflow(compile(twoArms, { gadgets: { branch: mutant } }), 'x', { runner });
+    expect(outcome).toHaveProperty('residue', ['s.0.route.err-seen']);
+  });
+
+  it("join-susp's all() on the suspension marker: consuming one leaves the others behind", async () => {
+    const mutant = mutating('join-susp', (t, p) => [
+      rebuilt(t, { inputs: t.inputSpecs.map((spec) => (spec.type === 'all' ? one(p('susp-seen')) : spec)) }),
+    ]);
+
+    const reports = await verifyMutant(mutant);
+    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+  });
+
+  it("collect-err's arrival deposit: without it a failing arm never counts and the join never fires", async () => {
+    const mutant = mutating('collect-err', (t, p) => {
+      const armErr = p('arm-err') as Place<FailureToken>;
+      const errSeen = p('err-seen') as Place<FailureToken>;
+      return [
+        rebuilt(t, {
+          outputs: outPlace(errSeen),
+          action: async (tctx) => {
+            tctx.output(errSeen, tctx.input(armErr));
+          },
+        }),
+      ];
     });
 
-    const { outcome, residue } = await runAndInspect(compileBranch(threeArms, runner), 'alert');
+    const reports = await verifyMutant(mutant);
+    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+    expect(verdictOf(reports, 'terminatesAtSink')).toBe('violated');
 
-    expect(outcome).toEqual({ status: 'failed', stepId: 'email', error: 'boom' });
-    expect(residue).toEqual([]);
+    const runner = new RecordingRunner({
+      steps: { a: () => ({ status: 'failed', error: 'down' }) },
+      branches: { route: () => [0, 1] },
+    });
+    const outcome = await runWorkflow(compile(twoArms, { gadgets: { branch: mutant } }), 'x', { runner });
+    expect(outcome.status).toBe('stranded');
   });
 
-  it('when a sibling succeeds after the failure, so the ok join could race the fail join', async () => {
-    const runner = runnerWith(() => [0, 1], {
-      email: async (input) => { await sleepMs(30); return { status: 'success', output: input }; },
-      sms: () => ({ status: 'failed', error: 'carrier rejected' }),
+  it("a skip's arrival deposit: a skipped arm that does not arrive stalls the join", async () => {
+    const mutant = mutating('gate-1', (t) => {
+      const gateIn = t.inputSpecs[0]!.place as Place<GateToken>;
+      const armIn = [...t.outputPlaces()].find((p) => p.name.startsWith('s.0-1.'))! as Place<FlowToken>;
+      const nowhere = place<ArmArrival>('s.0.route.skipped-nowhere');
+      return [
+        rebuilt(t, {
+          outputs: xor(outPlace(armIn), outPlace(nowhere)),
+          action: async (tctx) => {
+            const gate = tctx.input(gateIn);
+            if (gate.decision === 'run') tctx.output(armIn, { data: gate.data });
+            else tctx.output(nowhere, { status: 'skipped' });
+          },
+        }),
+      ];
     });
 
-    const { outcome, residue } = await runAndInspect(compileBranch(threeArms, runner), 'alert');
+    const reports = await verifyMutant(mutant);
+    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
 
-    // `arm.i.settle.fail` deposits the marker and the error in ONE firing, so there is no
-    // reachable marking with `arrived === n` and the error still pending.
-    expect(outcome.status).toBe('failed');
-    expect(residue).toEqual([]);
+    const runner = new RecordingRunner({ branches: { route: () => [0] } });
+    const outcome = await runWorkflow(compile(twoArms, { gadgets: { branch: mutant } }), 'x', { runner });
+    expect(outcome.status).toBe('stranded');
   });
 
-  it('when several arms fail at once and one of them is slow', async () => {
-    // Exercises the reset arc: `join.fail` consumes one error token and drains the rest,
-    // which have no other consumer anywhere in the net.
-    const runner = runnerWith(() => [0, 1, 2], {
-      email: () => ({ status: 'failed', error: 'e' }),
-      sms: () => ({ status: 'failed', error: 's' }),
-      push: async () => { await sleepMs(20); return { status: 'failed', error: 'p' }; },
+  it('one firing for the arrival and the failure marker: split in two, join-ok can win the race', async () => {
+    // The race-freedom argument is that `collect-err` deposits both in one firing. Splitting it
+    // opens a marking with n arrivals and the failure marker still pending, where `join-ok`
+    // fires and the marker then lands in an empty block.
+    const mutant = mutating('collect-err', (t, p) => {
+      const armErr = p('arm-err') as Place<FailureToken>;
+      const arrived = p('arrived') as Place<ArmArrival>;
+      const errSeen = p('err-seen') as Place<FailureToken>;
+      const pending = place<FailureToken>('s.0.route.err-pending');
+      return [
+        rebuilt(t, {
+          outputs: and(outPlace(arrived), outPlace(pending)),
+          action: async (tctx) => {
+            tctx.output(arrived, { status: 'failed' });
+            tctx.output(pending, tctx.input(armErr));
+          },
+        }),
+        Transition.builder('t.0.route.relay-err')
+          .inputs(one(pending))
+          .outputs(outPlace(errSeen))
+          .action(async (tctx) => {
+            tctx.output(errSeen, tctx.input(pending));
+          })
+          .build(),
+      ];
     });
 
-    const { outcome, residue } = await runAndInspect(compileBranch(threeArms, runner), 'alert');
-
-    expect(outcome.status).toBe('failed');
-    expect(residue).toEqual([]);
+    const reports = await verifyMutant(mutant);
+    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
   });
+});
 
-  it('when every arm fails and the branch has a downstream entry that must not run', async () => {
-    const chained = workflow(branch('route', step('a'), step('b')), step('after'));
-    const runner = runnerWith(() => [0, 1], {
-      a: () => ({ status: 'failed', error: 'x' }),
-      b: () => ({ status: 'failed', error: 'y' }),
-    });
+describe('compiled branch, a compiled net serves any runner', () => {
+  it('verifies the same net it runs: one CompiledWorkflow, proved and then executed', async () => {
+    const compiled: CompiledWorkflow = compile(workflow(step('validate'), branch('route', ...arms(3)), step('audit')));
+    expectProven(await verifyWorkflow(compiled, { timeoutMs: 120_000 }));
 
-    const { outcome, residue } = await runAndInspect(compileBranch(chained, runner), 'alert');
-
-    expect(outcome.status).toBe('failed');
-    expect(runner.calls).not.toContain('after');
-    // In particular the downstream entry's input place is empty: a failing branch must not
-    // leave a token sitting in front of a step that will never run.
-    expect(residue).toEqual([]);
-  });
-
-  it('on the zero-arms-selected edge, where every gate takes the skip leg', async () => {
-    const runner = runnerWith(() => []);
-
-    const { outcome, residue } = await runAndInspect(compileBranch(threeArms, runner), 'alert');
-
-    // The skip marker is the design's "nothing happened" token. It goes straight into
-    // `arrived`, so it is consumed by the same join as everything else.
-    expect(runner.calls).toEqual([]);
-    expect(outcome).toEqual({ status: 'success', output: {} });
-    expect(residue).toEqual([]);
-  });
-
-  it('on a mix of skip, success and failure in one branch', async () => {
-    const runner = runnerWith(() => [0, 2], {
-      email: (input) => ({ status: 'success', output: input }),
-      push: () => ({ status: 'failed', error: 'p' }),
-    });
-
-    const { outcome, residue } = await runAndInspect(compileBranch(threeArms, runner), 'alert');
-
-    expect(outcome).toEqual({ status: 'failed', stepId: 'push', error: 'p' });
-    expect(residue).toEqual([]);
-  });
-
-  it('when a nested branch fails entirely while the outer sibling is still in flight', async () => {
-    const runner = runnerWith(() => [0, 1], {
-      a: () => ({ status: 'failed', error: 'a!' }),
-      b: () => ({ status: 'failed', error: 'b!' }),
-      slow: async (input) => { await sleepMs(25); return { status: 'success', output: input }; },
-    });
-
-    const { outcome, residue } = await runAndInspect(compileBranch(nested, runner), 'alert');
-
-    expect(outcome.status).toBe('failed');
-    expect(residue).toEqual([]);
-  });
-
-  it("when a nested branch's own decision throws, arming none of its arms", async () => {
-    const runner = runnerWith(
-      (entryId) => {
-        if (entryId === 'inner') throw new Error('condition blew up');
-        return [0, 1];
-      },
-      { slow: async (input) => { await sleepMs(25); return { status: 'success', output: input }; } },
-    );
-
-    const { outcome, residue } = await runAndInspect(compileBranch(nested, runner), 'alert');
-
-    // `decide` fails before any gate is armed, so the inner branch contributes only a failure
-    // token to the outer arm's local failure place — and the outer join still fires.
-    expect(outcome.status).toBe('failed');
-    expect(residue).toEqual([]);
-  });
-
-  it('on malformed selectBranches answers: duplicates, a Set, a non-array, a non-integer', async () => {
-    const cases: ReadonlyArray<readonly [string, unknown, 'success' | 'failed']> = [
-      ['duplicate indices', [1, 1, 1], 'success'],
-      ['a Set instead of an array', new Set([0, 2]), 'success'],
-      ['undefined', undefined, 'failed'],
-      ['a non-integer index', [1.5], 'failed'],
-      ['an out-of-range index', [7], 'failed'],
-      ['a stringly-typed index', ['1'], 'failed'],
-    ];
-
-    for (const [label, answer, expected] of cases) {
-      const { outcome, residue } = await runAndInspect(
-        compileBranch(threeArms, runnerWith(() => answer)),
-        'alert',
-      );
-      expect(outcome.status, label).toBe(expected);
-      expect(residue, label).toEqual([]);
-    }
-  });
-
-  it('under repetition, where a success and a failure settle in the same executor pass', async () => {
-    // Both arms resolve without awaiting anything, so their settle transitions land in one
-    // pass. If outputs were not applied atomically per firing, `join.ok` would sometimes see
-    // n markers with an empty error place and the run would report success.
-    const statuses = new Set<string>();
-    for (let attempt = 0; attempt < 50; attempt++) {
-      const runner = runnerWith(() => [0, 1], {
-        email: (input) => ({ status: 'success', output: input }),
-        sms: () => ({ status: 'failed', error: 'boom' }),
-      });
-      const { outcome, residue } = await runAndInspect(compileBranch(threeArms, runner), 'alert');
-      statuses.add(outcome.status);
-      expect(residue).toEqual([]);
-    }
-    expect([...statuses]).toEqual(['failed']);
-  }, 30_000);
-
-  it('when two instances run through the same branch sub-net at once (KNOWN LIMITATION)', async () => {
-    // The join is a *cardinality* join, not a correlated one: `exactly(n, arrived)` takes any
-    // n markers, not n markers belonging to one instance. Nothing in the compiler produces
-    // this today — `compile` seeds one token and `parallel` gives each arm its own sub-net —
-    // but a `foreach` that reused one compiled body at concurrency > 1 would, and the join
-    // would then mix the instances' results.
-    //
-    // This pins the part that is safe (no token strands) and documents the part that is not.
-    // If someone adds instance correlation (ν-tokens / a correlated fork-join), the second
-    // assertion is the one to delete.
-    const runner = runnerWith(() => [0, 1], {
-      // Only the first instance's second arm is slow, so instance 2 settles both of its
-      // markers while instance 1 still has one outstanding.
-      b: async (input) => {
-        if (input === 'run1') await sleepMs(40);
-        return { status: 'success', output: `b(${String(input)})` };
-      },
-      a: (input) => ({ status: 'success', output: `a(${String(input)})` }),
-    });
-    const compiled = compileBranch(workflow(branch('route', step('a'), step('b'))), runner);
-
-    const executor = new PrecompiledNetExecutor(
-      compiled.net,
-      new Map([[compiled.entryPlace, [
-        tokenOf<FlowToken>({ data: 'run1' }),
-        tokenOf<FlowToken>({ data: 'run2' }),
-      ]]]),
-      {},
-    );
-    const marking = await executor.run(5_000, 'close');
-
-    const terminals = new Set([compiled.donePlace.name, compiled.failedPlace.name]);
-    const residue: string[] = [];
-    for (const p of compiled.net.places) {
-      if (!terminals.has(p.name) && marking.tokenCount(p) > 0) residue.push(p.name);
-    }
-
-    // Safe: every token reached a terminal, both instances completed, nothing stranded.
-    expect(residue).toEqual([]);
-    expect(marking.tokenCount(compiled.donePlace)).toBe(2);
-
-    // Not safe: the first record out is not instance 1's. It joined one marker from each
-    // instance — both for arm `a` — so arm `b` is missing from it entirely. A correlated join
-    // would have produced `{ a: 'a(runX)', b: 'b(runX)' }` for one consistent X.
-    const first = (marking.peekFirst(compiled.donePlace) as { value: FlowToken } | null)?.value
-      .data as Record<string, string> | undefined;
-    const correlated =
-      first !== undefined &&
-      Object.keys(first).length === 2 &&
-      ['run1', 'run2'].some((run) => first['a'] === `a(${run})` && first['b'] === `b(${run})`);
-    expect(correlated, `joined record was ${JSON.stringify(first)}`).toBe(false);
-  }, 20_000);
+    const runner = new RecordingRunner({ branches: { route: () => [0, 2] } });
+    const outcome = await runWorkflow(compiled, 'in', { runner });
+    expect(outcome).toStrictEqual({ status: 'success', output: { arm0: 'in', arm1: undefined, arm2: 'in' } });
+  }, 300_000);
 });

@@ -1,497 +1,477 @@
 import { describe, expect, it } from 'vitest';
-import { PrecompiledNetExecutor, tokenOf } from 'libpetri';
-import { compile } from '../../src/compiler/index.js';
-import { describeReport, verifyWorkflow } from '../../src/verify/index.js';
-import { classify, runWorkflow, type RunOutcome } from '../../src/engine/index.js';
-import { parallelGadget } from '../../src/compiler/gadgets/parallel.js';
+import { Transition, one, type In, type Place } from 'libpetri';
+import { compile, parallelGadget, type Gadget } from '../../src/compiler/index.js';
+import { runWorkflow, runWorkflowDetailed } from '../../src/engine/index.js';
 import type {
-  CompiledWorkflow,
-  FlowToken,
+  EntryDescription,
+  Exits,
+  StepCall,
+  StepDescription,
   StepOutcome,
-  StepRunner,
   WorkflowDescription,
 } from '../../src/compiler/types.js';
-import { RecordingRunner, inertRunner } from '../fixtures/runner.js';
+import { RecordingRunner, type Behaviour } from '../fixtures/runner.js';
 
-/** Registered explicitly, so these run against this gadget and not the registry's placeholder. */
-const build = (description: WorkflowDescription, runner: StepRunner): CompiledWorkflow =>
-  compile(description, { runner, gadgets: { parallel: parallelGadget } });
-
-/**
- * `RecordingRunner`'s behaviours are synchronous, so every arm settles in the same pass. One
- * test needs a sibling genuinely still in flight when another arm has already failed — that is
- * the interleaving a naive fork/join strands.
- */
-class PacedRunner implements StepRunner {
-  readonly calls: string[] = [];
-
-  constructor(
-    private readonly behaviour: Record<string, (input: unknown) => Promise<StepOutcome> | StepOutcome>,
-  ) {}
-
-  async run(stepId: string, input: unknown): Promise<StepOutcome> {
-    this.calls.push(stepId);
-    const fn = this.behaviour[stepId];
-    if (fn === undefined) return { status: 'success', output: input };
-    return fn(input);
-  }
-}
+const step = (id: string, extra: Partial<Omit<StepDescription, 'kind' | 'id'>> = {}): StepDescription =>
+  ({ kind: 'step', id, ...extra });
+const fan = (id: string, arms: readonly StepDescription[]): EntryDescription => ({ kind: 'parallel', id, arms });
+const wf = (...entries: EntryDescription[]): WorkflowDescription => ({ id: 'w', entries });
 
 const after = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Runs to quiescence exactly as `runWorkflow` does, but also reports every place still holding a
- * token. A join is precisely the shape whose bugs hide in the tokens the classification never
- * looks at: `classify` reports `failed` as soon as the failure terminal is marked, so an arm
- * left stranded elsewhere would be invisible to the outcome alone.
+ * Scripted arm behaviours that also log the order arms *settled* in, so a test can show that
+ * time order and index order really did differ rather than assume it.
  */
-async function run(
-  compiled: CompiledWorkflow,
-  input: unknown,
-): Promise<{ readonly outcome: RunOutcome; readonly held: readonly string[] }> {
-  const executor = new PrecompiledNetExecutor(
-    compiled.net,
-    new Map([[compiled.entryPlace, [tokenOf<FlowToken>({ data: input })]]]),
-  );
-  const marking = await executor.run(10_000, 'close');
+class Script {
+  readonly settled: string[] = [];
+  readonly inputs = new Map<string, unknown[]>();
 
-  const held: string[] = [];
-  for (const p of compiled.net.places) {
-    const count = marking.tokenCount(p);
-    if (count > 0) held.push(`${p.name}=${count}`);
+  /** Resolves `outcome` after `ms`, recording the input it saw and when it settled. */
+  at(ms: number, id: string, outcome: StepOutcome | ((input: unknown, call: StepCall) => StepOutcome)): Behaviour {
+    return async (input, call) => {
+      this.inputs.set(id, [...(this.inputs.get(id) ?? []), input]);
+      if (ms > 0) await after(ms);
+      this.settled.push(id);
+      return typeof outcome === 'function' ? outcome(input, call) : outcome;
+    };
   }
-  return { outcome: classify(compiled, marking), held: held.sort() };
 }
 
-const tag = (id: string) => (input: unknown): StepOutcome => ({
-  status: 'success',
-  output: `${input as string}/${id}`,
-});
+const ok = (output: unknown): StepOutcome => ({ status: 'success', output });
+const tag = (id: string) => (input: unknown): StepOutcome => ok(`${input as string}/${id}`);
 
-const fanThenAfter = {
-  id: 'fanout',
-  entries: [
-    {
-      kind: 'parallel',
-      id: 'fan',
-      arms: [
-        { kind: 'step', id: 'a' },
-        { kind: 'step', id: 'b' },
-        { kind: 'step', id: 'c' },
-      ],
-    },
-    { kind: 'step', id: 'after' },
-  ],
-} as const;
+const run = (description: WorkflowDescription, runner: RecordingRunner, gadget: Gadget = parallelGadget) =>
+  runWorkflow(compile(description, { gadgets: { parallel: gadget } }), 'x', { runner });
 
-const nestedFan = {
-  id: 'nested-fanout',
-  entries: [
-    {
-      kind: 'parallel',
-      id: 'outer',
-      arms: [
-        { kind: 'step', id: 'a' },
-        {
-          kind: 'parallel',
-          id: 'inner',
-          arms: [
-            { kind: 'step', id: 'b' },
-            { kind: 'step', id: 'c' },
-          ],
-        },
-      ],
-    },
-  ],
-} as const;
+// Every outcome below is asserted whole, with `toStrictEqual`: it catches a `residue` key (a
+// token left anywhere in the net) exactly as `toEqual` does, and additionally tells a key that
+// is present with `undefined` from a key that is absent — the difference between the two value
+// shapes this gadget hands on.
 
-describe('parallel', () => {
-  it('runs every arm and joins exactly once before the next entry', async () => {
-    const runner = new RecordingRunner({ a: tag('a'), b: tag('b'), c: tag('c') });
-
-    const { outcome, held } = await run(build(fanThenAfter, runner), 'x');
-
-    // All three ran, in no order this test is entitled to predict, and `after` ran only once
-    // all three had: the join is the only producer into the next entry's place.
-    expect(runner.calls.slice(0, 3).sort()).toEqual(['a', 'b', 'c']);
-    expect(runner.calls[3]).toBe('after');
-    expect(runner.calls).toHaveLength(4);
-    expect(outcome.status).toBe('success');
-    expect(held).toEqual(['wf.done=1']);
-  });
-
-  it('carries every arm both its input and its output across the join', async () => {
+describe('parallel: success', () => {
+  it('runs every arm on the same input and, as the last entry, returns the block output in arm order', async () => {
+    const s = new Script();
+    // Completion order c, b, a — the reverse of arm order.
     const runner = new RecordingRunner({
-      a: tag('a'),
-      b: tag('b'),
-      c: tag('c'),
-      after: (input) => ({ status: 'success', output: input }),
+      a: s.at(30, 'a', tag('a')),
+      b: s.at(15, 'b', tag('b')),
+      c: s.at(0, 'c', tag('c')),
     });
 
-    const { outcome } = await run(build(fanThenAfter, runner), 'x');
+    const outcome = await run(wf(fan('fan', [step('a'), step('b'), step('c')])), runner);
 
-    // Every arm saw the same input `x` (the fork copies it), and every arm's output reached the
-    // next entry keyed by arm id, assembled in arm order rather than completion order.
-    expect(outcome).toEqual({ status: 'success', output: { a: 'x/a', b: 'x/b', c: 'x/c' } });
+    expect(s.settled).toEqual(['c', 'b', 'a']);
+    expect([...s.inputs]).toEqual([['a', ['x']], ['b', ['x']], ['c', ['x']]]);
+    expect(outcome).toStrictEqual({ status: 'success', output: { a: 'x/a', b: 'x/b', c: 'x/c' } });
+    expect(Object.keys((outcome as { output: object }).output)).toEqual(['a', 'b', 'c']);
   });
 
-  it('routes one failing arm to the failure terminal without stranding its siblings', async () => {
-    const runner = new PacedRunner({
-      a: async (input) => { await after(10); return tag('a')(input); },
-      b: () => ({ status: 'failed', error: 'b exploded' }),
-      c: async (input) => { await after(10); return tag('c')(input); },
+  it('hands the next entry a record over every declared arm, and the next entry runs only after the join', async () => {
+    const s = new Script();
+    const runner = new RecordingRunner({
+      a: s.at(20, 'a', tag('a')),
+      b: s.at(0, 'b', tag('b')),
+      after: (input) => ok({ saw: input }),
     });
 
-    const { outcome, held } = await run(build(fanThenAfter, runner), 'x');
+    const outcome = await run(wf(fan('fan', [step('a'), step('b')]), step('after')), runner);
 
-    // `b` fails while `a` and `c` are still in flight — the case that deadlocks a join wired
-    // directly to each arm's done place.
-    expect(outcome).toEqual({ status: 'failed', stepId: 'b', error: 'b exploded' });
-    expect(runner.calls.slice(0, 3).sort()).toEqual(['a', 'b', 'c']);
-    expect(runner.calls).not.toContain('after');
-    // The whole point: one token, at the terminal, and nothing left anywhere else. A sibling
-    // sitting in `arrived` or a marker left in `err-seen` would show up here.
-    expect(held).toEqual(['wf.failed=1']);
+    expect(runner.calls.slice(0, 2).sort()).toEqual(['a', 'b']);
+    expect(runner.calls).toEqual([...runner.calls.slice(0, 2), 'after']);
+    expect(outcome).toStrictEqual({ status: 'success', output: { saw: { a: 'x/a', b: 'x/b' } } });
   });
 
-  it('drains every error marker when several arms fail', async () => {
-    const runner = new PacedRunner({
-      a: () => ({ status: 'failed', error: 'a exploded' }),
-      b: async (input) => { await after(10); return tag('b')(input); },
-      c: async () => { await after(5); return { status: 'failed', error: 'c exploded' }; },
+  it('retries an arm inside the block, and only its final attempt decides the arm', async () => {
+    const runner = new RecordingRunner({
+      a: (input, call) => (call.attempt < 2 ? { status: 'failed', error: `attempt ${call.attempt}` } : tag('a')(input)),
     });
 
-    const { outcome, held } = await run(build(fanThenAfter, runner), 'x');
+    const outcome = await run(wf(fan('fan', [step('a', { retries: 2 }), step('b')])), runner);
 
-    // Two failures put two tokens in `err-seen`; one `join-fail` firing must clear both. The
-    // first to fail is the one reported, which is what `Promise.all` would have rejected with.
-    expect(outcome).toEqual({ status: 'failed', stepId: 'a', error: 'a exploded' });
-    // Without the reset arc this would also hold `...fan.err-seen=1`, forever.
-    expect(held).toEqual(['wf.failed=1']);
-  });
-
-  it('joins a parallel nested inside a parallel arm', async () => {
-    const runner = new RecordingRunner({ a: tag('a'), b: tag('b'), c: tag('c') });
-
-    const { outcome, held } = await run(build(nestedFan, runner), 'x');
-
-    expect(runner.calls.sort()).toEqual(['a', 'b', 'c']);
-    expect(outcome).toEqual({
-      status: 'success',
-      output: { a: 'x/a', inner: { b: 'x/b', c: 'x/c' } },
-    });
-    expect(held).toEqual(['wf.done=1']);
-  });
-
-  it('carries a nested arm failure through both joins', async () => {
-    const runner = new PacedRunner({
-      a: async (input) => { await after(10); return tag('a')(input); },
-      b: async (input) => { await after(10); return tag('b')(input); },
-      c: () => ({ status: 'failed', error: 'c exploded' }),
-    });
-
-    const { outcome, held } = await run(build(nestedFan, runner), 'x');
-
-    // The inner gadget's failure terminal is the outer gadget's local `arm-err`, not
-    // `wf.failed`, so the inner join settles first and the outer one decides the run.
-    expect(outcome).toEqual({ status: 'failed', stepId: 'c', error: 'c exploded' });
-    expect(held).toEqual(['wf.failed=1']);
-  });
-
-  it('joins an arm that has no failure branch at all', async () => {
-    const runner = new RecordingRunner({ a: tag('a') });
-    const withSleep = {
-      id: 'fan-with-sleep',
-      entries: [
-        {
-          kind: 'parallel',
-          id: 'fan',
-          arms: [
-            { kind: 'step', id: 'a' },
-            { kind: 'sleep', id: 'wait', durationMs: 5 },
-          ],
-        },
-      ],
-    } as const;
-
-    const { outcome, held } = await run(build(withSleep, runner), 'x');
-
-    // `sleepGadget` never writes to its failure place, so `arm-err` has no producer here. The
-    // join must not depend on one existing.
-    expect(outcome).toEqual({ status: 'success', output: { a: 'x/a', wait: 'x' } });
-    expect(held).toEqual(['wf.done=1']);
-  });
-
-  it('keeps two arms that are the same step apart in the net', async () => {
-    const runner = new RecordingRunner({ a: tag('a') });
-    const twins = {
-      id: 'twins',
-      entries: [
-        {
-          kind: 'parallel',
-          id: 'fan',
-          arms: [
-            { kind: 'step', id: 'a' },
-            { kind: 'step', id: 'a' },
-          ],
-        },
-      ],
-    } as const;
-
-    const { outcome, held } = await run(build(twins, runner), 'x');
-
-    // Arm identity in the net is the path, so both arms compile to distinct places and both
-    // run. The id-keyed aggregate still collapses to one entry — exactly as Mastra's does.
-    expect(runner.calls).toEqual(['a', 'a']);
-    expect(outcome).toEqual({ status: 'success', output: { a: 'x/a' } });
-    expect(held).toEqual(['wf.done=1']);
-  });
-
-  it('compiles a single-arm parallel', async () => {
-    const solo = {
-      id: 'solo',
-      entries: [{ kind: 'parallel', id: 'fan', arms: [{ kind: 'step', id: 'only' }] }],
-    } as const;
-
-    const { outcome } = await run(build(solo, new RecordingRunner({ only: tag('only') })), 'x');
-
-    expect(outcome).toEqual({ status: 'success', output: { only: 'x/only' } });
-  });
-
-  it('rejects a parallel with no arms rather than compiling a net that hangs', () => {
-    const empty = {
-      id: 'empty-fan',
-      entries: [{ kind: 'parallel', id: 'fan', arms: [] }],
-    } as const;
-
-    expect(() => build(empty, new RecordingRunner())).toThrow(/no arms/);
-  });
-
-  it('runs through the kernel unchanged', async () => {
-    const runner = new RecordingRunner({ a: tag('a'), b: tag('b'), c: tag('c') });
-
-    const outcome = await runWorkflow(build(fanThenAfter, runner), 'x');
-
-    expect(outcome.status).toBe('success');
-    expect(runner.calls).toHaveLength(4);
+    expect(runner.attempts.filter((a) => a.stepId === 'a').map((a) => a.attempt)).toEqual([0, 1, 2]);
+    expect(outcome).toStrictEqual({ status: 'success', output: { a: 'x/a', b: 'x' } });
   });
 });
 
-/**
- * The failure mode a join is most likely to have is a token nobody can consume, and `classify`
- * is blind to it: it reports `failed` the instant `wf.failed` is marked, so a sibling left in
- * `arrived` or a marker left in `err-seen` never reaches the outcome. Every case below asserts
- * the *held* set, not just the status, and every one is an interleaving the executor tests
- * above do not reach.
- */
-describe('parallel, stranded-token hunt', () => {
-  const armsOf = (ids: readonly string[]): WorkflowDescription => ({
-    id: 'w',
-    entries: [{ kind: 'parallel', id: 'fan', arms: ids.map((id) => ({ kind: 'step', id })) }],
-  });
-  const fails = (error: string) => (): StepOutcome => ({ status: 'failed', error });
-  const failsAfter = (error: string, ms: number) => async (): Promise<StepOutcome> => {
-    await after(ms);
-    return { status: 'failed', error };
-  };
-  const succeedsAfter = (id: string, ms: number) => async (input: unknown): Promise<StepOutcome> => {
-    await after(ms);
-    return tag(id)(input);
-  };
-
-  it('strands nothing when every arm fails at once', async () => {
-    const runner = new PacedRunner({ a: fails('a!'), b: fails('b!'), c: fails('c!') });
-
-    const { outcome, held } = await run(build(armsOf(['a', 'b', 'c']), runner), 'x');
-
-    // Three failures put three tokens in `err-seen`; one `join-fail` firing consumes the FIFO
-    // head and the reset drops the other two. Any survivor would show up here, permanently:
-    // its only consumer needs a full `arrived` count that can never come again.
-    expect(outcome).toEqual({ status: 'failed', stepId: 'a', error: 'a!' });
-    expect(held).toEqual(['wf.failed=1']);
-  });
-
-  it('reports the first arm to fail when failures are staggered in time', async () => {
-    const runner = new PacedRunner({
-      a: failsAfter('a!', 40),
-      b: failsAfter('b!', 5),
-      c: failsAfter('c!', 20),
+describe('parallel: failure', () => {
+  it('reports the lowest-indexed failed arm, not the first to fail in time', async () => {
+    const s = new Script();
+    const runner = new RecordingRunner({
+      a: s.at(40, 'a', { status: 'failed', error: 'a!' }),
+      b: s.at(20, 'b', tag('b')),
+      c: s.at(0, 'c', { status: 'failed', error: 'c!' }),
     });
 
-    const { outcome, held } = await run(build(armsOf(['a', 'b', 'c']), runner), 'x');
+    const outcome = await run(wf(fan('fan', [step('a'), step('b'), step('c')])), runner);
 
-    // `one(err-seen)` takes the FIFO head ([EXEC-010]), which is the arm that failed first in
-    // time — not the lowest-indexed arm. That is what `Promise.all` would have rejected with.
-    expect(outcome).toEqual({ status: 'failed', stepId: 'b', error: 'b!' });
-    expect(held).toEqual(['wf.failed=1']);
+    // `c` failed first in time; Mastra's `results.find` over index-aligned results picks `a`.
+    expect(s.settled).toEqual(['c', 'b', 'a']);
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', error: 'a!' });
   });
 
-  it('strands nothing with eight arms, half of them failing at different times', async () => {
-    const runner = new PacedRunner({
-      a: failsAfter('a!', 5),
-      c: failsAfter('c!', 10),
-      e: failsAfter('e!', 15),
-      g: failsAfter('g!', 20),
-      b: succeedsAfter('b', 30),
-      d: succeedsAfter('d', 30),
-      f: succeedsAfter('f', 30),
-      h: succeedsAfter('h', 30),
+  it('waits for every sibling before failing the block, and stops the entries after it', async () => {
+    const s = new Script();
+    const runner = new RecordingRunner({
+      a: s.at(0, 'a', { status: 'failed', error: 'a!' }),
+      b: s.at(30, 'b', tag('b')),
     });
 
-    const { outcome, held } = await run(
-      build(armsOf(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']), runner),
-      'x',
+    const outcome = await run(wf(fan('fan', [step('a'), step('b')]), step('after')), runner);
+
+    // Mastra's arms never reject, so `Promise.all` awaits `b` too; the join is a count and does
+    // the same. `after` never runs.
+    expect(s.settled).toEqual(['a', 'b']);
+    expect(runner.calls).not.toContain('after');
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', error: 'a!' });
+  });
+
+  it('forwards a failing arm\'s tripwire, so the run ends tripwire', async () => {
+    const runner = new RecordingRunner({
+      b: () => ({ status: 'failed', error: 'blocked', tripwire: { reason: 'policy' } }),
+    });
+
+    const outcome = await run(wf(fan('fan', [step('a'), step('b')])), runner);
+
+    expect(outcome).toStrictEqual({ status: 'tripwire', stepId: 'b', tripwire: { reason: 'policy' } });
+  });
+
+  it('takes tripwire-or-not from the lowest-indexed failure, whichever failed first', async () => {
+    const s = new Script();
+    const plainFirst = new RecordingRunner({
+      a: s.at(20, 'a', { status: 'failed', error: 'a!' }),
+      b: s.at(0, 'b', { status: 'failed', error: 'b!', tripwire: { reason: 'policy' } }),
+    });
+    const tripwireFirst = new RecordingRunner({
+      a: s.at(20, 'a', { status: 'failed', error: 'a!', tripwire: { reason: 'policy' } }),
+      b: s.at(0, 'b', { status: 'failed', error: 'b!' }),
+    });
+    const shape = wf(fan('fan', [step('a'), step('b')]));
+
+    expect(await run(shape, plainFirst)).toStrictEqual({ status: 'failed', stepId: 'a', error: 'a!' });
+    expect(await run(shape, tripwireFirst)).toStrictEqual({ status: 'tripwire', stepId: 'a', tripwire: { reason: 'policy' } });
+  });
+
+  it('lets a failure outrank a suspension, and leaves no suspension marker behind', async () => {
+    const runner = new RecordingRunner({
+      a: () => ({ status: 'suspended', payload: 'wait for approval' }),
+      b: async () => { await after(10); return { status: 'failed', error: 'b!' }; },
+    });
+
+    const outcome = await run(wf(fan('fan', [step('a'), step('b')])), runner);
+
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'b', error: 'b!' });
+  });
+
+  it('settles every one of the five outcomes in one block, and the failure decides it', async () => {
+    const runner = new RecordingRunner({
+      ok: tag('ok'),
+      bad: async () => { await after(15); return { status: 'failed', error: 'bad!' }; },
+      wait: () => ({ status: 'suspended', payload: 'p' }),
+      early: () => ({ status: 'bailed', output: 'early' }),
+      sub: () => ({ status: 'paused' }),
+    });
+
+    const outcome = await run(
+      wf(fan('fan', [step('ok'), step('bad'), step('wait'), step('early'), step('sub', { source: 'workflow' })]), step('after')),
+      runner,
     );
 
-    // Four successes and four failures, all eight settlements landing in one `arrived` place,
-    // and four markers in `err-seen` that a single `join-fail` firing must clear.
-    expect(outcome).toEqual({ status: 'failed', stepId: 'a', error: 'a!' });
-    expect(held).toEqual(['wf.failed=1']);
-  });
-
-  it('holds a failure until a sibling sleep elapses, rather than stranding the sleep', async () => {
-    const runner = new PacedRunner({ a: fails('a!') });
-    const withSleep = {
-      id: 'w',
-      entries: [
-        {
-          kind: 'parallel',
-          id: 'fan',
-          arms: [
-            { kind: 'step', id: 'a' },
-            { kind: 'sleep', id: 'wait', durationMs: 40 },
-          ],
-        },
-      ],
-    } as const;
-
-    const started = Date.now();
-    const { outcome, held } = await run(build(withSleep, runner), 'x');
-
-    // A divergence from `Promise.all`, and a deliberate one: the join is a count, so the
-    // failure cannot be reported until every arm has settled. Rejecting early would mean
-    // firing `join-fail` on a partial count and leaving the sleeper's eventual token with no
-    // consumer — the stranding this whole shape exists to avoid. Documented, not accidental.
-    expect(outcome).toEqual({ status: 'failed', stepId: 'a', error: 'a!' });
-    expect(Date.now() - started).toBeGreaterThanOrEqual(35);
-    expect(held).toEqual(['wf.failed=1']);
-  });
-
-  it('strands nothing when an outer arm fails while a nested parallel is still in flight', async () => {
-    const runner = new PacedRunner({
-      a: fails('a!'),
-      b: succeedsAfter('b', 30),
-      c: succeedsAfter('c', 30),
-    });
-
-    const { outcome, held } = await run(build(nestedFan, runner), 'x');
-
-    // The inner join has not settled when the outer one already has its error marker. Both
-    // joins still have to reach a decision, and the inner's success token must be consumed by
-    // the outer `collect`, not left sitting in `arm-1-done`.
-    expect(outcome).toEqual({ status: 'failed', stepId: 'a', error: 'a!' });
-    expect(held).toEqual(['wf.failed=1']);
-  });
-
-  it('strands nothing when every arm of every nesting level fails', async () => {
-    const runner = new PacedRunner({ a: fails('a!'), b: fails('b!'), c: fails('c!') });
-
-    const { outcome, held } = await run(build(nestedFan, runner), 'x');
-
-    expect(outcome.status).toBe('failed');
-    expect(held).toEqual(['wf.failed=1']);
-  });
-
-  it('strands nothing when the parallel is followed by an entry that never runs', async () => {
-    const runner = new PacedRunner({ a: fails('a!'), b: succeedsAfter('b', 20), c: succeedsAfter('c', 20) });
-
-    const { outcome, held } = await run(build(fanThenAfter, runner), 'x');
-
-    // `after`'s input place must stay empty, and nothing may be left in the gadget either.
     expect(runner.calls).not.toContain('after');
-    expect(outcome.status).toBe('failed');
-    expect(held).toEqual(['wf.failed=1']);
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'bad', error: 'bad!' });
   });
 
-  it('keeps an arm output whose id is __proto__ as an own key of the aggregate', async () => {
-    // Regression. Arm ids are arbitrary user strings, and the aggregate used to be assembled by
-    // `aggregate[id] = value`. For `__proto__` that assignment is a setter call: it replaced the
-    // result object's prototype instead of creating a key, so the arm's output disappeared from
-    // `Object.keys` and its fields showed up on every downstream read as inherited properties.
-    const runner: StepRunner = {
-      async run(stepId: string): Promise<StepOutcome> {
-        if (stepId === '__proto__') return { status: 'success', output: { leaked: true } };
-        return { status: 'success', output: stepId };
-      },
-    };
-
-    const { outcome, held } = await run(build(armsOf(['__proto__', 'b']), runner), 'x');
-
-    expect(outcome.status).toBe('success');
-    const aggregate = (outcome as { output: Record<string, unknown> }).output;
-    expect(Object.keys(aggregate).sort()).toEqual(['__proto__', 'b']);
-    expect(Object.prototype.hasOwnProperty.call(aggregate, '__proto__')).toBe(true);
-    // The prototype is untouched, so nothing the arm returned leaks onto unrelated reads.
-    expect(Object.getPrototypeOf(aggregate)).toBe(Object.prototype);
-    expect((aggregate as { leaked?: unknown }).leaked).toBeUndefined();
-    expect(held).toEqual(['wf.done=1']);
-  });
-
-  it('strands nothing when the step runner throws instead of returning a failure', async () => {
-    const runner = new PacedRunner({
-      a: () => { throw new Error('boom'); },
-      b: succeedsAfter('b', 20),
+  it('treats a runner that throws as a failed arm', async () => {
+    const boom = new Error('provider down');
+    const runner = new RecordingRunner({
+      a: () => { throw boom; },
+      b: async (input) => { await after(10); return tag('b')(input); },
     });
 
-    const { outcome, held } = await run(build(armsOf(['a', 'b']), runner), 'x');
+    const outcome = await run(wf(fan('fan', [step('a'), step('b')])), runner);
 
-    // `stepAction` converts a thrown runner into the declared failure branch, so the arm still
-    // settles and the join still reaches its count. A lost settlement here would hang the join.
-    expect(outcome.status).toBe('failed');
-    expect(held).toEqual(['wf.failed=1']);
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', error: boom });
+  });
+
+  it('fails a retrying arm only once its retries are spent', async () => {
+    const runner = new RecordingRunner({ a: (_input, call) => ({ status: 'failed', error: `attempt ${call.attempt}` }) });
+
+    const outcome = await run(wf(fan('fan', [step('a', { retries: 2 }), step('b')])), runner);
+
+    expect(runner.attempts.filter((a) => a.stepId === 'a')).toHaveLength(3);
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', error: 'attempt 2' });
   });
 });
 
-/**
- * These belong in `tests/verify/` by convention and live here only because this change was
- * scoped to two files. They are the claim the executor tests cannot make: the executor tests
- * say "these interleavings were fine", the proofs say "no interleaving strands a token".
- */
-describe('parallel, proved', () => {
-  const shapes: Record<string, WorkflowDescription> = {
-    'fan-out then a successor': fanThenAfter,
-    'parallel nested in a parallel arm': nestedFan,
-    'an arm that never fails': {
-      id: 'fan-with-sleep',
-      entries: [
-        {
-          kind: 'parallel',
-          id: 'fan',
-          arms: [
-            { kind: 'step', id: 'a' },
-            { kind: 'sleep', id: 'wait', durationMs: 5 },
-          ],
-        },
-      ],
-    },
+describe('parallel: suspension', () => {
+  it('suspends the block on the lowest-indexed suspended arm, and records every suspension', async () => {
+    const s = new Script();
+    const runner = new RecordingRunner({
+      a: s.at(20, 'a', { status: 'suspended', payload: 'pa' }),
+      b: s.at(0, 'b', tag('b')),
+      c: s.at(0, 'c', { status: 'suspended', payload: 'pc' }),
+    });
+
+    const { outcome, stepResults } = await runWorkflowDetailed(
+      compile(wf(fan('fan', [step('a'), step('b'), step('c')]), step('after'))),
+      'x',
+      { runner },
+    );
+
+    expect(s.settled.indexOf('c')).toBeLessThan(s.settled.indexOf('a'));
+    expect(runner.calls).not.toContain('after');
+    expect(outcome).toStrictEqual({ status: 'suspended', stepId: 'a', path: [0, 0], payload: 'pa' });
+    // Mastra's `fmtReturnValue` lists *every* step result that is suspended, not only the one
+    // that decided the block (`default.ts:630-643`); both are in the step results to list.
+    expect(stepResults.get('a')).toStrictEqual({ status: 'suspended', payload: 'pa' });
+    expect(stepResults.get('c')).toStrictEqual({ status: 'suspended', payload: 'pc' });
+  });
+
+  it('picks the lowest index by path, exactly, even when two arms share an id', async () => {
+    const runner = new RecordingRunner({
+      a: async (_input, call) => {
+        if (call.path[1] === 0) await after(20);
+        return { status: 'suspended', payload: `arm ${call.path[1]}` };
+      },
+    });
+
+    const outcome = await run(wf(fan('fan', [step('a'), step('a')])), runner);
+
+    expect(outcome).toStrictEqual({ status: 'suspended', stepId: 'a', path: [0, 0], payload: 'arm 0' });
+  });
+
+  it('lets a suspension outrank a bail and a pause', async () => {
+    const runner = new RecordingRunner({
+      a: () => ({ status: 'bailed', output: 'early' }),
+      b: () => ({ status: 'paused' }),
+      c: async () => { await after(10); return { status: 'suspended', payload: 'pc' }; },
+    });
+
+    const outcome = await run(wf(fan('fan', [step('a'), step('b', { source: 'workflow' }), step('c')])), runner);
+
+    expect(outcome).toStrictEqual({ status: 'suspended', stepId: 'c', path: [0, 2], payload: 'pc' });
+  });
+});
+
+describe('parallel: a bail or a pause is swallowed', () => {
+  const bailA = () => new RecordingRunner({
+    a: () => ({ status: 'bailed', output: 'early' }),
+    b: async (input) => { await after(10); return tag('b')(input); },
+  });
+  const pauseA = () => new RecordingRunner({
+    a: () => ({ status: 'paused' }),
+    b: async (input) => { await after(10); return tag('b')(input); },
+  });
+  const arms = [step('a', { source: 'workflow' }), step('b')];
+
+  it('a bailed arm does not end the run, and the next entry reads its bail payload', async () => {
+    const runner = bailA();
+
+    const outcome = await run(wf(fan('fan', arms), step('after')), runner);
+
+    // A success, not `bailed: true`: the bail ended the arm, not the run.
+    expect(runner.calls).toContain('after');
+    expect(outcome).toStrictEqual({ status: 'success', output: { a: 'early', b: 'x/b' } });
+  });
+
+  it('a bailed arm is absent from the block output when the block is the last entry', async () => {
+    const outcome = await run(wf(fan('fan', arms)), bailA());
+
+    expect(outcome).toStrictEqual({ status: 'success', output: { b: 'x/b' } });
+  });
+
+  it('a paused arm does not end the run, and the next entry sees its key with undefined', async () => {
+    const runner = pauseA();
+
+    const outcome = await run(wf(fan('fan', arms), step('after')), runner);
+
+    expect(runner.calls).toContain('after');
+    expect(outcome).toStrictEqual({ status: 'success', output: { a: undefined, b: 'x/b' } });
+    expect('a' in (outcome as { output: object }).output).toBe(true);
+  });
+
+  it('a paused arm is absent from the block output when the block is the last entry', async () => {
+    const outcome = await run(wf(fan('fan', arms)), pauseA());
+
+    expect(outcome).toStrictEqual({ status: 'success', output: { b: 'x/b' } });
+    expect('a' in (outcome as { output: object }).output).toBe(false);
+  });
+
+  it('a block whose every arm bailed succeeds with {} as the last entry, and hands on every payload otherwise', async () => {
+    const runner = () => new RecordingRunner({
+      a: () => ({ status: 'bailed', output: 'pa' }),
+      b: () => ({ status: 'bailed', output: 'pb' }),
+    });
+    const both = [step('a'), step('b')];
+
+    expect(await run(wf(fan('fan', both)), runner())).toStrictEqual({ status: 'success', output: {} });
+    expect(await run(wf(fan('fan', both), step('after')), runner()))
+      .toStrictEqual({ status: 'success', output: { a: 'pa', b: 'pb' } });
+  });
+});
+
+describe('parallel: the next entry reads the step results, not the arm tokens', () => {
+  it('two arms sharing an id: the result keeps the later index, the next entry keeps the later finisher', async () => {
+    // Arm 0 finishes last. Mastra's block output reduces in index order, so arm 1 wins the key
+    // (`control-flow.ts:286-295`); `stepResults.a` is whatever was written last in time, so arm 0
+    // wins it for the next entry (`default.ts:1141-1149`). Only a join that reads the step results
+    // can produce the second value — the arrivals alone would give the first.
+    const behaviour = () => new RecordingRunner({
+      a: async (_input, call) => {
+        if (call.path[1] === 0) await after(20);
+        return ok(`arm ${call.path[1]}`);
+      },
+    });
+    const twins = [step('a'), step('a')];
+
+    expect(await run(wf(fan('fan', twins)), behaviour())).toStrictEqual({ status: 'success', output: { a: 'arm 1' } });
+    expect(await run(wf(fan('fan', twins), step('after')), behaviour()))
+      .toStrictEqual({ status: 'success', output: { a: 'arm 0' } });
+  });
+
+  it('an arm that ran earlier and pauses in the block hands on undefined, not its earlier output', async () => {
+    // The paused result replaces the earlier success wholesale, as Mastra's does: it is written
+    // over `omitPriorCompletionFields(...)`, which strips the earlier `output`
+    // (`handlers/step.ts:566-569`).
+    const runner = new RecordingRunner({
+      sub: (_input, call) => (call.path.length === 1 ? ok('earlier') : { status: 'paused' }),
+    });
+
+    const outcome = await run(
+      wf(step('sub', { source: 'workflow' }), fan('fan', [step('sub', { source: 'workflow' }), step('b')]), step('after')),
+      runner,
+    );
+
+    expect(runner.calls[0]).toBe('sub');
+    expect(runner.calls.slice(1, 3).sort()).toEqual(['b', 'sub']);
+    expect(runner.calls[3]).toBe('after');
+    expect(outcome).toStrictEqual({ status: 'success', output: { sub: undefined, b: 'earlier' } });
+  });
+});
+
+describe('parallel: the empty block', () => {
+  it('succeeds with {} as the last entry', async () => {
+    const runner = new RecordingRunner();
+
+    const outcome = await run(wf(fan('fan', [])), runner);
+
+    expect(runner.calls).toEqual([]);
+    expect(outcome).toStrictEqual({ status: 'success', output: {} });
+  });
+
+  it('hands {} to the next entry and the run continues', async () => {
+    const runner = new RecordingRunner({ after: (input) => ok({ saw: input }) });
+
+    const outcome = await run(wf(step('before'), fan('fan', []), step('after')), runner);
+
+    expect(runner.calls).toEqual(['before', 'after']);
+    expect(outcome).toStrictEqual({ status: 'success', output: { saw: {} } });
+  });
+});
+
+describe('parallel: arm ids are user strings', () => {
+  const protoRunner = () => new RecordingRunner({
+    // `Object.fromEntries`, because `{ __proto__: fn }` in a literal sets the prototype.
+    steps: Object.fromEntries<Behaviour>([
+      ['__proto__', () => ok({ leaked: true })],
+      ['b', () => ok('b')],
+    ]),
+  });
+  const arms = [step('__proto__'), step('b')];
+
+  const expectOwnProto = (outcome: unknown): void => {
+    expect(outcome).toMatchObject({ status: 'success' });
+    expect('residue' in (outcome as object)).toBe(false);
+    const record = (outcome as { output: Record<string, unknown> }).output;
+    expect(Object.keys(record)).toEqual(['__proto__', 'b']);
+    expect(Object.getOwnPropertyDescriptor(record, '__proto__')?.value).toStrictEqual({ leaked: true });
+    // The prototype is untouched, so nothing the arm returned leaks onto unrelated reads.
+    expect(Object.getPrototypeOf(record)).toBe(Object.prototype);
+    expect((record as { leaked?: unknown }).leaked).toBeUndefined();
   };
 
-  for (const [shape, description] of Object.entries(shapes)) {
-    it(`is deadlock-free and terminates at a declared sink: ${shape}`, async () => {
-      const reports = await verifyWorkflow(build(description, inertRunner));
+  it('keeps a __proto__ arm as an own key of the block output', async () => {
+    expectOwnProto(await run(wf(fan('fan', arms)), protoRunner()));
+  });
 
-      // `proven` explicitly. `unknown` is not a pass, and asserting "not violated" would make
-      // this test vacuous the day a query times out.
-      for (const report of reports) {
-        expect(report.result.verdict.type, describeReport(report)).toBe('proven');
-      }
-      expect(reports.map((r) => r.property)).toEqual(['deadlockFree', 'terminatesAtSink']);
-    }, 90_000);
-  }
+  it('keeps a __proto__ arm as an own key of the record handed to the next entry', async () => {
+    expectOwnProto(await run(wf(fan('fan', arms), step('after')), protoRunner()));
+  });
+});
 
-  // Not a test, because the mutation cannot be expressed without a second gadget, but the
-  // measurement that makes the one above non-vacuous: routing each arm straight to `wf.failed`
-  // instead of to the gadget-local `arm-err` turns `deadlockFree` on the first shape from
-  // `proven` into **violated** — the siblings of a failed arm sit in `arrived` with no enabled
-  // consumer. The proof distinguishes this design from the naive one; it does not merely pass.
+// ---------------------------------------------------------------------------------------------
+// Non-vacuity, observed in a run. `tests/verify/parallel.test.ts` flips a verdict for every
+// safeguard; these show the same removals producing a wrong *run*, through the `gadgets`
+// override with a mutated copy of the real gadget's output — never by editing src.
+// ---------------------------------------------------------------------------------------------
+
+function rebuild(t: Transition, change: { readonly inputs?: readonly In[]; readonly resets?: readonly Place<unknown>[] }): Transition {
+  const b = Transition.builder(t.name)
+    .inputs(...(change.inputs ?? t.inputSpecs))
+    .timing(t.timing)
+    .priority(t.priority)
+    .action(t.action);
+  if (t.outputSpec !== null) b.outputs(t.outputSpec);
+  for (const a of t.inhibitors) b.inhibitor(a.place);
+  for (const p of change.resets ?? t.resets.map((a) => a.place)) b.reset(p);
+  for (const r of t.reads) b.read(r.place);
+  return b.build();
+}
+
+const mutate = (role: string, edit: (t: Transition) => Transition): Gadget => (entry, next, ctx) => {
+  const result = parallelGadget(entry, next, ctx);
+  const transitions = result.transitions.map((t) => (t.name.endsWith(`.${role}`) ? edit(t) : t));
+  expect(transitions.filter((t, i) => t !== result.transitions[i])).toHaveLength(1);
+  return { ...result, transitions };
+};
+
+const bypass = (exit: keyof Exits): Gadget => (entry, next, ctx) =>
+  parallelGadget(entry, next, {
+    ...ctx,
+    emitNested: (s, p, n, exits) => ctx.emitNested(s, p, n, { ...exits, [exit]: ctx.exits[exit] } as Exits),
+  });
+
+describe('parallel: removing a safeguard breaks a run', () => {
+  const twoArms = wf(fan('fan', [step('a'), step('b')]));
+  const slowB = async (input: unknown): Promise<StepOutcome> => { await after(20); return tag('b')(input); };
+
+  it('without the failure arrival deposit, a failing arm ends the run and strands its sibling', async () => {
+    const runner = () => new RecordingRunner({ a: () => ({ status: 'failed', error: 'a!' }), b: slowB });
+
+    expect(await run(twoArms, runner())).toStrictEqual({ status: 'failed', stepId: 'a', error: 'a!' });
+    expect(await run(twoArms, runner(), bypass('failed')))
+      .toStrictEqual({ status: 'failed', stepId: 'a', error: 'a!', residue: ['s.0.fan.arrived'] });
+  });
+
+  it('without the bail arrival deposit, a bailing arm ends the run and strands its sibling', async () => {
+    const runner = () => new RecordingRunner({ a: () => ({ status: 'bailed', output: 'early' }), b: slowB });
+
+    expect(await run(twoArms, runner())).toStrictEqual({ status: 'success', output: { b: 'x/b' } });
+    expect(await run(twoArms, runner(), bypass('bailed')))
+      .toStrictEqual({ status: 'success', output: 'early', bailed: true, residue: ['s.0.fan.arrived'] });
+  });
+
+  it('without the reset on susp-seen, a failure beside a suspension leaves the marker behind', async () => {
+    const runner = () => new RecordingRunner({
+      a: () => ({ status: 'suspended', payload: 'p' }),
+      b: () => ({ status: 'failed', error: 'b!' }),
+    });
+
+    expect(await run(twoArms, runner())).toStrictEqual({ status: 'failed', stepId: 'b', error: 'b!' });
+    expect(await run(twoArms, runner(), mutate('join-fail', (t) => rebuild(t, { resets: [] }))))
+      .toStrictEqual({ status: 'failed', stepId: 'b', error: 'b!', residue: ['s.0.fan.susp-seen'] });
+  });
+
+  it('with one() instead of all() on err-seen, a second failure is left behind', async () => {
+    const runner = () => new RecordingRunner({
+      a: () => ({ status: 'failed', error: 'a!' }),
+      b: () => ({ status: 'failed', error: 'b!' }),
+    });
+    const oneErr = mutate('join-fail', (t) =>
+      rebuild(t, { inputs: t.inputSpecs.map((s) => (s.place.name.endsWith('.err-seen') ? one(s.place) : s)) }));
+
+    expect(await run(twoArms, runner())).toStrictEqual({ status: 'failed', stepId: 'a', error: 'a!' });
+    const mutated = await run(twoArms, runner(), oneErr);
+    expect(mutated).toMatchObject({ status: 'failed', residue: ['s.0.fan.err-seen'] });
+  });
 });

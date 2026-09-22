@@ -1,21 +1,30 @@
 import { Transition, all, and, one, outPlace, place, xor, type Place } from 'libpetri';
-import type { EntryDescription, FailureToken, FlowToken } from '../types.js';
+import { scopeOf } from '../scope.js';
+import type {
+  BailToken,
+  EntryDescription,
+  Exits,
+  FailureToken,
+  FlowToken,
+  PauseToken,
+  StepOutcome,
+  SuspendToken,
+} from '../types.js';
 import type { Gadget } from './types.js';
 
 /**
- * The undispatched tail of the input array.
+ * The undispatched tail of the input — Mastra's fastq queue.
  *
- * One token, consumed and re-emitted by whichever lane starts the next item, which makes it a
- * mutex: items *start* in input order because there is only ever one cursor, not because the
- * engine iterates. `items` is the whole array and `next` indexes it, so the index that pairs a
- * result back to its slot is carried rather than recomputed.
+ * One token, consumed and re-emitted by whichever lane starts the next item, so items *start* in
+ * input order because there is only ever one cursor, not because anything iterates. Removing it
+ * is `queue.kill()`: nothing queued can start again.
  */
 interface ForeachCursor {
   readonly items: readonly unknown[];
   readonly next: number;
 }
 
-/** What a lane is currently working on. Its presence *is* "this lane is busy". */
+/** What a lane is working on. Its presence *is* "this lane is busy". */
 interface ForeachSlot {
   readonly index: number;
 }
@@ -26,325 +35,459 @@ interface ForeachResult {
   readonly value: unknown;
 }
 
-/**
- * A lane's permit. `null` because presence is the whole message ([CORE-011] unit token).
- */
+/** A lane's permit. `null`, because presence is the whole message ([CORE-012] unit token). */
 type LanePermit = null;
+
+/** A failed item, recorded — Mastra's `errorResult` candidates. */
+interface FaultRecord {
+  readonly index: number;
+  readonly failure: FailureToken;
+}
+
+/** A bailed or paused item, recorded — Mastra's `exitResult` candidates. */
+type ExitRecord =
+  | { readonly status: 'bailed'; readonly index: number; readonly bail: BailToken }
+  | { readonly status: 'paused'; readonly index: number; readonly pause: PauseToken };
+
+/** A suspended item, recorded — Mastra's `foreachIndexObj`. */
+interface SuspensionRecord {
+  readonly index: number;
+  readonly suspension: SuspendToken;
+}
 
 /**
  * How many lanes one `.foreach` may compile to.
  *
  * A lane is a full copy of the body, so the net is O(concurrency x |body|) and so is anything
- * that explores it. Failing loudly beats compiling a net that exhausts memory or that no
- * verification run could ever finish; the message says what to do instead.
+ * that explores it. Mastra has no ceiling (`utils.ts:786-796`); refusing loudly beats compiling a
+ * net nothing could explore, and the refusal is a recorded divergence, not a silent clamp.
  */
-const MAX_LANES = 256;
+export const MAX_FOREACH_LANES = 256;
+
+/** The largest item count that is still an array length; past it, `results[k]` stops being an index. */
+const MAX_ITEMS = 2 ** 32 - 1;
 
 /**
- * `.foreach(step, { concurrency })` — run the body once per item of the previous entry's
- * output array, at most `concurrency` at a time, and produce the results in **input** order.
+ * `.foreach(step, { concurrency })` — run the body once per item of the previous entry's output,
+ * at most `concurrency` at a time, results in **input** order, and **stop dispatching the moment
+ * any item does not succeed**.
  *
- * **The shape.** `concurrency` is a compile-time number, so the gadget emits that many *lanes*.
- * A lane is one instantiation of the body (child path `[...path, lane]`, hence its own places)
- * plus a permit place, a slot place and the two places the body settles into:
+ * ```text
+ *   split          in                          -> xor( cursor + permit.* | next [no items] | exits.failed )
+ *   start.l        cursor, permit.l            -> xor( body.l + slot.l + cursor | body.l + slot.l )
+ *                  inhibited by every *other* lane's failed/bailed/suspended/paused
+ *   (body.l)       body.l                      -> done.l | failed.l | bailed.l | suspended.l | paused.l
+ *   collect.l      done.l, slot.l              -> results + permit.l
+ *   fail.l         failed.l, slot.l,    reset(cursor) -> faults + permit.l
+ *   bail.l         bailed.l, slot.l,    reset(cursor) -> exits + permit.l
+ *   pause.l        paused.l, slot.l,    reset(cursor) -> exits + permit.l
+ *   suspend.l      suspended.l, slot.l, reset(cursor) -> suspensions + permit.l
  *
+ *   join     all(results), permit.*   ¬cursor ¬faults ¬exits ¬suspensions      -> next
+ *   fail     all(faults), permit.*    reset(exits, suspensions, results)       -> exits.failed
+ *   exit     all(exits), permit.*     ¬faults  reset(suspensions, results)     -> exits.bailed | exits.paused
+ *   suspend  all(suspensions), permit.* ¬faults ¬exits  reset(results)        -> exits.suspended
  * ```
- *   split      in                     -> xor( cursor + permit.0..n | next | failed )
- *   start.l    cursor, permit.l       -> xor( body.l + slot.l + cursor | body.l + slot.l )
- *   (body.l)   body.l                 -> xor( done.l | failed.l )
- *   collect.l  done.l, slot.l         -> results + permit.l
- *   rescue.l   failed.l, slot.l       -> faults + permit.l
- *   join       all(results), permit.* -> next     ¬cursor ¬faults
- *   abort      all(faults), permit.*  -> failed   ¬cursor  reset(results)
- * ```
  *
- * **Why lanes rather than one body and N anonymous permits.** Two reasons, either decisive.
- * An anonymous permit cannot say *which* body is free, so N permits over one body copy put N
- * items into one set of places, and a result there can no longer be paired with the slot it
- * belongs to — completion order is not dispatch order, which is exactly the case the ordering
- * test covers. And it would not even run concurrently: both executors skip a transition whose
- * action is still in flight (`inFlightFlags` in `precompiled-net-executor.ts`, the `fireReady*`
- * paths), so one body transition runs one item at a time however many permits are held. Lanes
- * fix both: one item per lane by construction, and N distinct transitions genuinely in flight.
+ * **What Mastra does** (`executeForeach`, `handlers/control-flow.ts:952-1495`). Every item is
+ * pushed onto a `fastq` queue of width `concurrency` (`:1225`, `:1228-1272`); fastq starts the
+ * next queued item the moment a worker calls back, so admission is fluid. On the first item that
+ * does not succeed — failed, bailed, paused *or suspended* — `handleNonSuccessResult` calls
+ * `killQueue()` (`:1141`), which is `inFlight -= queue.length(); queue.kill()` (`:1087-1090`):
+ * nothing queued ever starts, items already running finish, and only then (`:1276-1280`) is the
+ * foreach decided, with a fixed precedence — any failure (`:1315-1316`), else any bail or pause
+ * (`:1373`), else any suspension (`:1410`), else success.
  *
- * **Why this needs no ν.** Correlation by name ([NU-020]) exists for the case where several
- * groups share places and the join must pair the right siblings. Here the sibling streams are
- * already disjoint — one lane, one item, one slot — so a match spec would correlate a place
- * whose per-name cardinality is structurally 1, which is the "match spec on a net where only
- * one group is live" anti-pattern and moves every query off the cheap linear routes. It is also
- * not available: the body rebuilds the flow token as `{ data }` (see `stepAction`), so no
- * minted name survives it for a key projection to read back.
+ * **The stop is structural, in two halves.**
  *
- * **Why the permit is a place and not an option.** `permit.l + slot.l = 1` per lane is a
- * P-invariant a verifier can read, and summed over lanes it is `inFlight + permits =
- * concurrency`. A runtime semaphore proves nothing. Fluid (not batched) admission falls out of
- * it for free: `start.l` needs only *its own* permit and the cursor, so the next item starts the
- * moment any one lane settles — no barrier, no generation counter, nothing that waits for a
- * batch.
+ * - *Once an outcome is recorded*, the cursor is gone: every non-success settle carries a reset
+ *   arc on it, which is `queue.kill()` — the undispatched tail is dropped in the same firing that
+ *   records the outcome ([EXEC-013]: resets drain during the firing, before the action). `start.l`
+ *   needs the cursor, so no item can start afterwards. The verifier checks this as
+ *   `mutualExclusion(cursor, faults | exits | suspensions)`.
+ * - *Between an item's outcome and its settle*, every `start.m` is inhibited by the four
+ *   non-success places of every other lane, so the stop takes effect the instant the body's
+ *   action writes its outcome, not one firing later. (A lane's own outcome needs no arc: while it
+ *   is pending the lane holds its slot, not its permit. Leaving those `4c` redundant arcs out is
+ *   not cosmetic: at three lanes they took `DeadlockFree` from 8s to 189s, measured against the
+ *   linked libpetri tree at `808171c`, not a release.) Mastra has a window
+ *   here — it awaits a progress-event publish (`:1126`, `:1129`, `:1135`) before `killQueue()`, and
+ *   a sibling finishing in that await releases a queued item — which we close rather than
+ *   reproduce: it is a race, not a behaviour anyone can rely on. This half is by construction, not
+ *   by a marking property: a marking cannot say which of two firings came first.
  *
- * **What is not bounded, and what that costs.** `results` and `faults` grow with the input
- * array, which is data, and the model cannot see data. So they carry no structural bound, and
- * the untimed abstraction — value-blind, so it may re-emit the cursor forever — cannot close a
- * termination proof either. A `maxItems` on the entry description would fix both (a budget place
- * seeded with `maxItems`, an inhibitor-armed overflow branch on `start`); `EntryDescription`
- * does not carry one today. Everything else here is 1-bounded: `in`, `cursor`, and per lane
- * `permit`, `slot`, `done` and `failed`.
+ * **Why lanes, not one body and N permits.** An anonymous permit cannot say *which* body is free,
+ * so a result could not be paired with its slot once completion order differs from dispatch
+ * order; and it would not run concurrently at all, because the executor never fires a transition
+ * that is still in flight (`inFlightFlags` in `precompiled-net-executor.ts`). A lane is one body
+ * instantiation at child path `[...path, lane]`, so N lanes are N distinct transitions genuinely
+ * in flight, and pairing is structural: `done.l`, the four outcome places and `slot.l` each hold at
+ * most one token, because `start.l` needs a permit only a settle of that lane gives back.
+ *
+ * **Why the permit is a place.** Between `split` and a finisher every lane holds exactly one of
+ * `permit.l` and `slot.l` (checked: both 1-bounded and mutually exclusive), so summed over lanes
+ * `inFlight + permits = concurrency` — a limit the verifier can read, where a runtime semaphore
+ * would prove nothing. Every finisher consumes **every** permit, which
+ * both proves that no item is still running — so no outcome can arrive after the decision — and
+ * clears the lanes that never started.
+ *
+ * **Which outcome is reported** — each an explicit Mastra rule, each a transition, the precedence
+ * enforced by inhibitors and resets rather than by a choice inside one action:
+ *
+ * - *Failure beats everything, first in time.* `if (!errorResult) errorResult = result`
+ *   (`:1130`, `:1210`) keeps the first failure to settle, not the lowest index. `all(faults)`
+ *   hands the action every recorded failure in arrival order ([CORE-013] FIFO), and the head is
+ *   taken. (`.parallel()` differs: it reports the lowest arm index.) A `tripwire` rides on the
+ *   failure unchanged, so the run ends `tripwire` exactly when Mastra's `fmtReturnValue` would.
+ * - *Then a bail or a pause, first in time*: `if (!exitResult) exitResult = result` (`:1136`),
+ *   and the foreach returns that result as its own (`:1406`). A bail therefore ends the run as a
+ *   success carrying the bail output; the array is never produced.
+ * - *Then a suspension, lowest index*: suspended items land in an integer-keyed object
+ *   (`foreachIndexObj[k]`, `:1119-1124`) and `Object.keys(...)[0]` is its **lowest** key
+ *   (`:1411-1412`), whatever order they suspended in. The record keeps only `status`,
+ *   `suspendPayload` and `suspendedAt`, so the `suspendOutput` spread at `:1439-1441` never fires:
+ *   a suspended foreach carries no output, and neither does ours.
+ *
+ * Losers are reset, not stranded: a higher-precedence finisher resets the lower-precedence
+ * records, and every non-success finisher resets `results` — Mastra returns no array in those
+ * cases either.
+ *
+ * **The run-scoped step results.** The body's leaf records each item's outcome under the body id
+ * as the item settles, exactly as Mastra's `Object.assign(stepResults, ...)` does (`:1179`).
+ * The finisher then records the **aggregate** under the same id, as `entry.ts:811-812` does with the
+ * foreach's own result, and it can only fire once every lane is idle — so the aggregate is always
+ * the last write. `getStepOutput` reads `stepResults[body.id]` (`default.ts:1152-1153`), which is
+ * why the value on `next` is the same whether or not `next` is the run's result.
+ *
+ * **Output.** `results[k] = output` for each success whose output is not `undefined`
+ * (`:1189-1191`), so an `undefined` output leaves a *hole* and the array is only as long as the
+ * last defined index. Reproduced by assigning, not by mapping.
+ *
+ * **Why this needs no ν.** Correlation by name ([NU-020]) is for sibling groups that share places.
+ * Here the streams are already disjoint — one lane, one item, one slot — and a combinator cannot
+ * contain a combinator, so no second group is ever live over these places.
+ *
+ * **What is not bounded.** `results` grows with the input, which is data the model cannot see, so
+ * `start.l`'s "more items" branch is value-blind and a proof covers every item count at once. The
+ * three outcome records are each bounded by the lane count: once one exists no item starts, and
+ * each lane holds at most one item.
  */
 export const foreachGadget: Gadget = (entry, next, ctx) => {
   if (entry.kind !== 'foreach') throw new Error(`foreachGadget received a '${entry.kind}' entry`);
-  const lanes = laneCount(entry);
+  // The IR narrows the body to a single step, as Mastra's `SingleStepEntry` does. Checked at run
+  // time too, because a caller outside the type system could still hand us a combinator.
+  if ((entry.body as { kind: string }).kind !== 'step') {
+    throw new Error(
+      `.foreach '${entry.id}': the body must be a single step, got '${(entry.body as { kind: string }).kind}'. ` +
+        'Mastra types a foreach body as SingleStepEntry; nest through a nested workflow instead.',
+    );
+  }
+  const lanes = foreachLanes(entry);
+  const bodyId = entry.body.id;
+  const { names, path, exits } = ctx;
 
   // Every name is minted through the vocabulary: libpetri place identity is the name string
-  // ([CORE-010]), so a hand-rolled name that collided would silently *merge* two lanes.
-  const p = (role: string): string => ctx.names.entryPlace(ctx.path, entry.id, role);
-  const t = (role: string): string => ctx.names.entryTransition(ctx.path, entry.id, role);
+  // ([CORE-010]), so a hand-rolled name that collided would silently merge two lanes.
+  const p = (role: string): string => names.entryPlace(path, entry.id, role);
+  const t = (role: string): string => names.entryTransition(path, entry.id, role);
 
-  const inPlace = place<FlowToken>(ctx.names.entryIn(ctx.path, entry.id));
+  const inPlace = place<FlowToken>(names.entryIn(path, entry.id));
   const cursor = place<ForeachCursor>(p('cursor'));
   const results = place<ForeachResult>(p('results'));
-  const faults = place<FailureToken>(p('faults'));
+  const faults = place<FaultRecord>(p('faults'));
+  const exited = place<ExitRecord>(p('exits'));
+  const suspensions = place<SuspensionRecord>(p('suspensions'));
 
-  const permit: Place<LanePermit>[] = [];
-  const slot: Place<ForeachSlot>[] = [];
-  const settled: Place<FlowToken>[] = [];
-  const broke: Place<FailureToken>[] = [];
-  for (let lane = 0; lane < lanes; lane++) {
-    permit.push(place<LanePermit>(p(`lane${lane}.permit`)));
-    slot.push(place<ForeachSlot>(p(`lane${lane}.slot`)));
-    settled.push(place<FlowToken>(p(`lane${lane}.done`)));
-    broke.push(place<FailureToken>(p(`lane${lane}.failed`)));
+  interface Lane {
+    readonly permit: Place<LanePermit>;
+    readonly slot: Place<ForeachSlot>;
+    readonly done: Place<FlowToken>;
+    readonly out: Exits;
+    readonly bodyIn: Place<FlowToken>;
   }
+
+  const laneList: Lane[] = [];
+  for (let lane = 0; lane < lanes; lane++) {
+    const done = place<FlowToken>(p(`lane${lane}.done`));
+    // Gadget-local exits, never `ctx.exits`: a sibling lane mid-item still holds a slot, and an
+    // outcome that jumped straight to a terminal would strand it. Local exits let every in-flight
+    // item finish, as Mastra's do, before a finisher decides.
+    const out: Exits = {
+      failed: place<FailureToken>(p(`lane${lane}.failed`)),
+      bailed: place<BailToken>(p(`lane${lane}.bailed`)),
+      suspended: place<SuspendToken>(p(`lane${lane}.suspended`)),
+      paused: place<PauseToken>(p(`lane${lane}.paused`)),
+    };
+    const body = ctx.emitNested(entry.body, [...path, lane], done, out);
+    laneList.push({
+      permit: place<LanePermit>(p(`lane${lane}.permit`)),
+      slot: place<ForeachSlot>(p(`lane${lane}.slot`)),
+      done,
+      out,
+      bodyIn: body.inPlace,
+    });
+  }
+
+  /** A lane's non-success outcome places: its item has finished badly and is not yet recorded. */
+  const pending = (l: Lane): Place<unknown>[] => [l.out.failed, l.out.bailed, l.out.suspended, l.out.paused];
+  const everyPermit = laneList.map((l) => one(l.permit));
 
   const transitions: Transition[] = [];
 
   /**
-   * Opens a round: seeds the cursor **and** every permit in one firing.
+   * Opens the foreach: seeds the cursor **and** every permit in one firing, so no marking exists
+   * with permits and no cursor (outputs of a firing land together, [EXEC-001]).
    *
-   * One firing matters. Permits deposited without a cursor would be a marking where `join` is
-   * enabled with nothing collected; there is no such marking, because outputs of a firing land
-   * together in the completion phase ([EXEC-001] step 1).
-   *
-   * Three declared branches, because there are three outcomes: items to run, an empty array
-   * (Mastra yields `[]` and the body never runs), and an input that is not an array at all.
-   * Under [IO-015] exactly one branch must claim precisely what the action wrote, so "empty"
-   * cannot be encoded as "the seeding branch, minus the cursor".
-   *
-   * It seeds rather than the initial marking doing it, which is also what makes re-entry safe:
-   * a `.foreach` inside a `.dowhile` gets a fresh allowance per round because `join`/`abort`
-   * consumed the previous one. No reset arc is used to "clear stale permits" — that would put a
-   * reset on the very places carrying the per-lane invariant.
+   * Three declared branches for three outcomes: items to run; no items at all (Mastra enqueues
+   * nothing and returns `[]`, `:1228`, `:1488-1494`); and an input Mastra cannot iterate either
+   * (see {@link itemsOf}), where Mastra's `execute()` rejects and we fail the run.
    */
   transitions.push(
     Transition.builder(t('split'))
       .inputs(one(inPlace))
-      .outputs(
-        xor(
-          and(outPlace(cursor), ...permit.map((q) => outPlace(q))),
-          outPlace(next),
-          outPlace(ctx.failed),
-        ),
-      )
+      .outputs(xor(and(outPlace(cursor), ...laneList.map((l) => outPlace(l.permit))), outPlace(next), outPlace(exits.failed)))
       .action(async (tctx) => {
         const incoming = tctx.input(inPlace);
-        // Decide, then emit ([EXEC-031]: inputs are already gone and nothing is restored).
-        if (!Array.isArray(incoming.data)) {
-          tctx.output(ctx.failed, {
-            stepId: entry.id,
-            error: new TypeError(
-              `.foreach '${entry.id}' expected an array from the previous entry, got ` +
-                `${incoming.data === null ? 'null' : typeof incoming.data}`,
-            ),
-          });
+        const scope = scopeOf(tctx);
+
+        // Decide, then emit ([EXEC-031]: the input is already gone and nothing is restored).
+        let items: readonly unknown[] | undefined;
+        let error: unknown;
+        try {
+          items = itemsOf(entry.id, incoming.data);
+        } catch (e) {
+          error = e;
+        }
+
+        if (items === undefined) {
+          scope.recordStepResult(bodyId, { status: 'failed', error });
+          tctx.output(exits.failed, { stepId: bodyId, error });
           return;
         }
-        // Copied at the boundary: the cursor is iterated over many firings, and the caller's
-        // array is not the net's to trust for that long.
-        const items: readonly unknown[] = [...incoming.data];
         if (items.length === 0) {
+          scope.recordStepResult(bodyId, { status: 'success', output: [] });
           tctx.output(next, { data: [] });
           return;
         }
         tctx.output(cursor, { items, next: 0 });
-        for (const q of permit) tctx.output(q, null);
+        for (const l of laneList) tctx.output(l.permit, null);
       })
       .build(),
   );
 
-  for (let lane = 0; lane < lanes; lane++) {
-    const myPermit = permit[lane]!;
-    const mySlot = slot[lane]!;
-    const myDone = settled[lane]!;
-    const myFailed = broke[lane]!;
-
-    // The body, instantiated once per lane. Its failure goes to a *gadget-local* place, never
-    // straight to the workflow terminal: a sibling lane that is mid-item still owns a slot and
-    // a permit, and a failure that jumped the fence would leave both stranded with `join`
-    // inhibited forever. Local failure lets every lane settle, then `abort` decides.
-    const body = ctx.emitNested(entry.body, [...ctx.path, lane], myDone, myFailed);
-
+  // Settles are declared before starts. Nothing depends on it — the inhibitors close the window
+  // structurally — but it keeps the executor's tie-break ([EXEC-002]) pointing the same way.
+  laneList.forEach((l, lane) => {
     /**
-     * Admits the next item into this lane.
+     * A success: pairs the output with the index the lane started with and returns the permit,
+     * in one firing — so no marking has the lane idle and its result missing, which is what lets
+     * `join` read "every permit is back" as "every result is in".
+     */
+    transitions.push(
+      Transition.builder(t(`lane${lane}.collect`))
+        .inputs(one(l.done), one(l.slot))
+        .outputs(and(outPlace(results), outPlace(l.permit)))
+        .action(async (tctx) => {
+          const produced = tctx.input(l.done);
+          const s = tctx.input(l.slot);
+          tctx.output(results, { index: s.index, value: produced.data });
+          tctx.output(l.permit, null);
+        })
+        .build(),
+    );
+
+    /** One non-success settle: records the outcome, kills the queue, frees the lane. */
+    const settle = <T, R>(role: string, from: Place<T>, into: Place<R>, record: (token: T, index: number) => R) =>
+      Transition.builder(t(`lane${lane}.${role}`))
+        .inputs(one(from), one(l.slot))
+        .reset(cursor)
+        .outputs(and(outPlace(into), outPlace(l.permit)))
+        .action(async (tctx) => {
+          const token = tctx.input(from);
+          const s = tctx.input(l.slot);
+          tctx.output(into, record(token, s.index));
+          tctx.output(l.permit, null);
+        })
+        .build();
+
+    transitions.push(
+      settle('fail', l.out.failed, faults, (failure, index) => ({ index, failure })),
+      settle('bail', l.out.bailed, exited, (bail, index): ExitRecord => ({ status: 'bailed', index, bail })),
+      settle('pause', l.out.paused, exited, (pause, index): ExitRecord => ({ status: 'paused', index, pause })),
+      settle('suspend', l.out.suspended, suspensions, (suspension, index) => ({ index, suspension })),
+    );
+  });
+
+  laneList.forEach((l, lane) => {
+    /**
+     * Admits the next item into this lane. Competing with the other lanes' `start` for the one
+     * cursor is the whole scheduler: which lane runs an item is the marking's decision, and no
+     * priority is involved.
      *
-     * Competing with the other lanes' `start` for the one cursor token is the whole scheduler:
-     * the decision "which lane runs this item" is the marking's, not an action's, and the
-     * losing lanes simply stay disabled. No priority is involved, so nothing here rests on
-     * scheduling policy ([EXEC-002] is free to order these any way it likes).
-     *
-     * The `xor` is "this was the last item" versus "there are more": the last one drops the
-     * cursor, which is what eventually enables `join` (which is inhibited by it). The choice
-     * reads the consumed token, not hidden state — and a value-blind analysis that takes the
-     * short branch early merely dispatches fewer items, which strands nothing.
+     * The `xor` is "more items" versus "this was the last": the last drops the cursor, which is
+     * what eventually lets `join` fire. A value-blind analysis that takes the short branch early
+     * merely dispatches fewer items, which strands nothing.
      */
     transitions.push(
       Transition.builder(t(`lane${lane}.start`))
-        .inputs(one(cursor), one(myPermit))
+        .inputs(one(cursor), one(l.permit))
+        .inhibitors(...laneList.filter((other) => other !== l).flatMap(pending))
         .outputs(
           xor(
-            and(outPlace(body.inPlace), outPlace(mySlot), outPlace(cursor)),
-            and(outPlace(body.inPlace), outPlace(mySlot)),
+            and(outPlace(l.bodyIn), outPlace(l.slot), outPlace(cursor)),
+            and(outPlace(l.bodyIn), outPlace(l.slot)),
           ),
         )
         .action(async (tctx) => {
           const c = tctx.input(cursor);
           const index = c.next;
-          tctx.output(body.inPlace, { data: c.items[index] });
-          tctx.output(mySlot, { index });
+          tctx.output(l.bodyIn, { data: c.items[index] });
+          tctx.output(l.slot, { index });
           if (index + 1 < c.items.length) tctx.output(cursor, { items: c.items, next: index + 1 });
         })
         .build(),
     );
-
-    /**
-     * Pairs this lane's output with the index it started with, and returns the permit.
-     *
-     * Pairing is structural, not FIFO and not by correlation: `done.l` and `slot.l` can each
-     * hold at most one token, because `start.l` needs the permit that only this transition (or
-     * `rescue.l`) gives back. There is nothing to choose between, so there is nothing to get
-     * wrong when items complete out of order.
-     *
-     * Result and permit are emitted by the *same* firing, so no marking exists in which the
-     * lane looks finished while its result is still missing — which is what lets `join` treat
-     * "every permit is back" as "every result is in".
-     */
-    transitions.push(
-      Transition.builder(t(`lane${lane}.collect`))
-        .inputs(one(myDone), one(mySlot))
-        .outputs(and(outPlace(results), outPlace(myPermit)))
-        .action(async (tctx) => {
-          const produced = tctx.input(myDone);
-          const s = tctx.input(mySlot);
-          tctx.output(results, { index: s.index, value: produced.data });
-          tctx.output(myPermit, null);
-        })
-        .build(),
-    );
-
-    /**
-     * The failure half of `collect.l`, and the reason a failed item does not hang the round:
-     * it consumes the slot and returns the permit exactly as success does, so the lane rejoins
-     * the pool and the remaining items still run. The failure itself becomes a token in
-     * `faults`, which is what `abort` later reads.
-     */
-    transitions.push(
-      Transition.builder(t(`lane${lane}.rescue`))
-        .inputs(one(myFailed), one(mySlot))
-        .outputs(and(outPlace(faults), outPlace(myPermit)))
-        .action(async (tctx) => {
-          const failure = tctx.input(myFailed);
-          tctx.output(faults, failure);
-          tctx.output(myPermit, null);
-        })
-        .build(),
-    );
-  }
+  });
 
   /**
-   * Closes a successful round.
-   *
-   * "Everything is done" is three structural facts, no bookkeeping: the cursor is gone (nothing
-   * left to start), every permit is back (no lane is busy), and no fault was recorded. The
-   * permits are *consumed* rather than read past an inhibitor, which both proves the lanes idle
-   * and clears them — a permit left behind would be a token with no consumer, i.e. a stranded
-   * marking and an unbounded place.
-   *
-   * `all(results)` is the one draining arc here. It is honest — the domain really is "take
-   * every result" and the count is the input array's length, which no invariant can weigh —
-   * and it is safe against the drain-too-early trap for a structural reason rather than a
-   * timing one: every transition that could add to `results` needs a permit this firing holds.
-   *
-   * Order is data, so it rides in the token and is restored by sorting on the slot index here.
-   * Firing order is deliberately given no meaning.
+   * Every item succeeded. Enabled only with nothing left to start (¬cursor), no lane busy (every
+   * permit consumed) and nothing recorded against the foreach (¬faults ¬exits ¬suspensions).
+   * `all(results)` is honest: the domain really is "take every result", and nothing can add to it
+   * while this firing holds every permit.
    */
   transitions.push(
     Transition.builder(t('join'))
-      .inputs(all(results), ...permit.map((q) => one(q)))
-      .inhibitor(cursor)
-      .inhibitor(faults)
+      .inputs(all(results), ...everyPermit)
+      .inhibitors(cursor, faults, exited, suspensions)
       .outputs(outPlace(next))
       .action(async (tctx) => {
-        const collected = [...tctx.inputs(results)];
-        collected.sort((a, b) => a.index - b.index);
-        tctx.output(next, { data: collected.map((r) => r.value) });
+        const output: unknown[] = [];
+        for (const r of tctx.inputs(results)) {
+          // `results[k] = result.output` only when the output is defined (`:1189-1191`).
+          if (r.value !== undefined) output[r.index] = r.value;
+        }
+        scopeOf(tctx).recordStepResult(bodyId, { status: 'success', output });
+        tctx.output(next, { data: output });
       })
       .build(),
   );
 
-  /**
-   * Closes a failed round.
-   *
-   * Same quiescence preconditions as `join`, and structurally exclusive with it: `join` is
-   * inhibited by `faults`, this one requires a fault. No priority, no guard — the marking
-   * decides which of the two is enabled.
-   *
-   * The reset arc on `results` is the consumer for the successful siblings of a failed item.
-   * Reset is safe *here* specifically: `results` is already drained by `join`, so no
-   * conservation law has it in its support, and the per-lane invariant it must not disturb
-   * lives in `permit`/`slot`, which this transition consumes one at a time.
-   *
-   * Mastra fails the run on the first failing item; the first fault collected is reported,
-   * which is the earliest to have settled.
-   */
+  /** A failure was recorded: the first in time wins, and outranks every other outcome. */
   transitions.push(
-    Transition.builder(t('abort'))
-      .inputs(all(faults), ...permit.map((q) => one(q)))
-      .inhibitor(cursor)
-      .reset(results)
-      .outputs(outPlace(ctx.failed))
+    Transition.builder(t('fail'))
+      .inputs(all(faults), ...everyPermit)
+      .resets(exited, suspensions, results)
+      .outputs(outPlace(exits.failed))
       .action(async (tctx) => {
-        const failures = tctx.inputs(faults);
-        tctx.output(ctx.failed, failures[0]!);
+        const { failure } = tctx.inputs(faults)[0]!;
+        const outcome: StepOutcome =
+          failure.tripwire === undefined
+            ? { status: 'failed', error: failure.error }
+            : { status: 'failed', error: failure.error, tripwire: failure.tripwire };
+        scopeOf(tctx).recordStepResult(bodyId, outcome);
+        tctx.output(exits.failed, failure);
       })
       .build(),
   );
 
-  // The children's transitions are collected by the builder as `emitNested` returns them;
-  // repeating them here would register each one twice.
+  /** No failure, and a bail or pause was recorded: the first in time is the foreach's result. */
+  transitions.push(
+    Transition.builder(t('exit'))
+      .inputs(all(exited), ...everyPermit)
+      .inhibitor(faults)
+      .resets(suspensions, results)
+      .outputs(xor(outPlace(exits.bailed), outPlace(exits.paused)))
+      .action(async (tctx) => {
+        const first = tctx.inputs(exited)[0]!;
+        const scope = scopeOf(tctx);
+        if (first.status === 'bailed') {
+          scope.recordStepResult(bodyId, { status: 'bailed', output: first.bail.output });
+          tctx.output(exits.bailed, { stepId: first.bail.stepId, output: first.bail.output });
+          return;
+        }
+        scope.recordStepResult(bodyId, { status: 'paused' });
+        // Mastra runs each item at the foreach's own execution path (`:1101`), so that is the
+        // path reported, not the lane's.
+        tctx.output(exits.paused, { stepId: first.pause.stepId, path });
+      })
+      .build(),
+  );
+
+  /** Only suspensions were recorded: the lowest index is the foreach's suspension. */
+  transitions.push(
+    Transition.builder(t('suspend'))
+      .inputs(all(suspensions), ...everyPermit)
+      .inhibitors(faults, exited)
+      .reset(results)
+      .outputs(outPlace(exits.suspended))
+      .action(async (tctx) => {
+        const recorded = tctx.inputs(suspensions);
+        let lowest = recorded[0]!;
+        for (const r of recorded) if (r.index < lowest.index) lowest = r;
+        const { stepId, payload } = lowest.suspension;
+        scopeOf(tctx).recordStepResult(bodyId, { status: 'suspended', payload });
+        tctx.output(exits.suspended, { stepId, path, payload });
+      })
+      .build(),
+  );
+
+  // The body's transitions are collected by the builder as `emitNested` returns them; repeating
+  // them here would register each one twice.
   return { inPlace, transitions };
 };
 
 /**
- * How many lanes this entry compiles to.
- *
- * Mastra's default is 1, and its `ForeachConcurrencyResolver` (a per-run number) cannot reach
- * here at all: the net is built once per workflow shape and cached by structural hash, so a
- * per-run concurrency would be a per-run net. `EntryDescription` carries a static number, which
- * is the only form a permit place can represent.
+ * The lane count, clamped exactly as Mastra's `resolveForeachConcurrency` clamps
+ * (`utils.ts:786-796`): anything that is not a finite number, or is below 1, runs one at a time;
+ * anything else is floored. Only the ceiling is ours.
  */
-function laneCount(entry: Extract<EntryDescription, { kind: 'foreach' }>): number {
-  const c = entry.concurrency;
-  if (!Number.isInteger(c) || c < 1) {
+export function foreachLanes(entry: Extract<EntryDescription, { kind: 'foreach' }>): number {
+  const configured: unknown = entry.concurrency;
+  const lanes =
+    typeof configured !== 'number' || !Number.isFinite(configured) || configured < 1 ? 1 : Math.floor(configured);
+  if (lanes > MAX_FOREACH_LANES) {
     throw new Error(
-      `.foreach '${entry.id}' has concurrency ${String(c)}; it must be an integer >= 1. ` +
-        'The limit is a permit place with one token per lane, so it cannot be fractional, ' +
-        'zero (nothing would ever run) or resolved per run.',
+      `.foreach '${entry.id}' has concurrency ${lanes}, above the ${MAX_FOREACH_LANES}-lane limit. ` +
+        'Each concurrent item is a full copy of the step in the compiled workflow, so its size grows ' +
+        'linearly with the concurrency. Lower it, or batch the items so each step call does more work.',
     );
   }
-  if (c > MAX_LANES) {
-    throw new Error(
-      `.foreach '${entry.id}' has concurrency ${c}, above the ${MAX_LANES}-lane limit. ` +
-        'A lane is a full copy of the body, so the net grows linearly with it. Lower the ' +
-        'concurrency, or batch the items so each body call does more work.',
+  return lanes;
+}
+
+/**
+ * The items, read exactly as Mastra reads them: `for (let k = 0; k < prevOutput.length; k++)
+ * queue.push(prevOutput[k])` (`handlers/control-flow.ts:1050`, `:1228`, `:1272`). There is no
+ * array check anywhere at run time — the builder's `'Previous step must return an array type'`
+ * (`workflow.ts:2618`) is a compile-time conditional type — so:
+ *
+ * - an array iterates its elements, holes as `undefined`;
+ * - a string iterates its UTF-16 code units, and any array-like its indexed properties;
+ * - anything whose `length` is not a number greater than 0 — a plain object, a number, a boolean —
+ *   yields no items, so the foreach succeeds with `[]`.
+ *
+ * Where Mastra is not well-defined this fails instead, with an error that says why: `null` and
+ * `undefined` make Mastra throw a `TypeError` out of `execute()`, so `run.start()` rejects
+ * (nothing in `handlers/entry.ts` or `default.ts:894` catches it); an infinite `length` enqueues
+ * forever; and past 2^32-1 items the result slots are no longer array indices.
+ */
+export function itemsOf(id: string, input: unknown): unknown[] {
+  if (input === null || input === undefined) {
+    throw new TypeError(
+      `.foreach '${id}' received ${String(input)} from the previous step; it needs an array. ` +
+        '(Mastra throws reading its length, which rejects the run.)',
     );
   }
-  return c;
+  const source = input as { readonly length?: unknown; readonly [index: number]: unknown };
+  // `k < prevOutput.length` converts exactly as Number() does, a thrown conversion included.
+  const bound = Number(source.length);
+  if (bound === Infinity || bound > MAX_ITEMS) {
+    throw new RangeError(
+      `.foreach '${id}' received input with length ${String(source.length)}; ` +
+        `at most ${MAX_ITEMS} items can be iterated.`,
+    );
+  }
+  const items: unknown[] = [];
+  for (let k = 0; k < bound; k++) items.push(source[k]);
+  return items;
 }

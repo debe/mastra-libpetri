@@ -1,17 +1,23 @@
-import { Transition, and, one, outPlace, place, xor } from 'libpetri';
-import type { FailureToken, FlowToken } from '../types.js';
+import { Transition, and, one, outPlace, place, xor, type Place } from 'libpetri';
+import { scopeOf, viewOf } from '../scope.js';
+import type { BailToken, Exits, FailureToken, FlowToken, PauseToken, SuspendToken } from '../types.js';
 import type { Gadget } from './types.js';
 
 /**
- * What waits between iterations: the value the next iteration will be fed, and how many
- * iterations have already completed.
+ * The largest `iterationBound` a loop compiles with.
  *
- * The count rides in the token because Mastra's `LoopConditionFunction` is handed an
- * `iterationCount` and there is nowhere else for a *payload* to live — but it is payload only.
- * Nothing in the net reads it, no transition is enabled or disabled by it, and no claim about
- * this gadget rests on it. The *bound* lives in the `budget` place, where it is at least a count
- * in the marking that the firing rule enforces; a number in a token would be enforced by an
- * action reading it, which is neither race-free nor checkable.
+ * The allowance is seeded as that many unit tokens when the loop starts, so the bound is also a
+ * token count held in memory for the life of the loop. Without a ceiling, a caller reaching for
+ * `Number.MAX_SAFE_INTEGER` to mean "as unbounded as Mastra" would get a run that hangs seeding
+ * its allowance instead of an error at compile. Mastra has no ceiling because it has no bound.
+ */
+export const MAX_ITERATION_BOUND = 100_000;
+
+/**
+ * Between iterations: the value the next iteration is fed, and how many iterations have run.
+ *
+ * `iteration` is payload only. It is what the condition is told (`iterationCount`), and no
+ * transition is enabled or disabled by it: the bound is the `budget` place, never this number.
  */
 interface LoopState {
   readonly data: unknown;
@@ -19,12 +25,11 @@ interface LoopState {
 }
 
 /**
- * The marker for the one iteration currently in flight.
+ * The pending marker for the one iteration in flight.
  *
- * The body is a child gadget: it consumes a `FlowToken` and produces a `FlowToken`, so anything
- * the loop needs on the far side of the body cannot travel *through* it. This is the
- * pending-marker place — one token per outstanding unit of work — which also makes
- * "an iteration is running" a fact the marking holds rather than a fact an action remembers.
+ * The body is a leaf gadget: it consumes a `FlowToken` and produces one, so nothing the loop
+ * needs on the far side of the body can travel through it. The iteration number rides here
+ * instead, beside the body's token, and every way out of the body consumes it.
  */
 interface IterationMarker {
   readonly iteration: number;
@@ -33,267 +38,289 @@ interface IterationMarker {
 /**
  * `.dowhile` / `.dountil`.
  *
- * Both run the body first and evaluate the condition after, and the first evaluation sees
- * `iterationCount === 1` (Mastra's `processWorkflowLoop`: `iterationCount = previous + 1`).
- * `dowhile` repeats while the condition holds; `dountil` repeats until it holds. That is the
- * *only* difference between them, and it is one boolean negation inside `check` — the topology
- * is identical, because the continue/exit decision is an `Xor` branch either way.
+ * **What Mastra does** (`handlers/control-flow.ts`, `executeLoop`):
+ *
+ * - The first iteration's input is the previous entry's output: `result` starts as
+ *   `{ status: 'success', output: loopInput }` (:734), and `loopInput` is `prevOutput` (:730-733).
+ * - Every later iteration is fed the previous iteration's output. The body is called with
+ *   `prevOutput: (result as { output: any }).output` (:764), and `result` is reassigned to the
+ *   body's own result after each call (:780).
+ * - The body runs first; then the condition is evaluated with `inputData: result.output` (:843)
+ *   and `iterationCount: iteration + 1` (:847). `iteration` starts at 0 (:728) and is incremented
+ *   only after the condition (:883), so the first evaluation sees **1**. That holds for both loop
+ *   types: there is one `do { body; condition } while (…)` (:739-901), and the two differ only in
+ *   the test at :901, `dowhile ? isTrue : !isTrue`.
+ * - A non-success body result ends the loop at once, returned as the loop's own result (:791-801).
+ * - The loop's result is the last body result (:914), stored under the **body's** step id
+ *   (`handlers/entry.ts:810-812`), which is where the next entry reads it
+ *   (`default.ts:1150-1151`).
+ * - The body runs under the loop's own `executionContext`, passed through unchanged (:760), so
+ *   its `executionPath` is the loop's path. A `.parallel()` arm, by contrast, gets
+ *   `[...executionPath, i]` (:244).
  *
  * **The shape.**
  *
  * ```text
- *   in ──start──▶ ready ──enter──▶ body.in ─(child)─▶ produced ──check──▶ ready   (repeat)
- *          │        │       │                            ▲        │  └──▶ exiting ──finish──▶ next
- *          │(reset) │       └──▶ running ────────────────┘        └─────▶ failing ──abort──▶ wf.failed
- *          └──▶ budget ◀────┘(one per iteration)                            ▲
- *                  ╳ (inhibitor)                                            │
- *               exhaust ◀── ready ─────────────────────────────────────────┘
+ *   loop-in ─start─▶ ready + budget×N
+ *   ready + budget ─enter─▶ body.in + running          ready ─exhaust (inhibited by budget)─▶ failed
+ *   body ─success─▶ produced ; produced + running ─check─▶ ready | exiting | failing
+ *   exiting ─finish (reset budget)─▶ next              failing ─abort (reset budget)─▶ failed
+ *   body-X + running ─leave-X (reset budget)─▶ X        for X in failed, bailed, suspended, paused
  * ```
  *
- * **Why the iteration allowance is a place.** `budget` is seeded with `maxIterations` unit
- * tokens by `start` and drained one token per iteration by `enter`. A counter in a token or a
- * number in a closure would be a fact no analysis could ever see, and would leave the
- * continue/stop decision to an action reading a number — the exact shape this model exists to
- * remove. As a place, the decision is the marking: `enter` is enabled while a token is there and
- * `exhaust` while it is not, and the only claim outstanding is the count itself (see the next
- * paragraph). `maxIterations` appears in `start`'s closure purely as *how many tokens to seed* —
- * the canonical budget idiom — never as something an action consults to decide anything.
+ * **The body shares the loop's path.** That is what Mastra does (:760), and it is what the runner
+ * hands on as the step's `executionPath` and what a suspension records in `suspendedPaths`. The
+ * price is that a loop's id defaults to its body's id (the adapter falls back to it, as Mastra
+ * keys the result by it), so both would claim `entryIn(path, id)`. The loop therefore never mints
+ * `.in`: its input is `loop-in`, and its other roles are disjoint from the leaf's
+ * (`in`, `run`, `run-n`, `retry-n`, `attempt-n`). A collision would throw at compile anyway,
+ * because `NameVocabulary` refuses to mint one name twice.
  *
- * **Why `start` resets the budget.** A loop entry is compiled once and can be entered more than
- * once (it is the body of an outer loop, or of a `foreach`). A stale allowance left by a
- * previous entry would add to the new one and `budget` would hold more than `maxIterations`,
- * so the second entry of a loop would run longer than the first — the cap is the one thing this
- * place is for. `finish` and `abort` already clear it on the way out, so the reset on `start` is
- * belt-and-braces; it is kept because it makes the cap hold whatever the exit path did, rather
- * than depending on every future exit remembering to clean up. Under [EXEC-013] the drain
- * happens during the firing step, before the action runs, so `start` cannot wipe the tokens it
- * is about to seed.
+ * **The iteration allowance is a place.** `budget` is seeded with `iterationBound` unit tokens by
+ * `start` and spent one per iteration by `enter`. `enter` needs a token and `exhaust` is
+ * inhibited by one, so every marking with a token in `ready` enables exactly one of them. The
+ * exclusion is that inhibitor arc, not the priorities, which are the budget idiom written out and
+ * which no analysis sees by default. `tests/verify/loop.test.ts` removes the inhibitor and gets
+ * `deadlockFree` violated while the run itself still passes — the proof rests on the arc.
  *
- * Be honest about what that reset is worth today: it is **unobservable**. Every exit clears
- * `budget`, so a sequentially re-entered loop always finds the place already empty, and deleting
- * this reset changes no test and no verdict in either suite — measured, unlike the two exit
- * resets, which a mutation of each turns red. It is insurance against a future exit path, not a
- * live guard, and in the one scenario it is aimed at it would *hurt*: under concurrent re-entry
- * (a `foreach` with `concurrency > 1` over a loop body) a second entry's `start` would wipe the
- * first entry's unspent allowance and starve it into a spurious exhaustion failure. These places
- * are per-entry, not per-instance; concurrent re-entry needs ν-correlation or a per-instance
- * subnet, and this reset does not make it safe.
+ * **Exceeding the bound fails the run.** Mastra's loop has no bound (:739, :901); ours exists so
+ * that termination can be proved (`docs/divergences.md` row 13). Exiting normally at the bound
+ * would hand a truncated result downstream with nothing to tell it from a settled condition, so
+ * `exhaust` fails the run with an error naming the bound. It goes straight to `exits.failed`
+ * with nothing to clean up: the inhibitor means `budget` is empty, and `check` already took
+ * `running`.
  *
- * **Why exhaustion fails rather than exits.** Mastra has no iteration cap at all; a `.dowhile`
- * whose condition never goes false loops forever. `maxIterations` is our structural addition,
- * needed because an unbounded loop place is an unbounded place and an unbounded place stops a
- * proof from closing. Exiting normally on exhaustion would be indistinguishable — to the next
- * entry and to the caller — from a condition that genuinely terminated, so a truncated result
- * would flow downstream with no signal at all. A failure names the entry and the cap. This is a
- * divergence from Mastra and belongs in `docs/divergences.md`.
+ * **Every other exit cleans up the allowance.** A loop that leaves with allowance to spare holds
+ * leftover `budget` tokens, so `finish`, `abort` and the four `leave-*` transitions each carry a
+ * reset arc on `budget`. The reset cannot sit on `check`, which also fires on the repeat branch
+ * and would wipe the allowance the next iteration is about to spend — hence the `exiting` and
+ * `failing` hops. `running` is never reset: it is consumed with `one()` on every path, because
+ * it holds exactly one token whenever the body does, so the marker stays a conservation law
+ * (`running` = the body's token count) rather than something a reset erases.
  *
- * **Where the allowance has to be seeded for a proof to mean anything — read this before
- * quoting a bound.** [IO-016] makes an output branch a *set* of places: every branch-enumerating
- * analysis deposits exactly one token per named place, whatever the action wrote
- * (`postVector[idx] = 1` in the flattener). `start` writes `maxIterations` tokens into a place
- * its branch names once, which conforms to [IO-015] — the produced *set* matches, and the
- * executor emits the [IO-016] AC4 warning on the first such firing — but it means a query seeded
- * at the entry place explores a net whose allowance is **one** token, at `maxIterations` 1, 3 or
- * 300 alike. So `placeBound(budget, N)` seeded that way comes back `proven` for any N >= 1,
- * including bounds the executor really exceeds; that verdict is about a different net.
+ * **`start` carries no reset.** A loop entry is entered once per run: it cannot sit inside
+ * another combinator (`types.ts`, `StepDescription`), and the top-level chain has no back-edge,
+ * so there is never a stale allowance to clear and every exit clears its own anyway. The reset
+ * the budget idiom puts on `start` would be unobservable here, and under a concurrent re-entry
+ * it would wipe a live allowance.
  *
- * This is not merely a weaker proof, it is a blind spot with a shape, and the shape is the one
- * the exit resets exist for. In the flattened net the single modelled allowance token is always
- * spent by the first `enter`, so *leaving with allowance to spare is unreachable* and no query
- * seeded at the entry place can see whether the leftovers are cleared. Measured: deleting
- * `.reset(budget)` from `finish` keeps `deadlockFree` `proven` on every shape, while a real
- * eight-allowance run that exits after two iterations strands six tokens.
+ * **Where the allowance has to be seeded for a proof to mean anything — read this before quoting
+ * a bound.** [IO-016]: every branch-enumerating analysis models one token per place a branch
+ * names, whatever the action wrote. `start` writes `iterationBound` tokens into a place its
+ * branch names once — that conforms to [IO-015], and the executor reports it as the [IO-016] AC4
+ * warning — but a query seeded at the workflow's entry place sees an allowance of **one** at any
+ * bound. So from the entry place, the proof covers the topology (every transition and branch is
+ * reachable at an allowance of one) and not the cycle running more than once, nor leaving with
+ * allowance to spare, which is exactly what the exit resets are for. Seeding `ready` and `budget`
+ * directly is the post-`start` marking, and `tests/verify/loop.test.ts` proves the cycle there at
+ * genuine allowances. What stays unproven is one action's deposit count — that `start` writes
+ * `iterationBound` tokens — which the executor tests pin.
  *
- * The answer is not a different topology — this topology is already right, and it is not the
- * case that no topology expresses the cap. It is to seed the allowance where the verifier reads
- * it, which is libpetri's own budget idiom (`.initialMarking(m => m.tokens(idle, 1).tokens(
- * budget, k))`). Seeding `ready` and `budget` directly is exactly the post-`start` marking, and
- * `tests/verify/loop.test.ts` proves over it that at a genuine allowance of k the bound holds,
- * that it is **tight** (`placeBound(budget, k - 1)` comes back `violated`), and that nothing
- * strands on any exit. What is left unproven afterwards is one action's deposit count — that
- * `start` really puts `maxIterations` tokens in — and nothing else. An output multiplicity
- * upstream (`postVector[idx] = n`) or a `CompiledWorkflow` carrying an initial marking would
- * close that last step; the executor tests in `tests/compiler/loop.test.ts` pin it meanwhile.
+ * **Sequential by construction.** One flow token circulates: `start` emits one `ready`, `enter`
+ * turns it into one `body.in` plus one `running`, and `check` consumes both halves.
  *
- * **Why sequentiality needs no mutex place.** Exactly one flow token circulates: `start` emits
- * one `ready`, `enter` turns it into one `body.in` plus one `running`, `check` consumes both
- * halves and emits one of three places. There is no reachable marking in which two iterations
- * are in flight, and that is `placeBound(running, 1)` — proven at an allowance of one, which is
- * where the encoding and the executor agree, rather than argued. A mutex place would be the
- * alternative and is not available anyway: the kernel seeds only the entry place, so no place
- * can carry an initial token and a permit place has nothing to seed it.
+ * **[TIME-012] applies and is harmless.** The reset arcs on `budget` restart the clocks of
+ * `enter` (input) and `exhaust` (inhibitor). Both are immediate, `[0, inf)`, so a restart changes
+ * nothing. Giving either a timing without revisiting this would reintroduce the trap.
  *
- * **Why `exhaust` is not a race.** `enter` consumes `one(budget)`; `exhaust` carries an
- * inhibitor on `budget`. They are structurally exclusive, so the exclusion does not rest on
- * priority (which no analysis sees by default) — the priorities below are the canonical idiom
- * written out, not load-bearing. The one window worth checking is the first one: `start` emits
- * `ready` and the `budget` tokens from a single firing, and [EXEC-003] AC4 makes deposits visible
- * uniformly at the next cycle, never part-way through a pass, so there is no instant at which
- * `ready` is marked and `budget` is still empty.
- *
- * **[TIME-012] does apply and is harmless here.** The reset arcs on `budget` restart the clocks
- * of `enter` (input) and `exhaust` (inhibitor). Both are `immediate`, whose interval is
- * `[0, inf)`, so a restart changes nothing. Adding timing to either without revisiting this
- * would silently reintroduce the trap.
+ * **What the step results hold.** The body's leaf records every iteration's final outcome under
+ * the body's id, and Mastra writes each iteration there too (`Object.assign(stepResults, …)`,
+ * :779), so the next entry — and the condition, which runs after that write — see the latest
+ * iteration. When the loop fails on its own account (bound exceeded, a throwing condition, a
+ * runner that cannot evaluate conditions), it records that failure under the body's id as well,
+ * because that is where Mastra writes a loop's result (`handlers/entry.ts:811`).
  */
 export const loopGadget: Gadget = (entry, next, ctx) => {
   if (entry.kind !== 'loop') throw new Error(`loopGadget received a '${entry.kind}' entry`);
 
-  // Resolved at compile, not at fire: a loop compiled against a runner that cannot evaluate its
-  // condition is a broken build, and discovering it from inside an action would surface as a
-  // failed step halfway through a run instead.
-  const runner = ctx.runner;
-  const evaluate = runner.evaluateLoopCondition?.bind(runner);
-  if (evaluate === undefined) {
+  const { iterationBound: bound, loopType, body } = entry;
+  // The body always runs once before the condition is first asked, so a bound below 1 describes
+  // no loop — and `start` would owe `budget` tokens its own `And` branch claims.
+  if (!Number.isInteger(bound) || bound < 1 || bound > MAX_ITERATION_BOUND) {
     throw new Error(
-      `loop entry '${entry.id}' needs StepRunner.evaluateLoopCondition, which this runner does ` +
-        'not implement. A loop cannot be compiled without it: the continue/exit decision is an ' +
-        'Xor branch whose action has nothing to ask.',
+      `loop '${entry.id}' has iterationBound=${String(bound)}; it must be a whole number in ` +
+        `[1, ${MAX_ITERATION_BOUND}], because the body always runs at least once.`,
     );
   }
-
-  // `.dowhile` / `.dountil` always run the body at least once, so a cap below 1 describes no
-  // loop at all — and `start` would then have to seed zero tokens into a place its own `And`
-  // branch claims, which is an [IO-015] violation rather than a quiet no-op.
-  if (!Number.isInteger(entry.maxIterations) || entry.maxIterations < 1) {
-    throw new Error(
-      `loop entry '${entry.id}' has maxIterations=${entry.maxIterations}; it must be a positive ` +
-        'integer, because the body always runs at least once and the allowance is seeded as ' +
-        'that many tokens.',
-    );
+  if (loopType !== 'dowhile' && loopType !== 'dountil') {
+    throw new Error(`loop '${entry.id}' has an unknown loopType '${String(loopType)}'`);
   }
 
-  const inPlace = place<FlowToken>(ctx.names.entryIn(ctx.path, entry.id));
+  const { names, path, exits } = ctx;
+  const own = <T>(role: string): Place<T> => place<T>(names.entryPlace(path, entry.id, role));
+  const named = (role: string) => names.entryTransition(path, entry.id, role);
+
+  const inPlace = own<FlowToken>('loop-in');
   /** The iteration allowance. Unit tokens: the count is the state, the value carries nothing. */
-  const budget = place<null>(ctx.names.entryPlace(ctx.path, entry.id, 'budget'));
-  /** Between iterations: the next iteration's input, waiting for an allowance token. */
-  const ready = place<LoopState>(ctx.names.entryPlace(ctx.path, entry.id, 'ready'));
-  /** While the body runs: the pending marker for the single in-flight iteration. */
-  const running = place<IterationMarker>(ctx.names.entryPlace(ctx.path, entry.id, 'running'));
-  /** The body's output, waiting for the condition. */
-  const produced = place<FlowToken>(ctx.names.entryPlace(ctx.path, entry.id, 'produced'));
-  /** Decided to leave, waiting for the allowance to be cleared. */
-  const exiting = place<FlowToken>(ctx.names.entryPlace(ctx.path, entry.id, 'exiting'));
-  /** Every way this loop can fail, funnelled to one place so cleanup lives in one transition. */
-  const failing = place<FailureToken>(ctx.names.entryPlace(ctx.path, entry.id, 'failing'));
+  const budget = own<null>('budget');
+  const ready = own<LoopState>('ready');
+  const running = own<IterationMarker>('running');
+  /** The body's successful output, waiting for the condition. */
+  const produced = own<FlowToken>('produced');
+  /** The condition said stop. */
+  const exiting = own<FlowToken>('exiting');
+  /** The condition threw. `check` has already taken `running`. */
+  const failing = own<FailureToken>('failing');
+  /** The body's own non-success outcomes, each held until the marker and allowance are cleared. */
+  const bodyExits: Exits = {
+    failed: own<FailureToken>('body-failed'),
+    bailed: own<BailToken>('body-bailed'),
+    suspended: own<SuspendToken>('body-suspended'),
+    paused: own<PauseToken>('body-paused'),
+  };
 
-  // The body routes failure to the gadget's own place, never straight to the workflow terminal.
-  // Straight to the terminal, the allowance tokens and the pending marker would have no enabled
-  // consumer in any state that followed: stranded tokens, an unbounded-looking place, and a run
-  // that reports `failed` only because `classify` reads that terminal first.
-  const body = ctx.emitNested(entry.body, [...ctx.path, 0], produced, failing);
+  // Same path as the loop: see "The body shares the loop's path" above.
+  const bodyIn = ctx.emitNested(body, path, produced, bodyExits).inPlace;
 
-  // Seeded once per entry, spread into the output. Fixed `null`s, so there is nothing to alias
-  // between firings.
-  const allowance: readonly null[] = Array.from({ length: entry.maxIterations }, () => null);
+  const loopFailure = (error: unknown): FailureToken => ({ stepId: entry.id, error });
 
-  const start = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'start'))
+  // Decide, then emit ([EXEC-031]). A runner that cannot evaluate conditions is found here,
+  // before the body runs, so no step's side effect executes for a loop that could never decide
+  // whether to repeat.
+  const start = Transition.builder(named('start'))
     .inputs(one(inPlace))
-    .reset(budget)
-    .outputs(and(outPlace(ready), outPlace(budget)))
+    .outputs(xor(and(outPlace(ready), outPlace(budget)), outPlace(exits.failed)))
     .action(async (c) => {
       const incoming = c.input(inPlace);
+      const scope = scopeOf(c);
+      // Probed inside a `try`: reading the capability can itself throw (a getter), and a throw
+      // here would lose the consumed input and strand the run without naming a place.
+      let capable = false;
+      let probeError: unknown;
+      try {
+        capable = typeof scope.runner.evaluateLoopCondition === 'function';
+      } catch (e) {
+        probeError = e;
+      }
+      if (!capable) {
+        const error =
+          probeError ??
+          new Error(
+            `loop '${entry.id}' needs StepRunner.evaluateLoopCondition, which this run's runner ` +
+              'does not implement; failing before the body runs',
+          );
+        scope.recordStepResult(body.id, { status: 'failed', error });
+        c.output(exits.failed, loopFailure(error));
+        return;
+      }
       c.output(ready, { data: incoming.data, iteration: 0 });
-      c.output(budget, ...allowance);
+      for (let i = 0; i < bound; i++) c.output(budget, null);
     })
     .build();
 
-  // High priority is the budget idiom written out; the exclusion against `exhaust` is the
-  // inhibitor arc, not this number.
-  const enter = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'enter'))
+  const enter = Transition.builder(named('enter'))
     .inputs(one(ready), one(budget))
     .priority(1)
-    .outputs(and(outPlace(body.inPlace), outPlace(running)))
+    .outputs(and(outPlace(bodyIn), outPlace(running)))
     .action(async (c) => {
       const state = c.input(ready);
-      c.output(body.inPlace, { data: state.data });
+      c.output(bodyIn, { data: state.data });
       c.output(running, { iteration: state.iteration + 1 });
     })
     .build();
 
-  // The fallback leg of the budget idiom: fires only once the allowance is gone, which is
-  // exactly when `enter` cannot fire. Together the two cover every marking in which `ready`
-  // holds a token, so that token always has an enabled consumer.
-  const exhaust = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'exhaust'))
+  const exhaust = Transition.builder(named('exhaust'))
     .inputs(one(ready))
     .inhibitor(budget)
     .priority(0)
-    .outputs(outPlace(failing))
+    .outputs(outPlace(exits.failed))
     .action(async (c) => {
       const state = c.input(ready);
-      c.output(failing, {
-        stepId: entry.id,
-        error: new Error(
-          `loop '${entry.id}' did not settle within maxIterations=${entry.maxIterations} ` +
-            `(${state.iteration} iterations ran; the ${entry.loopType} condition still asked ` +
-            'for another)',
-        ),
-      });
+      const scope = scopeOf(c);
+      const error = new Error(
+        `loop '${entry.id}' reached its iterationBound of ${bound} and the ${loopType} condition ` +
+          `still asked for another iteration (${state.iteration} ran). The bound is this ` +
+          "engine's, not Mastra's, whose loop has none.",
+      );
+      scope.recordStepResult(body.id, { status: 'failed', error });
+      c.output(exits.failed, loopFailure(error));
     })
     .build();
 
-  // Three branches, because there are three outcomes. A condition that throws is one of them:
-  // routing it to `exiting` would leave the loop, and the workflow, looking successful.
-  const check = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'check'))
+  const check = Transition.builder(named('check'))
     .inputs(one(produced), one(running))
     .outputs(xor(outPlace(ready), outPlace(exiting), outPlace(failing)))
     .action(async (c) => {
       const output = c.input(produced);
       const marker = c.input(running);
+      const scope = scopeOf(c);
 
-      // Decide, then emit ([EXEC-031]): the inputs are already consumed and are not restored, so
-      // the awaiting half writes nothing and the writing half cannot throw. A write in the `try`
-      // and another in the `catch` would satisfy no branch of the `Xor`.
-      let outcome:
-        | { readonly kind: 'repeat' }
-        | { readonly kind: 'exit' }
-        | { readonly kind: 'failed'; readonly error: unknown };
+      // Decide, then emit: the inputs are already consumed and are not restored, so the awaiting
+      // half writes nothing and the writing half cannot throw.
+      let decision: { readonly kind: 'repeat' | 'exit' } | { readonly kind: 'failed'; readonly error: unknown };
       try {
-        const held = await evaluate(entry.id, output.data, marker.iteration);
-        const repeat = entry.loopType === 'dowhile' ? held : !held;
-        outcome = repeat ? { kind: 'repeat' } : { kind: 'exit' };
+        const evaluate = scope.runner.evaluateLoopCondition;
+        if (evaluate === undefined) {
+          throw new Error(`loop '${entry.id}' needs StepRunner.evaluateLoopCondition`);
+        }
+        const held = await evaluate.call(scope.runner, entry.id, output.data, marker.iteration, viewOf(scope, path));
+        // Truthiness, as `while (dowhile ? isTrue : !isTrue)` reads it (:901).
+        decision = (loopType === 'dowhile' ? Boolean(held) : !held) ? { kind: 'repeat' } : { kind: 'exit' };
       } catch (error) {
-        outcome = { kind: 'failed', error };
+        // Mastra does not catch this (:835, no try) and `run.start()` rejects with no status.
+        // A net cannot reject; failing the run is the nearest outcome it can declare.
+        decision = { kind: 'failed', error };
       }
 
-      if (outcome.kind === 'failed') c.output(failing, { stepId: entry.id, error: outcome.error });
-      // Mastra feeds the body's own output back in as the next iteration's input
-      // (`loopAgainData.prevResult = stepResult`), and hands the same value on at the end.
-      else if (outcome.kind === 'repeat') {
-        c.output(ready, { data: output.data, iteration: marker.iteration });
-      } else c.output(exiting, { data: output.data });
+      switch (decision.kind) {
+        case 'repeat':
+          // The body's own output is the next iteration's input (:764, :780).
+          c.output(ready, { data: output.data, iteration: marker.iteration });
+          return;
+        case 'exit':
+          c.output(exiting, output);
+          return;
+        case 'failed':
+          scope.recordStepResult(body.id, { status: 'failed', error: decision.error });
+          c.output(failing, loopFailure(decision.error));
+          return;
+      }
     })
     .build();
 
-  // The exit hop exists for the reset arc. A reset fires whenever its transition fires, so it
-  // cannot sit on `check`, which also fires on the repeat branch and would wipe the allowance it
-  // is about to spend. `exiting` splits "decided to leave" from "left", and the leftover
-  // allowance — `maxIterations` minus the iterations actually run — is cleared exactly once, by
-  // the transition that only ever fires on the way out.
-  const finish = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'finish'))
+  const finish = Transition.builder(named('finish'))
     .inputs(one(exiting))
     .reset(budget)
     .outputs(outPlace(next))
     .action(async (c) => {
-      c.output(next, { data: c.input(exiting).data });
+      c.output(next, c.input(exiting));
     })
     .build();
 
-  // The single failure boundary. `running` is reset rather than consumed because it holds a
-  // token on the body-failure path and none on the condition-failure path, where `check` already
-  // took it: a reset arc requires nothing and takes whatever is there, so one transition covers
-  // both without an extra branch. Both resets are cleanup at a boundary, not bookkeeping inside
-  // the loop.
-  const abort = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'abort'))
+  const abort = Transition.builder(named('abort'))
     .inputs(one(failing))
-    .resets(budget, running)
-    .outputs(outPlace(ctx.failed))
+    .reset(budget)
+    .outputs(outPlace(exits.failed))
     .action(async (c) => {
-      c.output(ctx.failed, c.input(failing));
+      c.output(exits.failed, c.input(failing));
     })
     .build();
 
-  // The body's transitions were collected by the builder when `emitNested` ran; returning them
-  // again would add every one of them twice.
-  return { inPlace, transitions: [start, enter, exhaust, check, finish, abort] };
+  // Any non-success iteration ends the loop with that result (:791-801). The body's leaf has
+  // already recorded it under the body's id, which is also where Mastra keeps the loop's result.
+  const leave = <T>(role: string, from: Place<T>, to: Place<T>) =>
+    Transition.builder(named(`leave-${role}`))
+      .inputs(one(from), one(running))
+      .reset(budget)
+      .outputs(outPlace(to))
+      .action(async (c) => {
+        c.output(to, c.input(from));
+      })
+      .build();
+
+  return {
+    inPlace,
+    transitions: [
+      start,
+      enter,
+      exhaust,
+      check,
+      finish,
+      abort,
+      leave('failed', bodyExits.failed, exits.failed),
+      leave('bailed', bodyExits.bailed, exits.bailed),
+      leave('suspended', bodyExits.suspended, exits.suspended),
+      leave('paused', bodyExits.paused, exits.paused),
+    ],
+  };
 };

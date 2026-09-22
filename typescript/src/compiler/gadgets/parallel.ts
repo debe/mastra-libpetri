@@ -1,5 +1,6 @@
 import {
   Transition,
+  all,
   and,
   exactly,
   one,
@@ -7,187 +8,327 @@ import {
   place,
   type Place,
 } from 'libpetri';
-import type { EntryDescription, FailureToken, FlowToken } from '../types.js';
+import { scopeOf } from '../scope.js';
+import type {
+  BailToken,
+  Exits,
+  FailureToken,
+  FlowToken,
+  PauseToken,
+  StepOutcome,
+  SuspendToken,
+} from '../types.js';
 import type { Gadget } from './types.js';
 
 /**
  * What one arm's settlement looks like to the join.
  *
- * The arm index is stamped by *which* collect transition fired, not carried in from the arm's
- * own output, so arm identity is topology rather than a value the join has to trust. A failed
- * arrival carries nothing: it exists only so the arm still counts toward the join's `exactly(n)`.
+ * The arm index of a success is stamped by *which* collect transition fired, not carried in from
+ * the arm's own output, so arm identity is topology rather than a value the join has to trust.
+ * The other three carry nothing: they exist only so the arm still counts toward the join's
+ * `exactly(n)`. What a failed or suspended arm *was* travels separately, in `errSeen` /
+ * `suspSeen`, where an inhibitor arc can see it.
  */
 type ArmArrival =
   | { readonly status: 'ok'; readonly index: number; readonly data: unknown }
-  | { readonly status: 'failed' };
+  | { readonly status: 'failed' }
+  | { readonly status: 'suspended' }
+  /** A bailed or paused arm: settled, swallowed, and left out of the block's own output. */
+  | { readonly status: 'settled' };
 
 /**
- * `.parallel([...])` — every arm runs, every arm joins.
+ * `.parallel([...])` — every arm runs, every arm settles, then one join decides the block.
  *
  * ```text
- *   in --(fork)--> armIn_0 ... armIn_{n-1}        one branch, and(...): every arm always runs
+ *   in --(fork)--> armIn_0 ... armIn_{n-1}            one branch, and(...): every arm always runs
  *
- *   armIn_i -> [arm i] -> armDone_i --(collect-i)--> arrived      {status: ok, index: i}
- *   [any arm's failure] -> armErr --(collect-err)--> arrived      {status: failed}
- *                                              and--> errSeen     the failure token itself
+ *   armIn_i -> [step i] -> armDone_i --(collect-i)-----> arrived {ok, index: i, data}
+ *   [any arm]  failed    -> armErr   --(collect-err)---> arrived {failed}    + errSeen  (one firing)
+ *   [any arm]  suspended -> armSusp  --(collect-susp)--> arrived {suspended} + suspSeen (one firing)
+ *   [any arm]  bailed    -> armBail  --(collect-bail)--> arrived {settled}              (swallowed)
+ *   [any arm]  paused    -> armPause --(collect-pause)-> arrived {settled}              (swallowed)
  *
- *   exactly(n) arrived, inhibited by errSeen        --(join-ok)---> next
- *   exactly(n) arrived, one(errSeen), reset(errSeen) --(join-fail)-> ctx.failed
+ *   exactly(n) arrived, all(errSeen), reset(suspSeen)          --(join-fail)-> exits.failed
+ *   exactly(n) arrived, all(suspSeen), inhibitor(errSeen)      --(join-susp)-> exits.suspended
+ *   exactly(n) arrived, inhibitor(errSeen), inhibitor(suspSeen) --(join-ok)---> next
  * ```
  *
- * **Why every arm deposits into one shared `arrived` place.** The naive fan-in — a join that
- * consumes one token from each arm's own done place — deadlocks the moment an arm fails: that
- * arm never produces, so the join is never enabled, and the siblings that *did* finish sit in
- * their done places with no enabled consumer for the life of the net. That is an unbounded place
- * in the model and a hang in production. Here the failure path deposits into `arrived` too, so
- * the join always sees exactly `n` settlements regardless of how many of them failed, and every
- * token this gadget creates has a consumer that becomes enabled in every reachable state.
+ * **What Mastra does, and so what this reproduces** (`handlers/control-flow.ts:220-313`). The
+ * arms run under `Promise.all`, but a step's failure never *rejects* — `executeStepWithRetry`
+ * returns it as a value (`default.ts:459-511`) — so every sibling is awaited to completion and
+ * nothing is abandoned. Only then is the block decided, with a fixed precedence: any failed arm
+ * makes it `failed`, else any suspended arm makes it `suspended`, else it succeeds (`canceled`
+ * sits between the last two; cancellation here is structural, not a status). A **bailed** or
+ * **paused** arm is not tested for at all: it falls through to the success branch and is merely
+ * left out of the block's output (`:286-295`). So a bail inside a parallel does not end the run,
+ * and neither does a nested workflow's pause.
  *
- * **Why `errSeen` exists at all.** `armErr` is consumed by `collectErr`, so by join time the
- * evidence that something failed would be gone. `errSeen` is that evidence, held in the marking
- * where the inhibitor arc can see it. The alternative — letting one join transition look at the
- * arrivals and decide — puts the ok/fail choice inside an action, where no analysis can see it
- * ([IO-006] removed input guards precisely so that decisions cannot hide there).
+ * **Why every settlement deposits into one shared `arrived` place.** The naive fan-in — a join
+ * consuming one token from each arm's own done place — deadlocks the moment an arm does anything
+ * but succeed: that arm never produces, the join is never enabled, and the siblings that did
+ * finish sit in their done places for the life of the net. Here all five outcomes deposit into
+ * `arrived`, so the join always sees exactly `n` settlements whatever they were, and every token
+ * this gadget creates has a consumer that becomes enabled in every reachable state. It is also
+ * what makes the join wait for every sibling, exactly as Mastra's `Promise.all` does: a failure
+ * is not reported until the slowest arm has settled.
  *
- * **Why the choice is race-free.** `collectErr` writes `arrived` and `errSeen` in a single
- * firing, and a firing's complete output set is deposited in one step of the loop, strictly
- * before enablement is re-evaluated ([EXEC-001] steps 1 and 3). So the arrival that completes
- * the count can never be observed without the error marker that accompanies it: `errSeen` is
- * deposited no later than the `n`-th arrival. There is no window in which `join-ok` sees a full
- * count and an empty `errSeen`.
+ * **Why `errSeen` and `suspSeen` exist.** `armErr` and `armSusp` are drained by their collects,
+ * so by join time the evidence would be gone. The two markers hold it in the marking, where an
+ * inhibitor arc can read it. The alternative — one join transition looking at the arrivals and
+ * choosing — puts the choice inside an action where no analysis can see it ([IO-006] removed
+ * input guards precisely so that decisions cannot hide there).
  *
- * **Why no priority.** `join-ok` is inhibited by `errSeen` and `join-fail` requires it, so the
- * two are structurally exclusive and are never simultaneously enabled. Ordering them by priority
- * would work as well and prove less: nothing here rests on [EXEC-002].
+ * **Why the choice is race-free.** `collect-err` writes `arrived` and `errSeen` in a single
+ * firing, and a firing's complete output set is deposited in one step, strictly before
+ * enablement is re-evaluated ([EXEC-001]). So the arrival that completes the count can never be
+ * observed without the marker that accompanies it, and there is no window in which `join-ok`
+ * sees a full count and an empty `errSeen`. `collect-susp` is the same argument for `suspSeen`.
  *
- * **Concurrency limit.** Mastra's `.parallel()` fan-out is unbounded (`Promise.all`), and the
- * `parallel` variant of `EntryDescription` carries no limit to compile, so this gadget emits no
- * permit place (`docs/divergences.md` row 5 is still *proposed*, and `foreach` is where a
- * `concurrency` field actually exists today). Adding one later is a permit place seeded by an
- * upstream transition and consumed by each arm's start — but note it cannot be seeded by `fork`
- * writing `k` tokens into one place: a branch names places, not counts, and every analysis
- * models one token per named place ([IO-016]), so the multiplicity has to be topology.
+ * **Why no priorities.** The three joins are structurally exclusive: `join-fail` needs `errSeen`,
+ * which inhibits the other two; `join-susp` needs `suspSeen`, which inhibits `join-ok`. At most
+ * one is ever enabled, so nothing here rests on [EXEC-002] ordering. `join-fail` resets `suspSeen`
+ * because failure outranks suspension and the losing markers must not outlive the block.
+ *
+ * **Which failure is reported.** The lowest arm index, not the first in time: Mastra takes
+ * `results.find(r => r.status === 'failed')` over an array index-aligned with the arms (`:267`),
+ * and `Promise.all` preserves index order whatever order the arms settle in. `all(errSeen)` hands
+ * the action every failure so it can choose; a `one` would take the FIFO head, which is the
+ * first in *time* and is the wrong answer whenever a higher-indexed arm fails sooner. The token
+ * is forwarded unchanged, `tripwire` included, so the run ends `tripwire` exactly when Mastra's
+ * `fmtReturnValue` would (`control-flow.ts:271-276`, `default.ts:611-629`). Suspension is
+ * chosen the same way (`:269`).
+ *
+ * **The value handed on.** Two different values, because Mastra has two
+ * (`GadgetContext.nextIsResult`): as the workflow's last entry it is the block's own output — only the arms that *succeeded in
+ * this block*, keyed by id in arm order — and otherwise it is what `getStepOutput` hands the next
+ * entry: a record over *every declared arm*, read from the run's step results
+ * (`default.ts:1141-1149`), so a bailed arm carries its bail payload and a paused arm is present
+ * as `undefined`.
+ *
+ * **Every arm receives the same input**, as Mastra's does (`prevOutput` is computed once, `:187`).
+ *
+ * **Concurrency is unbounded**, as `Promise.all` is. The `parallel` entry carries no limit to
+ * compile (`docs/divergences.md` row 5 is a proposed addition). Adding one would be a permit
+ * place seeded by topology, never `k` tokens written into one place by `fork`: a branch names
+ * places, not counts ([IO-016]).
  */
 export const parallelGadget: Gadget = (entry, next, ctx) => {
   if (entry.kind !== 'parallel') throw new Error(`parallelGadget received a '${entry.kind}' entry`);
 
-  const arms: readonly EntryDescription[] = entry.arms;
+  const { names, path } = ctx;
+  const arms = entry.arms;
   const armCount = arms.length;
+  const inPlace = place<FlowToken>(names.entryIn(path, entry.id));
+
   if (armCount === 0) {
-    // An `and()` with no children is rejected by libpetri, and `exactly(0, ...)` by `In`. Both
-    // are downstream symptoms of the real defect: a fork with nothing to produce into leaves the
-    // gadget's input token with no consumer, which is a hang, not an empty success.
-    throw new Error(`parallel entry '${entry.id}' has no arms; nothing would consume its input token`);
+    // Mastra reduces over an empty results array and continues with `{}` (`control-flow.ts:220,
+    // 286-295`). `and()` with no children and `exactly(0, ...)` are both illegal in libpetri, so
+    // the empty block is one pass-through. The next entry's record over zero declared arms is
+    // `{}` as well, so the two value shapes coincide and `nextIsResult` does not matter here.
+    const pass = Transition.builder(names.entryTransition(path, entry.id, 'empty'))
+      .inputs(one(inPlace))
+      .outputs(outPlace(next))
+      .action(async (tctx) => {
+        tctx.output(next, { data: {} });
+      })
+      .build();
+    return { inPlace, transitions: [pass] };
   }
 
-  const inPlace = place<FlowToken>(ctx.names.entryIn(ctx.path, entry.id));
-  /** Every arm's settlement, success or failure. The join counts this place and nothing else. */
-  const arrived = place<ArmArrival>(ctx.names.entryPlace(ctx.path, entry.id, 'arrived'));
+  /** Every arm's settlement, whatever it was. The joins count this place and nothing else. */
+  const arrived = place<ArmArrival>(names.entryPlace(path, entry.id, 'arrived'));
   /**
-   * Gadget-local failure sink for the arms. Passing this to `emitNested` instead of
-   * `ctx.failed` is what stops a failing arm from ending the run while its siblings are still
-   * in flight: their tokens would then have no consumer and the run would read as stranded.
+   * The arms' exits. Passing these to `emitNested` instead of `ctx.exits` is what stops one arm
+   * from deciding the run while its siblings are still in flight — their tokens would then have
+   * no consumer and the run would read as stranded. Shared by every arm: the arm a failure or
+   * suspension came from is recovered from the token itself, where the join needs it.
    */
-  const armErr = place<FailureToken>(ctx.names.entryPlace(ctx.path, entry.id, 'arm-err'));
-  /** The marking's memory that an arm failed, kept alive past `armErr`'s consumption. */
-  const errSeen = place<FailureToken>(ctx.names.entryPlace(ctx.path, entry.id, 'err-seen'));
+  const armExits: Exits = {
+    failed: place<FailureToken>(names.entryPlace(path, entry.id, 'arm-err')),
+    bailed: place<BailToken>(names.entryPlace(path, entry.id, 'arm-bail')),
+    suspended: place<SuspendToken>(names.entryPlace(path, entry.id, 'arm-susp')),
+    paused: place<PauseToken>(names.entryPlace(path, entry.id, 'arm-pause')),
+  };
+  /** The marking's memory that an arm failed, kept past `arm-err`'s consumption. */
+  const errSeen = place<FailureToken>(names.entryPlace(path, entry.id, 'err-seen'));
+  /** The same for a suspended arm. */
+  const suspSeen = place<SuspendToken>(names.entryPlace(path, entry.id, 'susp-seen'));
 
   const armIns: Place<FlowToken>[] = [];
   const collects: Transition[] = [];
 
   for (let i = 0; i < armCount; i++) {
-    const armDone = place<FlowToken>(ctx.names.entryPlace(ctx.path, entry.id, `arm-${i}-done`));
-    // The child path extends ours, so the vocabulary's uniqueness assertion covers nesting:
-    // two arms that are the same step id land at different paths and so at different names.
-    const arm = ctx.emitNested(arms[i]!, [...ctx.path, i], armDone, armErr);
+    const armDone = place<FlowToken>(names.entryPlace(path, entry.id, `arm-${i}-done`));
+    // The child path extends ours, so two arms that are the same step id land at different
+    // paths and so at different names; the vocabulary's uniqueness assertion covers it.
+    const arm = ctx.emitNested(arms[i]!, [...path, i], armDone, armExits);
     armIns.push(arm.inPlace);
 
-    // Stamping the index here rather than inside the arm is what keeps arm identity structural:
-    // the arm produces an ordinary `FlowToken` and does not know it is an arm.
     collects.push(
-      Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, `collect-${i}`))
+      Transition.builder(names.entryTransition(path, entry.id, `collect-${i}`))
         .inputs(one(armDone))
         .outputs(outPlace(arrived))
         .action(async (tctx) => {
-          const incoming = tctx.input(armDone);
-          tctx.output(arrived, { status: 'ok', index: i, data: incoming.data });
+          tctx.output(arrived, { status: 'ok', index: i, data: tctx.input(armDone).data });
         })
         .build(),
     );
   }
 
-  const fork = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'fork'))
+  const fork = Transition.builder(names.entryTransition(path, entry.id, 'fork'))
     .inputs(one(inPlace))
-    // One branch, claiming exactly the set the action writes ([IO-015]): all arms always run,
+    // One branch, claiming exactly the set the action writes ([IO-015]): every arm always runs,
     // so there is nothing to select. Every arm receives the same input, as Mastra's does.
     .outputs(and(...armIns.map(outPlace)))
     .action(async (tctx) => {
-      const incoming = tctx.input(inPlace);
-      const payload: FlowToken = { data: incoming.data };
-      for (const armIn of armIns) tctx.output(armIn, payload);
+      const { data } = tctx.input(inPlace);
+      for (const armIn of armIns) tctx.output(armIn, { data });
     })
     .build();
 
-  const collectErr = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'collect-err'))
-    .inputs(one(armErr))
-    // Both writes are one branch, and that is the whole safety argument: the arrival that keeps
-    // the join's count honest and the marker that decides its outcome land together or not at all.
+  // Both writes are one branch, and that is the whole race-freedom argument: the arrival that
+  // keeps the count honest and the marker that decides the outcome land together or not at all.
+  const collectErr = Transition.builder(names.entryTransition(path, entry.id, 'collect-err'))
+    .inputs(one(armExits.failed))
     .outputs(and(outPlace(arrived), outPlace(errSeen)))
     .action(async (tctx) => {
-      const failure = tctx.input(armErr);
+      const failure = tctx.input(armExits.failed);
       tctx.output(arrived, { status: 'failed' });
       tctx.output(errSeen, failure);
     })
     .build();
 
-  const joinOk = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'join-ok'))
-    .inputs(exactly(armCount, arrived))
-    .inhibitor(errSeen)
-    .outputs(outPlace(next))
+  const collectSusp = Transition.builder(names.entryTransition(path, entry.id, 'collect-susp'))
+    .inputs(one(armExits.suspended))
+    .outputs(and(outPlace(arrived), outPlace(suspSeen)))
     .action(async (tctx) => {
-      // Decide, then emit ([EXEC-031]: inputs are already consumed and are not restored). The
-      // aggregate is assembled in full before a single token is written.
-      const byIndex = new Array<unknown>(armCount);
-      for (const arrival of tctx.inputs(arrived)) {
-        // A failed arrival cannot reach here — `errSeen` would be marked and this transition
-        // inhibited — and it carries no output to contribute in any case.
-        if (arrival.status === 'ok') byIndex[arrival.index] = arrival.data;
-      }
-      // Keyed by arm id and assembled in arm order, so the result is independent of the order
-      // the arms actually finished in. Mastra keys its `.parallel()` result the same way, which
-      // also means two arms sharing an id collapse there exactly as they collapse here; the
-      // net's own identity for an arm remains its index.
-      //
-      // Assembled through `Object.fromEntries`, never by assigning `aggregate[id] = ...`. Arm
-      // ids are arbitrary user strings, and `obj['__proto__'] = value` is a *setter* call: it
-      // replaces the aggregate's prototype instead of creating a key, so that arm's output
-      // vanishes from the result and every downstream step sees the arm's fields as inherited
-      // properties that `Object.keys` does not list. `fromEntries` defines own properties
-      // (CreateDataPropertyOrThrow), so `__proto__` becomes an ordinary key like any other.
-      // This is data loss, not a hang — no token strands either way — but the join's contract
-      // is that every arm's output reaches `next`, and assignment quietly breaks it.
-      const pairs = new Array<readonly [string, unknown]>(armCount);
-      for (let i = 0; i < armCount; i++) pairs[i] = [arms[i]!.id, byIndex[i]] as const;
-      tctx.output(next, { data: Object.fromEntries(pairs) });
+      const suspension = tctx.input(armExits.suspended);
+      tctx.output(arrived, { status: 'suspended' });
+      tctx.output(suspSeen, suspension);
     })
     .build();
 
-  const joinFail = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'join-fail'))
-    // `one` takes the FIFO head ([EXEC-010]), which is the first arm to have failed — the
-    // outcome `Promise.all` would have rejected with. The reset then drains the rest: with k
-    // failures there are k tokens in `errSeen`, and this single firing must leave none, or the
-    // survivors sit in a place whose only consumer needs a full `arrived` count that will never
-    // come again. Inputs are consumed before resets drain within a firing ([EXEC-013]), so the
-    // head is safely in hand by the time the place is emptied.
-    .inputs(exactly(armCount, arrived), one(errSeen))
-    .reset(errSeen)
-    .outputs(outPlace(ctx.failed))
+  // A bail or a pause is swallowed: the arm counts toward the join and contributes nothing else.
+  // Its outcome is still in the run's step results, which is where the next entry reads it.
+  const collectBail = Transition.builder(names.entryTransition(path, entry.id, 'collect-bail'))
+    .inputs(one(armExits.bailed))
+    .outputs(outPlace(arrived))
     .action(async (tctx) => {
-      tctx.output(ctx.failed, tctx.input(errSeen));
+      tctx.output(arrived, { status: 'settled' });
+    })
+    .build();
+
+  const collectPause = Transition.builder(names.entryTransition(path, entry.id, 'collect-pause'))
+    .inputs(one(armExits.paused))
+    .outputs(outPlace(arrived))
+    .action(async (tctx) => {
+      tctx.output(arrived, { status: 'settled' });
+    })
+    .build();
+
+  /**
+   * The lowest arm index a step id occupies. With single-step arms a `FailureToken`'s `stepId`
+   * *is* its arm's id; two arms sharing an id collapse to the first index, as they collapse in
+   * every id-keyed record Mastra builds. A `Map`, not an object, so an id like `__proto__` is an
+   * ordinary key.
+   */
+  const firstIndexOf = new Map<string, number>();
+  arms.forEach((arm, i) => {
+    if (!firstIndexOf.has(arm.id)) firstIndexOf.set(arm.id, i);
+  });
+  const failureIndex = (f: FailureToken): number => firstIndexOf.get(f.stepId) ?? armCount;
+  // A suspension carries the path the arm was emitted at, whose element below ours *is* the arm
+  // index — exact even when two arms share an id.
+  const suspensionIndex = (s: SuspendToken): number =>
+    s.path.length > path.length ? s.path[path.length]! : (firstIndexOf.get(s.stepId) ?? armCount);
+
+  const joinFail = Transition.builder(names.entryTransition(path, entry.id, 'join-fail'))
+    // `all(errSeen)` takes every failure so the action can choose among them; the reset drops
+    // any suspension markers, which lose to a failure. Both places are empty after this firing.
+    .inputs(exactly(armCount, arrived), all(errSeen))
+    .reset(suspSeen)
+    .outputs(outPlace(ctx.exits.failed))
+    .action(async (tctx) => {
+      tctx.output(ctx.exits.failed, lowest(tctx.inputs(errSeen), failureIndex));
+    })
+    .build();
+
+  const joinSusp = Transition.builder(names.entryTransition(path, entry.id, 'join-susp'))
+    .inputs(exactly(armCount, arrived), all(suspSeen))
+    .inhibitor(errSeen)
+    .outputs(outPlace(ctx.exits.suspended))
+    .action(async (tctx) => {
+      tctx.output(ctx.exits.suspended, lowest(tctx.inputs(suspSeen), suspensionIndex));
+    })
+    .build();
+
+  const joinOk = Transition.builder(names.entryTransition(path, entry.id, 'join-ok'))
+    .inputs(exactly(armCount, arrived))
+    .inhibitors(errSeen, suspSeen)
+    .outputs(outPlace(next))
+    .action(async (tctx) => {
+      // Decide, then emit ([EXEC-031]: inputs are already consumed and are not restored). The
+      // record is assembled in full before a single token is written.
+      //
+      // Every record here is built with `Object.fromEntries`, never `record[id] = value`. Arm
+      // ids are arbitrary user strings, and `obj['__proto__'] = value` is a *setter* call that
+      // replaces the record's prototype instead of creating a key — the arm's value vanishes
+      // from `Object.keys` and its fields leak onto every downstream read as inherited
+      // properties. `fromEntries` defines own properties, so `__proto__` is a key like any other.
+      let data: Record<string, unknown>;
+      if (ctx.nextIsResult) {
+        // The block's own output (`control-flow.ts:286-295`): only the arms that succeeded in
+        // this block, in arm order, so a later arm sharing an id overwrites an earlier one as
+        // Mastra's `reduce` does. Bailed and paused arms arrived as `settled` and are absent.
+        const byIndex = new Map<number, unknown>();
+        for (const arrival of tctx.inputs(arrived)) {
+          if (arrival.status === 'ok') byIndex.set(arrival.index, arrival.data);
+        }
+        const pairs: [string, unknown][] = [];
+        for (let i = 0; i < armCount; i++) {
+          if (byIndex.has(i)) pairs.push([arms[i]!.id, byIndex.get(i)]);
+        }
+        data = Object.fromEntries(pairs);
+      } else {
+        // What the next entry receives (`default.ts:1141-1149`): every declared arm, read from
+        // the run's step results rather than from the arrivals. So a bailed arm carries its bail
+        // payload, a paused arm is present as `undefined`, and two arms sharing an id show the
+        // outcome recorded *last* — the step results keep the latest, in time.
+        const scope = scopeOf(tctx);
+        data = Object.fromEntries(arms.map((arm) => [arm.id, outputOf(scope.getStepResult(arm.id))]));
+      }
+      tctx.output(next, { data });
     })
     .build();
 
   // The arms' own transitions are deliberately not returned: `emitNested` already recorded them
   // against their own entry, and repeating them here would re-key the `NetMap` to this entry.
-  return { inPlace, transitions: [fork, ...collects, collectErr, joinOk, joinFail] };
+  return {
+    inPlace,
+    transitions: [fork, ...collects, collectErr, collectSusp, collectBail, collectPause, joinFail, joinSusp, joinOk],
+  };
 };
+
+/**
+ * Mastra's `stepResults[id]?.output`. Only a success and a bail have an `output` there: a
+ * failed, suspended or paused step result is written over `omitPriorCompletionFields(...)`
+ * (`handlers/step.ts:566-569`, `utils.ts:759-777`), which strips any earlier `output`, and a
+ * suspension's own value lives in `suspendOutput`, not `output`.
+ */
+function outputOf(outcome: StepOutcome | undefined): unknown {
+  return outcome?.status === 'success' || outcome?.status === 'bailed' ? outcome.output : undefined;
+}
+
+/** The token with the lowest arm index; on a tie, the earliest in the input order. */
+function lowest<T>(tokens: readonly T[], indexOf: (token: T) => number): T {
+  let best = tokens[0]!;
+  let bestIndex = indexOf(best);
+  for (let k = 1; k < tokens.length; k++) {
+    const index = indexOf(tokens[k]!);
+    if (index < bestIndex) {
+      best = tokens[k]!;
+      bestIndex = index;
+    }
+  }
+  return best;
+}

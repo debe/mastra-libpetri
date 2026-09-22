@@ -6,7 +6,13 @@
  * `@mastra/core` at runtime, and `adapt.ts` turns a committed workflow's step flow into the
  * compiler's description. See the root README for the architecture.
  */
-export { adaptStepFlow, adaptExecutionGraph, MASTRA_BRANCH_ENTRY_TYPE } from './adapt.js';
+export {
+  adaptStepFlow,
+  adaptExecutionGraph,
+  MASTRA_BRANCH_ENTRY_TYPE,
+  MASTRA_WORKFLOW_COMPONENT,
+  UnsupportedWorkflowError,
+} from './adapt.js';
 export type { AdaptOptions } from './adapt.js';
 export { entryId } from './host.js';
 export type {

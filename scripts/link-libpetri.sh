@@ -42,6 +42,17 @@ fingerprint_dist() {
     | awk '{print $1}' | sort | shasum -a 256 | cut -c1-12
 }
 
+# A clean tree does not prove the build came from it: dist/ is gitignored, and it is what the
+# package actually imports. Stale if any source file is newer than the oldest built file.
+dist_stale() {
+  [ -d "$SIBLING/dist" ] || return 0
+  local oldest
+  # Portable (BSD and GNU): the oldest top-level built file, then any source newer than it.
+  oldest="$(ls -1tr "$SIBLING"/dist/*.js 2>/dev/null | head -1)"
+  [ -n "$oldest" ] || return 0
+  [ -n "$(find "$SIBLING/src" -name '*.ts' -type f -newer "$oldest" 2>/dev/null | head -1)" ]
+}
+
 sibling_rev() { git -C "$(dirname "$SIBLING")" rev-parse --short HEAD 2>/dev/null || echo unknown; }
 
 sibling_dirty() {
@@ -69,6 +80,12 @@ check_pin() {
   fi
 
   echo "provenance: $(provenance)"
+  if dist_stale; then
+    echo "warning: a source file under the sibling's typescript/src is newer than its dist/," >&2
+    echo "         so the code that runs was not built from the tree the pin names." >&2
+    echo "         Rebuild the sibling (npm run build) before attributing a figure." >&2
+    [ "${STRICT:-0}" = "1" ] && die "refusing to certify a stale build (--strict)"
+  fi
   if sibling_dirty; then
     echo "warning: the sibling's typescript/ tree has uncommitted changes, so the pinned" >&2
     echo "         revision does NOT describe the code that runs. Expected while CORE-073" >&2
