@@ -30,15 +30,18 @@ import type {
 } from './types.js';
 
 /**
- * The largest net `compile()` will emit, in places — a stopgap, not a design limit.
+ * The largest net `compile()` will emit, in places — a guard against a libpetri defect.
  *
- * libpetri's `PrecompiledNetExecutor` (the one the kernel runs) spins synchronously on some nets
- * a little over 4096 places: a bare chain of 4097 places completes in ~120ms and one of 4098
- * never returns, and `run(timeout, 'close')` cannot interrupt it because the loop never yields.
- * `BitmapNetExecutor` runs the same 4098-place chain in ~115ms. Reported upstream with that
- * repro; the exact trigger is not understood here, which is why the guard is conservative. A hang
- * no timeout can reach is the worst failure there is, so above this size compilation refuses by
- * name instead. Real workflows sit far below it; lift it when the executor is fixed.
+ * `PrecompiledNet` stored each transition's single-word needs index in an `Int8Array`, so a
+ * transition whose input and read places all sit in one bitmap word at index 128 or above —
+ * place ids from 4096 up — wrapped negative and was read as having no needs. On an input that
+ * makes a transition fire with its place empty, fail synchronously and re-mark itself dirty
+ * forever: a spin `run(timeout, 'close')` cannot interrupt, because the loop never yields. On an
+ * inhibitor it is quieter and worse — the inhibitor is ignored and the run gives a wrong answer.
+ * Root-caused and fixed upstream (`Int8Array` -> `Int32Array`, TypeScript only; Java and Rust
+ * were never affected). Place ids, not the place count, trigger it, but a net of at most 4096
+ * places has every id below 4096, so this bound excludes both failures exactly. Lift it once the
+ * package depends on a libpetri release carrying the fix.
  */
 export const MAX_NET_PLACES = 4096;
 

@@ -114,8 +114,9 @@
       can no longer contain a foreach. The `loop` allowance is provable only when seeded at the
       post-`start` marking (`placeBound(budget, k)` proven, `k-1` violated): `start` writes `k`
       tokens into one place its `and` names once, which libpetri accepts but its analyses model
-      as one token per named place ([IO-016]) — asked upstream whether that multiplicity is
-      intended and stable (U8). No property establishes termination (see above)
+      as one token per named place ([IO-016]). That multiplicity is specified (U8); closing the
+      limit means expressing the allowance in topology. No property establishes termination
+      (see above)
 - [ ] Track A: assert the instantiate -> fuse -> re-instantiate round-trip. Depth is
       unconstrained now that [MOD-031] is fixed, but it is the shape nested workflows take and
       a regression there is silent token loss rather than a build error
@@ -298,11 +299,22 @@ bump not yet run):
 
 **Reported this phase, open upstream:**
 
-- [ ] U7 — `PrecompiledNetExecutor` spins synchronously on a 4098-place chain that
-      `BitmapNetExecutor` runs in ~115ms; no timeout can interrupt it. Repro sent to the libpetri
-      session. Our stopgap is `MAX_NET_PLACES`; lift it when fixed
-- [ ] U8 — question, not pressed: is depositing several tokens into one place an `and` names
-      once intended and stable? The loop gadget's `start` depends on it
+- [ ] U7 — `PrecompiledNetExecutor` spun synchronously on a 4098-place chain. **Root-caused by
+      the libpetri session:** `PrecompiledNet`'s single-word needs index was an `Int8Array`, so
+      place ids from 4096 up wrapped negative and read as "no needs" — a spin on an input arc, a
+      silently ignored inhibitor on an inhibitor arc. Place ids trigger it, not the count, which
+      is why a 4411-place foreach ran and a 4097-place workflow hung. Fixed (`Int32Array`, with a
+      regression test that fails without it) in libpetri's working tree, uncommitted; confirmed
+      live here: 4098 places in 121ms, 5000 in 163ms. `MAX_NET_PLACES` stays until the package
+      depends on a release carrying it
+- [x] U8 — answered: depositing several tokens into one place an `and` names once is
+      **specified**, not an accident. [IO-015] validates the set of places ("names places, not
+      counts"), and [IO-016 AC4] deposits regardless and reports it as one WARN log event per
+      transition per execution; tightening it would be a breaking spec change. So the loop
+      gadget stands on specified behaviour — and emits that WARN on every run, which M5's event
+      mapping must expect. The spec's advice for a net meant to be proven is to express the
+      multiplicity in topology, which is the route to proving the loop allowance from the entry
+      marking rather than from the post-start one
 
 **Not pursued, deliberately:**
 

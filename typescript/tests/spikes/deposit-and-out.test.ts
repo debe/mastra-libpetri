@@ -450,11 +450,13 @@ describe('(B) Out spec validation exactness [IO-015, IO-016, CORE-043]', () => {
     expect(overlapping.counts).toEqual({ A: 1, B: 1, C: 1, src: 0 });
   });
 
-  it('SILENT: writing twice to a place an and names once validates and deposits both tokens', async () => {
-    // [IO-015] validates the produced *set*, so multiplicity is invisible to it. Two firings
-    // deposit four tokens into A and the run reports success. The only signal is one WARN
-    // log-message event per transition per execution [IO-016 AC4] — the second firing's
-    // duplication is not reported at all.
+  it('writing twice to a place an and names once validates, deposits both, and warns once [IO-016]', async () => {
+    // [IO-015] validates the produced *set* — "a spec names places, not counts" — so an action
+    // that deposits several tokens into one claimed place conforms, by specification. It is not
+    // silent: [IO-016 AC4] requires one WARN log-message event per transition per execution, so
+    // the second firing's duplication is not reported again. (This test was once titled
+    // "SILENT"; it always asserted the WARN. The deposit is silent to validation, not to the
+    // event stream.)
     const report = await fireOnce(
       and(outPlace(A), outPlace(B)),
       async ctx => {
