@@ -6,8 +6,19 @@ import { verifyWorkflow, describeReport, type PropertyReport } from '../../src/v
 import type { FlowToken, WorkflowDescription } from '../../src/compiler/types.js';
 import { RecordingRunner } from '../fixtures/runner.js';
 
-function expectBothProven(reports: readonly PropertyReport[]): void {
-  expect(reports.map((r) => r.property)).toEqual(['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal']);
+/** Every report `verifyWorkflow` returns by default, in order: both segments on one closed net. */
+const ALL_REPORTS = [
+  'closed/deadlockFree',
+  'closed/terminatesAtSink',
+  'closed/exactlyOneTerminal',
+  'closed/neverCanceled',
+  'cancel/deadlockFree',
+  'cancel/terminatesAtSink',
+  'cancel/exactlyOneTerminal',
+];
+
+function expectAllProven(reports: readonly PropertyReport[]): void {
+  expect(reports.map((r) => `${r.segment}/${r.property}`)).toEqual(ALL_REPORTS);
   for (const report of reports) {
     // Assert `proven` explicitly. `isViolated()` is false for `unknown` too, so asserting
     // "not violated" would pass on a query that timed out.
@@ -15,10 +26,26 @@ function expectBothProven(reports: readonly PropertyReport[]): void {
   }
 }
 
+/** The structural cancel check, then both segments, through `verifyWorkflow`'s default. */
+async function expectProvenBothSegments(description: WorkflowDescription): Promise<readonly PropertyReport[]> {
+  const reports = await verifyWorkflow(compile(description));
+  expectAllProven(reports);
+  return reports;
+}
+
+const verdict = (reports: readonly PropertyReport[], key: string): string | undefined =>
+  reports.find((r) => `${r.segment}/${r.property}` === key)?.result.verdict.type;
+
 /**
- * Properties `deadlockFree`, `terminatesAtSink` and `exactlyOneTerminal`; initial marking one token in the entry place;
- * no environment places (closed net); sinks `wf.done`, `wf.failed`, `wf.bailed`, `wf.suspended`,
- * `wf.paused`. The route is reported by `describeReport` if an assertion fails.
+ * `verifyWorkflow`'s default. First the structural cancel check, which throws on a violation.
+ * Then two segments on one closed net, sinks the six terminals (`wf.done`, `wf.failed`,
+ * `wf.bailed`, `wf.suspended`, `wf.paused`, `wf.canceled`) and `wf.cancel`:
+ * - `closed` — initial marking one token in the entry place, `wf.cancel.request` empty (no
+ *   cancellation): `deadlockFree`, `terminatesAtSink`, `exactlyOneTerminal`, and `neverCanceled`
+ *   (`placeBound(wf.canceled, 0)`, a reachability bound).
+ * - `cancel` — one token in the entry place and one in `wf.cancel.request`, so `t.cancel.arrive`
+ *   lands the signal at every reachable point: the first three.
+ * The route is reported by `describeReport` if an assertion fails.
  */
 describe('compiled linear chain, proved', () => {
   it('is deadlock-free and terminates at a declared sink', async () => {
@@ -33,7 +60,7 @@ describe('compiled linear chain, proved', () => {
     };
 
     // `compile` takes no runner: a net compiled only to be verified never fires.
-    expectBothProven(await verifyWorkflow(compile(chain)));
+    await expectProvenBothSegments(chain);
   }, 90_000);
 
   it('proves a chain using every leaf form at once', async () => {
@@ -49,8 +76,8 @@ describe('compiled linear chain, proved', () => {
       ],
     };
 
-    expectBothProven(await verifyWorkflow(compile(chain)));
-  }, 90_000);
+    await expectProvenBothSegments(chain);
+  }, 180_000);
 });
 
 /**
@@ -70,28 +97,34 @@ describe('exactlyOneTerminal catches what the other two cannot', () => {
       .action(async (tctx) => {
         const incoming = tctx.input(inPlace);
         tctx.output(next, incoming);
-        tctx.output(ctx.exits.failed, { stepId: entry.id, error: 'both' });
+        tctx.output(ctx.exits.failed, { stepId: entry.id, path: ctx.viewPath, error: 'both' });
       })
       .build();
     return { inPlace, transitions: [run] };
   };
   const chain: WorkflowDescription = { id: 'double', entries: [{ kind: 'step', id: 'a' }] };
 
-  it('the intact chain proves all three', async () => {
-    expectBothProven(await verifyWorkflow(compile(chain)));
+  it('the intact chain proves every property in both segments', async () => {
+    await expectProvenBothSegments(chain);
   });
 
   it('a step reaching two terminals is violated by exactlyOneTerminal alone, and shows as residue', async () => {
     const compiled = compile(chain, { gadgets: { step: doubleExit } });
+    // The mutant has no gate and no sweep: nothing the structural check could flag.
     const reports = await verifyWorkflow(compiled);
-    const verdict = (p: string) => reports.find((r) => r.property === p)!.result.verdict.type;
+    const all = reports.map(describeReport).join('; ');
 
-    expect(verdict('deadlockFree'), reports.map(describeReport).join('; ')).toBe('proven');
-    expect(verdict('terminatesAtSink'), reports.map(describeReport).join('; ')).toBe('proven');
-    expect(verdict('exactlyOneTerminal'), reports.map(describeReport).join('; ')).toBe('violated');
+    expect(verdict(reports, 'closed/deadlockFree'), all).toBe('proven');
+    expect(verdict(reports, 'closed/terminatesAtSink'), all).toBe('proven');
+    expect(verdict(reports, 'closed/exactlyOneTerminal'), all).toBe('violated');
+    expect(verdict(reports, 'closed/neverCanceled'), all).toBe('proven');
+    // Under cancellation too: two settle tokens each re-stamped is two canceled terminals.
+    expect(verdict(reports, 'cancel/deadlockFree'), all).toBe('proven');
+    expect(verdict(reports, 'cancel/terminatesAtSink'), all).toBe('proven');
+    expect(verdict(reports, 'cancel/exactlyOneTerminal'), all).toBe('violated');
 
     // The run agrees: classify reports the failure and names the second terminal as residue.
     const outcome = await runWorkflow(compiled, 'x', { runner: new RecordingRunner() });
-    expect(outcome).toEqual({ status: 'failed', stepId: 'a', error: 'both', residue: ['wf.done'] });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'a', path: [0], error: 'both', residue: ['wf.done'] });
   });
 });

@@ -1,19 +1,24 @@
 import {
   PrecompiledNetExecutor,
+  environmentPlace,
   tokenOf,
   seedToken,
   type Clock,
+  type EventStore,
   type Marking,
+  type NetEvent,
   type Place,
+  type Token,
 } from 'libpetri';
 import { RUN_SCOPE_KEY } from '../compiler/scope.js';
 import type {
   BailToken,
+  CanceledToken,
   CompiledWorkflow,
   FailureToken,
   FlowToken,
   PauseToken,
-  StepOutcome,
+  StepRecord,
   StepRunner,
   SuspendToken,
 } from '../compiler/types.js';
@@ -37,12 +42,20 @@ type Residue = { readonly residue?: readonly string[] };
  * leak appears. A test does not have to opt in to catching one. A second marked terminal is
  * residue too: every entry ends in exactly one outcome, so two means the model is wrong.
  */
+/**
+ * Where the reported outcome came from: the step, its view path (Mastra's `executionPath`) and,
+ * for a `.foreach()` item, its index — what the codec needs to write the snapshot's paths.
+ */
+type At = { readonly stepId: string; readonly path: EntryPath; readonly foreachIndex?: number };
+
 export type RunOutcome =
   | ({ readonly status: 'success'; readonly output: unknown; readonly bailed?: true } & Residue)
-  | ({ readonly status: 'failed'; readonly stepId: string; readonly error: unknown } & Residue)
-  | ({ readonly status: 'tripwire'; readonly stepId: string; readonly tripwire: unknown } & Residue)
-  | ({ readonly status: 'suspended'; readonly stepId: string; readonly path: EntryPath; readonly payload: unknown } & Residue)
-  | ({ readonly status: 'paused'; readonly stepId: string; readonly path: EntryPath } & Residue)
+  | ({ readonly status: 'failed'; readonly error: unknown } & At & Residue)
+  | ({ readonly status: 'tripwire'; readonly tripwire: unknown } & At & Residue)
+  | ({ readonly status: 'suspended'; readonly payload: unknown } & At & Residue)
+  | ({ readonly status: 'paused' } & At & Residue)
+  /** Mastra's canceled run carries no step id; `origin` names what was waiting or running. */
+  | ({ readonly status: 'canceled'; readonly origin?: CanceledToken['origin'] } & Residue)
   | { readonly status: 'stranded'; readonly places: readonly string[] };
 
 export interface RunOptions {
@@ -65,14 +78,25 @@ export interface RunOptions {
    * file can bound.
    */
   readonly timeoutMs?: number;
-  /** Step results carried in from an earlier segment. Each must be a recognised outcome. */
-  readonly stepResults?: ReadonlyMap<string, StepOutcome>;
+  /** Step records carried in from an earlier segment. Each must be a recognised outcome. */
+  readonly stepResults?: ReadonlyMap<string, StepRecord>;
+  /**
+   * The run's abort signal — Mastra's `abortController.signal`. When it fires, one token is
+   * injected into the net's cancellation place and the net itself decides what that stops.
+   *
+   * Supplying one registers that place as an environment place, and an executor with one does not
+   * end at quiescence on its own ([ENV-010]): the kernel ends the run by calling `drain()` the
+   * moment a terminal is marked. A run whose model strands a token therefore reaches no terminal
+   * and ends only at `timeoutMs` — a model defect the proven `exactlyOneTerminal` rules out, and
+   * the reason a run without a signal registers no environment place at all.
+   */
+  readonly signal?: AbortSignal;
 }
 
 export interface RunReport {
   readonly outcome: RunOutcome;
-  /** Every step's latest outcome, keyed by step id — Mastra's `stepResults`. */
-  readonly stepResults: ReadonlyMap<string, StepOutcome>;
+  /** Every step's latest record, keyed by step id — Mastra's `stepResults`. */
+  readonly stepResults: ReadonlyMap<string, StepRecord>;
 }
 
 /**
@@ -85,8 +109,10 @@ export interface RunReport {
  * **The run scope travels with the firing**, through `executionContextProvider`: every action
  * reads its runner and the run's step results from it, so one compiled net serves every run.
  *
- * **Quiescence, not environment places.** No environment place is registered on this path, so
- * the executor terminates at quiescence ([ENV-010]) rather than requiring `drain()`.
+ * **How a run ends.** Without a signal no environment place is registered and the executor ends
+ * at quiescence ([ENV-010]). With one, the cancel request place is an environment place, so the
+ * executor would wait at quiescence for more; the kernel ends the run with `drain()` the moment a
+ * terminal is marked ([ADR 0004]).
  *
  * **Cancellation is `close()`, never `run(timeoutMs)` alone.** The default timeout policy is
  * `'abandon'`: it rejects while the loop keeps firing and mutating the marking. `'close'` is the
@@ -98,26 +124,69 @@ export async function runWorkflowDetailed(
   options: RunOptions,
 ): Promise<RunReport> {
   if (options.stepResults) assertStepResults(options.stepResults);
+  const { signal } = options;
   const scope = new KernelRunScope({
     runner: options.runner,
     initData: input,
     ...(options.clock ? { clock: options.clock } : {}),
+    ...(signal ? { signal } : {}),
     ...(options.stepResults ? { stepResults: options.stepResults } : {}),
   });
 
   // A marking is built before any executor exists, so the ordinary constructor stamps wall time
   // and would differ on every replay — inside the marking. Seed through the clock.
-  const seed = options.clock
-    ? seedToken<FlowToken>(options.clock, { data: input })
-    : tokenOf<FlowToken>({ data: input });
+  const seed = <T>(value: T): Token<T> => (options.clock ? seedToken<T>(options.clock, value) : tokenOf<T>(value));
+  const initial = new Map<Place<unknown>, Token<unknown>[]>([[compiled.entryPlace, [seed<FlowToken>({ data: input })]]]);
+  // Aborted before it began: the signal is already in the marking, so the first entry's sweep
+  // takes the run straight to `wf.canceled`, as Mastra's check before the first entry does.
+  // The SIGNAL, not the request: the arrival already happened, before the run. Seeding the request
+  // would let `arrive` and the first entry's start fire in either order — they share no input — so
+  // a pre-aborted run could start its first step, which Mastra's check before the first entry never
+  // allows. (The `cancel` proof segment seeds the request on purpose: there the arrival may land
+  // anywhere, including after the first start.)
+  if (signal?.aborted) initial.set(compiled.cancel, [seed(null)]);
 
   const context = new Map<string, unknown>([[RUN_SCOPE_KEY, scope]]);
-  const executor = new PrecompiledNetExecutor(compiled.net, new Map([[compiled.entryPlace, [seed]]]), {
+  // At runtime the environment writes to the SIGNAL directly, not to the request place. The net's
+  // `t.cancel.arrive` exists so a proof can land the arrival anywhere; a real arrival going through
+  // it would cost an extra firing, and in that window a start enabled in the same cycle fires
+  // before the inhibitor sees the signal — measured: a step started though its abort signal had
+  // already fired, which Mastra, reading its signal synchronously before each entry, never does.
+  // Injecting into `wf.cancel` is the same event the verifier models, with no hop.
+  // A place NAME: libpetri's `environmentPlace` takes a string, and given a `Place` it registers
+  // one that matches nothing in the net.
+  const cancelPlace = environmentPlace<null>(compiled.cancel.name);
+  const terminalNames = new Set(Object.values(compiled.terminals).map((p: Place<unknown>) => p.name));
+
+  // `drain()` the moment a terminal is marked. It stops nothing: queued events are processed and
+  // in-flight actions finish ([ENV-011]), so the run still comes to rest, and `exactlyOneTerminal`
+  // covers the marking it rests in. Called from inside the firing cycle, which is safe: a wake-up
+  // raised while the executor is not parked is latched, not lost (libpetri 6.1.0).
+  let executor: PrecompiledNetExecutor | undefined;
+  const drainOnTerminal: EventStore | undefined = signal
+    ? terminalWatcher(terminalNames, () => executor?.drain())
+    : undefined;
+
+  executor = new PrecompiledNetExecutor(compiled.net, initial, {
     executionContextProvider: () => context,
     ...(options.clock ? { clock: options.clock, deadlineToleranceMs: 0 } : {}),
+    ...(signal ? { environmentPlaces: new Set([cancelPlace]), eventStore: drainOnTerminal } : {}),
   });
 
-  const marking = await executor.run(options.timeoutMs ?? 300_000, 'close');
+  // After `drain()` or `close()` the executor rejects an injection silently — the run is already
+  // finishing, so a late abort is "already terminal". What `injectNoAwait` *throws* is a wiring
+  // error (the place is not registered), which must surface rather than lose the abort.
+  const onAbort = (): void => {
+    executor?.injectNoAwait(cancelPlace, null);
+  };
+  if (signal && !signal.aborted) signal.addEventListener('abort', onAbort, { once: true });
+
+  let marking: Marking;
+  try {
+    marking = await executor.run(options.timeoutMs ?? 300_000, 'close');
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+  }
   const outcome = classify(compiled, marking);
 
   // A top-level bail ends the run as a success, and Mastra rewrites the bailing entry's own
@@ -127,20 +196,29 @@ export async function runWorkflowDetailed(
   if (outcome.status === 'success' && outcome.bailed === true) {
     const bail = marking.peekFirst(compiled.terminals.bailed) as { value: BailToken } | null;
     if (bail !== null) {
-      scope.recordStepResult(bail.value.stepId, { status: 'success', output: bail.value.output });
+      const existing = scope.getStepResult(bail.value.stepId);
+      scope.recordStepResult(bail.value.stepId, {
+        payload: existing !== undefined && 'payload' in existing ? existing.payload : undefined,
+        ...(existing?.startedAt === undefined ? {} : { startedAt: existing.startedAt }),
+        ...(existing?.endedAt === undefined ? {} : { endedAt: existing.endedAt }),
+        ...(existing?.metadata === undefined ? {} : { metadata: existing.metadata }),
+        status: 'success',
+        output: bail.value.output,
+      });
     }
   }
   return { outcome, stepResults: scope.stepResults() };
 }
 
-const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bailed', 'suspended', 'paused']);
+/** Statuses a carried-in record may have: every outcome, and a combinator's `canceled`. */
+const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bailed', 'suspended', 'paused', 'canceled']);
 
 /**
  * Refuses a malformed carried-in record at the boundary. A `null` in there would otherwise be
  * read deep inside a join's action, after its inputs were consumed, and strand the run with no
  * place named.
  */
-function assertStepResults(results: ReadonlyMap<string, StepOutcome>): void {
+function assertStepResults(results: ReadonlyMap<string, StepRecord>): void {
   for (const [stepId, outcome] of results) {
     const status = (outcome as { status?: unknown } | null)?.status;
     if (outcome === null || typeof outcome !== 'object' || typeof status !== 'string' || !OUTCOME_STATUSES.has(status)) {
@@ -186,6 +264,8 @@ export function classify(compiled: CompiledWorkflow, marking: Marking): RunOutco
   const { terminals } = compiled;
   const counts = new Map<string, number>();
   for (const p of compiled.net.places) {
+    // The cancellation signal stays marked once injected — it is the environment's, not work.
+    if (p.name === compiled.cancel.name) continue;
     const count = marking.tokenCount(p);
     if (count > 0) counts.set(p.name, count);
   }
@@ -199,23 +279,28 @@ export function classify(compiled: CompiledWorkflow, marking: Marking): RunOutco
   let outcome: Exclude<RunOutcome, { readonly status: 'stranded' }> | undefined;
   let reported: string | undefined;
 
+  const cancellation = head<CanceledToken>(terminals.canceled);
   const failure = head<FailureToken>(terminals.failed);
   const suspension = head<SuspendToken>(terminals.suspended);
   const pause = head<PauseToken>(terminals.paused);
   const bail = head<BailToken>(terminals.bailed);
   const done = head<FlowToken>(terminals.done);
 
-  if (failure !== null) {
-    outcome =
-      isTripwire(failure.tripwire)
-        ? { status: 'tripwire', stepId: failure.stepId, tripwire: failure.tripwire }
-        : { status: 'failed', stepId: failure.stepId, error: failure.error };
+  if (cancellation !== null) {
+    // Canceled first: Mastra re-stamps whatever the interrupted entry produced
+    // (`handlers/entry.ts:815-817`), so a canceled run is canceled whatever else it reached.
+    outcome = cancellation.origin === undefined ? { status: 'canceled' } : { status: 'canceled', origin: cancellation.origin };
+    reported = terminals.canceled.name;
+  } else if (failure !== null) {
+    outcome = isTripwire(failure.tripwire)
+      ? { status: 'tripwire', ...at(failure), tripwire: failure.tripwire }
+      : { status: 'failed', ...at(failure), error: failure.error };
     reported = terminals.failed.name;
   } else if (suspension !== null) {
-    outcome = { status: 'suspended', stepId: suspension.stepId, path: suspension.path, payload: suspension.payload };
+    outcome = { status: 'suspended', ...at(suspension), payload: suspension.payload };
     reported = terminals.suspended.name;
   } else if (pause !== null) {
-    outcome = { status: 'paused', stepId: pause.stepId, path: pause.path };
+    outcome = { status: 'paused', ...at(pause) };
     reported = terminals.paused.name;
   } else if (bail !== null) {
     outcome = { status: 'success', output: bail.output, bailed: true };
@@ -234,4 +319,31 @@ export function classify(compiled: CompiledWorkflow, marking: Marking): RunOutco
 
   if (outcome === undefined) return { status: 'stranded', places: residue };
   return residue.length > 0 ? { ...outcome, residue } : outcome;
+}
+
+/**
+ * An event store that does one thing: calls `onTerminal` when a token lands in a terminal place.
+ * It keeps no events — the kernel needs the signal, not the history.
+ */
+function terminalWatcher(terminalNames: ReadonlySet<string>, onTerminal: () => void): EventStore {
+  let fired = false;
+  return {
+    append(event: NetEvent): void {
+      if (!fired && event.type === 'token-added' && terminalNames.has(event.placeName)) {
+        fired = true;
+        onTerminal();
+      }
+    },
+    events: () => [],
+    isEnabled: () => true,
+    size: () => 0,
+    isEmpty: () => true,
+  };
+}
+
+/** An exit token's origin, with `foreachIndex` only when there is one. */
+function at(origin: At): At {
+  return origin.foreachIndex === undefined
+    ? { stepId: origin.stepId, path: origin.path }
+    : { stepId: origin.stepId, path: origin.path, foreachIndex: origin.foreachIndex };
 }

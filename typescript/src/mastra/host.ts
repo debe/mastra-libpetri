@@ -1,10 +1,11 @@
 /**
- * Mastra's workflow graph types, mirrored **structurally**.
+ * Mastra's workflow graph and step-result types, mirrored **structurally**.
  *
  * Nothing in this package imports `@mastra/core` at runtime: it is a type-only devDependency
  * and a tsup external, so a compiler or verification build never pulls Mastra in (CLAUDE.md,
  * *Source layout*). This file is that seam — a structural copy of exactly the fields the
- * adapter reads, and nothing else.
+ * adapter and the step-result translation (`step-result.ts`) read or write, and nothing else.
+ * Types only: no runtime code but `entryId`.
  *
  * **Transcribed from `@mastra/core@1.67.0`.** Cited so drift is findable:
  * - `StepFlowEntry`, `SingleStepEntry`, `ForeachOptions`, `StepFlowEntryOptions` —
@@ -12,6 +13,9 @@
  * - `Step` — `.mastra/package/dist/workflows/step.d.ts:59-78`
  * - `ExecutionGraph` — `.mastra/package/dist/workflows/execution-engine.d.ts:13-16`
  * - `getEntryId` — `.mastra/src-extracted/src/workflows/step-entry.ts:23-25`
+ * - `StepResult` and its members, `StepTripwireInfo`, `SerializedStepFailure` —
+ *   `.mastra/package/dist/workflows/types.d.ts:65-162`; `SerializedError` —
+ *   `dist/_types/@internal_core/dist/error/index.d.ts:12-17`
  *
  * **Deliberately loose.** Mastra's builder carries eight type parameters; every one of them is
  * erased by the time an entry sits in `stepFlow`, and the adapter works on the erased side.
@@ -21,7 +25,8 @@
  * **Drift is loud, not silent.** Every variant is matched exhaustively and an unrecognised
  * `type` is refused, so a new Mastra entry kind surfaces as a refusal rather than as a
  * mis-mapping. `tests/mastra/adapt.test.ts` additionally asserts, at the type level only, that
- * Mastra's real `StepFlowEntry` is assignable to this mirror.
+ * Mastra's real `StepFlowEntry` is assignable to this mirror, and that `StepResult` is assignable
+ * in both directions.
  */
 
 /**
@@ -196,3 +201,156 @@ export interface ExecutionGraph {
 export function entryId(entry: SingleStepEntry): string {
   return entry.type === 'step' ? entry.step.id : entry.id;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Step results
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `StepMetadata` (`types.d.ts:65`): open-ended. Mastra writes `iterationCount` for a loop body
+ * (`handlers/step.ts:177`) and `nestedRunId` for a nested workflow (`handlers/step.ts:561-563`);
+ * anything else is the author's.
+ */
+export type StepMetadata = Record<string, unknown>;
+
+/**
+ * `StepTripwireInfo` (`types.d.ts:80-85`) — a `TripWire` flattened to a plain object when the
+ * failure is recorded, so it serialises (`default.ts:496-504`).
+ */
+export interface StepTripwireInfo {
+  readonly reason: string;
+  readonly retry?: boolean;
+  readonly metadata?: Record<string, unknown>;
+  readonly processorId?: string;
+}
+
+/**
+ * `SerializedError` (`_types/@internal_core/dist/error/index.d.ts:12-17`): what a failure's
+ * `error` becomes once a run has been through storage.
+ */
+export type SerializedError = {
+  readonly name: string;
+  readonly message: string;
+  readonly stack?: string;
+  readonly cause?: unknown;
+} & Record<string, unknown>;
+
+/**
+ * The fields every recorded status shares, with Mastra's generic parameters erased — the
+ * adapter's side of the seam never sees them.
+ *
+ * `payload` is the step's **input**, not a suspension's payload: that one is `suspendPayload`.
+ * `suspendPayload`, `suspendOutput` and `suspendedAt` belong to a suspension and are modelled on
+ * the engine's suspended record; `resumePayload` and `resumedAt` are the resume fields this
+ * engine does not model, and survive a translation only through a record's `host`
+ * (`../compiler/types.ts`, `StepOutcome.host`).
+ */
+interface StepResultBase {
+  readonly payload: unknown;
+  readonly resumePayload?: unknown;
+  readonly suspendPayload?: unknown;
+  readonly suspendOutput?: unknown;
+  readonly startedAt: number;
+  readonly suspendedAt?: number;
+  readonly resumedAt?: number;
+  readonly metadata?: StepMetadata;
+}
+
+/** `StepSuccess` (`types.d.ts:66-78`). */
+export interface StepSuccess extends StepResultBase {
+  readonly status: 'success';
+  readonly output: unknown;
+  readonly endedAt: number;
+}
+
+/**
+ * `StepFailure` (`types.d.ts:86-102`). `error` is always an `Error` at run time: Mastra passes
+ * whatever a step threw through `getErrorFromUnknown` before recording it (`default.ts:466-469`).
+ */
+export interface StepFailure extends StepResultBase {
+  readonly status: 'failed';
+  readonly error: Error;
+  readonly endedAt: number;
+  readonly tripwire?: StepTripwireInfo;
+  readonly nonRetryable?: true;
+}
+
+/** `SerializedStepFailure` (`types.d.ts:156-158`): a failure read back from storage. */
+export interface SerializedStepFailure extends Omit<StepFailure, 'error'> {
+  readonly error: SerializedError;
+}
+
+/**
+ * `StepSuspended` (`types.d.ts:103-111`). No `endedAt`: a suspended step has not ended, and
+ * `suspendedAt` is its timestamp instead (`handlers/step.ts:516-521`).
+ */
+export interface StepSuspended extends StepResultBase {
+  readonly status: 'suspended';
+  readonly suspendedAt: number;
+}
+
+/** `StepRunning` (`types.d.ts:112-122`): a step in flight — the record written before it runs. */
+export interface StepRunning extends StepResultBase {
+  readonly status: 'running';
+}
+
+/** `StepWaiting` (`types.d.ts:123-131`): a `.sleep()` / `.sleepUntil()` in progress (`handlers/entry.ts:606`). */
+export interface StepWaiting extends StepResultBase {
+  readonly status: 'waiting';
+}
+
+/** `StepPaused` (`types.d.ts:132-140`): a nested workflow that paused. */
+export interface StepPaused extends StepResultBase {
+  readonly status: 'paused';
+}
+
+/**
+ * `StepSkipped` (`types.d.ts:141-150`): written only by time travel, for a `.branch()` arm whose
+ * condition was not truthy (`handlers/control-flow.ts:517-528`, `utils.ts:512-516`).
+ */
+export interface StepSkipped extends StepResultBase {
+  readonly status: 'skipped';
+  readonly endedAt: number;
+}
+
+/**
+ * A step that called `bail(result)`. **Not in Mastra's declared union** — `StepResult` has no
+ * `'bailed'` member — but it is what the step handler records (`handlers/step.ts:522-524`, cast
+ * through `as StepResult` at `:566-569`), and it sits in `stepResults` under that status until a
+ * top-level bail rewrites it to `'success'` in place (`default.ts:926-928`). Mirrored because the
+ * translation must accept what Mastra actually stores, not only what it declares.
+ */
+export interface StepBailed extends StepResultBase {
+  readonly status: 'bailed';
+  readonly output: unknown;
+  readonly endedAt: number;
+}
+
+/**
+ * A loop or foreach canceled mid-run. **Not in Mastra's declared union** either: the loop returns
+ * a bare `{ status: 'canceled' }` and the foreach `{...stepInfo, status: 'canceled', output,
+ * endedAt}`, both cast through `as unknown as StepResult` (`handlers/control-flow.ts:752,817,899,
+ * 1164-1169,1306`), and `handlers/entry.ts:810-812` stores it under the body's id. Hence every
+ * field but `status` is optional: the loop's has none of them.
+ */
+export interface StepCanceled extends Partial<StepResultBase> {
+  readonly status: 'canceled';
+  readonly output?: unknown;
+  readonly endedAt?: number;
+}
+
+/** `StepResult<any, any, any, any>` (`types.d.ts:151`). */
+export type StepResult =
+  | StepSuccess
+  | StepFailure
+  | StepSuspended
+  | StepRunning
+  | StepWaiting
+  | StepPaused
+  | StepSkipped;
+
+/**
+ * Everything a `stepResults` entry can hold: Mastra's declared union, its serialised failure
+ * (`SerializedStepResult`, `types.d.ts:162`), and the undeclared `'bailed'` and `'canceled'`.
+ */
+export type StoredStepResult = StepResult | SerializedStepFailure | StepBailed | StepCanceled;

@@ -1,46 +1,50 @@
 import { systemClock, type Clock } from 'libpetri';
 import type { RunScope } from '../compiler/scope.js';
-import type { StepOutcome, StepRunner } from '../compiler/types.js';
+import type { StepRecord, StepRunner } from '../compiler/types.js';
 
 export interface RunScopeOptions {
   readonly runner: StepRunner;
   readonly initData: unknown;
   readonly clock?: Clock;
-  /** Step results carried in from an earlier segment — a resume, or a Mastra snapshot. */
-  readonly stepResults?: ReadonlyMap<string, StepOutcome>;
+  /** The run's abort signal. Omitted, the scope's signal simply never aborts. */
+  readonly signal?: AbortSignal;
+  /** Step records carried in from an earlier segment — a resume, or a Mastra snapshot. */
+  readonly stepResults?: ReadonlyMap<string, StepRecord>;
 }
 
 /**
- * One run's scope: its runner, its input and its step results.
+ * One run's scope: its runner, its input, its signal and its step records.
  *
- * The step results are Mastra's own `stepResults` — the system of record Mastra persists in
- * `WorkflowRunState` — so on a resume this is rehydrated from the snapshot alongside the
- * marking, and nothing about the net is persisted separately. Latest outcome per step id, as
- * Mastra's `stepResults[id] = result` keeps.
+ * The records are Mastra's own `stepResults` — the system of record Mastra persists in
+ * `WorkflowRunState` — so on a resume this is rehydrated from the snapshot alongside the marking,
+ * and nothing about the net is persisted separately. Latest record per step id, as Mastra's
+ * `stepResults[id] = result` keeps.
  */
 export class KernelRunScope implements RunScope {
   readonly runner: StepRunner;
   readonly initData: unknown;
-  readonly #results: Map<string, StepOutcome>;
+  readonly signal: AbortSignal;
+  readonly #results: Map<string, StepRecord>;
   readonly #clock: Clock;
 
   constructor(options: RunScopeOptions) {
     this.runner = options.runner;
     this.initData = options.initData;
+    this.signal = options.signal ?? new AbortController().signal;
     this.#results = new Map(options.stepResults ?? []);
     this.#clock = options.clock ?? systemClock();
   }
 
-  getStepResult(stepId: string): StepOutcome | undefined {
+  getStepResult(stepId: string): StepRecord | undefined {
     return this.#results.get(stepId);
   }
 
-  recordStepResult(stepId: string, outcome: StepOutcome): void {
-    this.#results.set(stepId, outcome);
+  recordStepResult(stepId: string, record: StepRecord): void {
+    this.#results.set(stepId, record);
   }
 
-  /** Every recorded outcome, in first-recorded order. */
-  stepResults(): ReadonlyMap<string, StepOutcome> {
+  /** Every record, in first-recorded order. */
+  stepResults(): ReadonlyMap<string, StepRecord> {
     return this.#results;
   }
 
@@ -49,22 +53,29 @@ export class KernelRunScope implements RunScope {
   }
 
   /**
-   * Waits on the run's clock, so a per-run sleep follows an injected clock ([TIME-015]) instead
-   * of burning real time under a virtual one.
+   * Waits on the run's clock, so an action-side sleep follows an injected clock ([TIME-015])
+   * instead of burning real time under a virtual one — and resolves early when the run's signal
+   * aborts, as Mastra's `abortableSleep` does.
    *
    * `Clock.sleep` may resolve early and spuriously by contract, so the wait loops on the clock
    * rather than trusting a single resolution. One caveat, recorded rather than hidden: this calls
    * the clock's wait from an action, outside the executor loop it was specified for. A real clock
    * is unaffected; a virtual clock that advances on every finite `sleep` call advances once per
-   * call here too, so a per-run wait overlapping another timed wait can move virtual time further
-   * than either alone.
+   * call here too, so a wait overlapping another timed wait can move virtual time further than
+   * either alone.
    */
   async wait(ms: number): Promise<void> {
-    if (ms <= 0) return;
+    if (ms <= 0 || this.signal.aborted) return;
     const until = this.#clock.now() + ms;
     const controller = new AbortController();
-    while (this.#clock.now() < until) {
-      await this.#clock.sleep(until - this.#clock.now(), () => false, controller.signal);
+    const onAbort = (): void => controller.abort();
+    this.signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      while (this.#clock.now() < until && !this.signal.aborted) {
+        await this.#clock.sleep(until - this.#clock.now(), () => false, controller.signal);
+      }
+    } finally {
+      this.signal.removeEventListener('abort', onAbort);
     }
   }
 }

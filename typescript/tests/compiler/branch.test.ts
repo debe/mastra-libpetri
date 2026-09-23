@@ -9,6 +9,7 @@ import type {
 } from '../../src/compiler/types.js';
 import { runWorkflow, runWorkflowDetailed, type RunOutcome } from '../../src/engine/index.js';
 import { RecordingRunner, type Behaviour } from '../fixtures/runner.js';
+import { ManualClock } from '../support/manual-clock.js';
 
 const step = (id: string, extra: Omit<StepDescription, 'kind' | 'id'> = {}): StepDescription => ({
   kind: 'step',
@@ -258,7 +259,7 @@ describe('branch: the two value shapes', () => {
 
     const outcome = await runWorkflow(compile(workflow(branch('route', step('email')))), 'alert', {
       runner,
-      stepResults: new Map([['email', { status: 'failed', error: 'old' }]]),
+      stepResults: new Map([['email', { status: 'failed', error: 'old', payload: 'alert' }]]),
     });
 
     expect(runner.calls).toEqual(['email']);
@@ -298,7 +299,7 @@ describe('branch: failure, suspension and their precedence', () => {
 
     const outcome = await runWorkflow(compile(threeArms), 'alert', { runner });
 
-    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'email', error: 'email down' });
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'email', path: [0, 0], error: 'email down' });
   });
 
   it('awaits every sibling before failing, and stops the chain after the block', async () => {
@@ -315,7 +316,7 @@ describe('branch: failure, suspension and their precedence', () => {
 
     expect(smsFinished).toBe(true);
     expect(runner.calls).not.toContain('audit');
-    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'email', error: 'boom' });
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'email', path: [0, 0], error: 'boom' });
   });
 
   it('forwards a tripwire unchanged, so the run ends as tripwire', async () => {
@@ -327,7 +328,7 @@ describe('branch: failure, suspension and their precedence', () => {
 
     const outcome = await runWorkflow(compile(threeArms), 'alert', { runner });
 
-    expect(outcome).toStrictEqual({ status: 'tripwire', stepId: 'sms', tripwire });
+    expect(outcome).toStrictEqual({ status: 'tripwire', stepId: 'sms', path: [0, 1], tripwire });
   });
 
   it('treats a throwing arm step as a failed arm rather than a lost token', async () => {
@@ -336,7 +337,7 @@ describe('branch: failure, suspension and their precedence', () => {
 
     const outcome = await runWorkflow(compile(threeArms), 'alert', { runner });
 
-    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'push', error: boom });
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'push', path: [0, 2], error: boom });
   });
 
   it('ranks failed above suspended, whichever settles first, and leaves no suspension behind', async () => {
@@ -346,7 +347,7 @@ describe('branch: failure, suspension and their precedence', () => {
         {
           email: async () => {
             if (!suspendFirst) await sleep(15);
-            return { status: 'suspended', payload: { ask: 'approve?' } };
+            return { status: 'suspended', suspendPayload: { ask: 'approve?' } };
           },
           sms: async () => {
             if (suspendFirst) await sleep(15);
@@ -361,6 +362,7 @@ describe('branch: failure, suspension and their precedence', () => {
       expect(outcome, `suspendFirst=${suspendFirst}`).toStrictEqual({
         status: 'failed',
         stepId: 'sms',
+        path: [0, 1],
         error: 'carrier rejected',
       });
     }
@@ -370,8 +372,8 @@ describe('branch: failure, suspension and their precedence', () => {
     const runner = runnerFor(
       { route: () => [1, 2] },
       {
-        sms: async () => { await sleep(15); return { status: 'suspended', payload: 'sms-wait' }; },
-        push: () => ({ status: 'suspended', payload: 'push-wait' }),
+        sms: async () => { await sleep(15); return { status: 'suspended', suspendPayload: 'sms-wait' }; },
+        push: () => ({ status: 'suspended', suspendPayload: 'push-wait' }),
       },
     );
 
@@ -379,14 +381,17 @@ describe('branch: failure, suspension and their precedence', () => {
 
     expect(report.outcome).toStrictEqual({ status: 'suspended', stepId: 'sms', path: [0, 1], payload: 'sms-wait' });
     // Both arms' suspensions are in the step results, which is where Mastra's run result lists
-    // every suspended step from (`default.ts:630-643`).
-    expect(report.stepResults.get('push')).toEqual({ status: 'suspended', payload: 'push-wait' });
+    // every suspended step from (`default.ts:630-643`). The record's `payload` is the step's
+    // *input*, Mastra's `StepResult.payload`; the suspension's own is `suspendPayload`, kept
+    // on the record for the arm the block did not report too.
+    expect(report.stepResults.get('push')).toMatchObject({ status: 'suspended', payload: 'alert', suspendPayload: 'push-wait' });
+    expect(report.stepResults.get('sms')).toMatchObject({ status: 'suspended', payload: 'alert', suspendPayload: 'sms-wait' });
   });
 
   it('suspends rather than succeeds when one arm suspends and another succeeds', async () => {
     const runner = runnerFor(
       { route: () => [0, 1] },
-      { email: tag('email'), sms: () => ({ status: 'suspended', payload: 'wait' }) },
+      { email: tag('email'), sms: () => ({ status: 'suspended', suspendPayload: 'wait' }) },
     );
 
     const outcome = await runWorkflow(compile(threeArmsThenAudit), 'alert', { runner });
@@ -411,28 +416,73 @@ describe('branch: failure, suspension and their precedence', () => {
     expect(outcome).toStrictEqual({ status: 'success', output: {} });
   });
 
-  it('reports a failure by the first arm carrying its id when two arms share one (a pinned divergence)', async () => {
-    // Arms 0 and 2 are both `x`: one of them succeeds, the other fails, and arm 1 (`y`) fails.
-    // When the failing `x` is arm 2, Mastra's `results.find` reports `y` (index 1). A failure
-    // carries only its step id, so the join ranks every `x` failure at the id's first arm, 0, and
-    // reports `x`'s error either way. Reported for docs/divergences.md.
-    let xRuns = 0;
+  it('ranks a failure by its arm, not its step id, when two arms share one (closes row 33)', async () => {
+    // Arms 0 and 2 are both `x`: arm 0 succeeds, arm 2 fails, and arm 1 (`y`) fails. Mastra's
+    // `results.find` is over arm order (`handlers/control-flow.ts:596`), so it reports `y`, index 1.
+    // The failure's origin path names its arm (`[0, 2]`), so the join ranks it at 2, not at the
+    // id's first arm, 0 — which used to report `x`.
     const runner = runnerFor(
       { route: () => [0, 1, 2] },
       {
-        x: async () => {
-          xRuns += 1;
-          if (xRuns === 1) return ok('x-ok');
-          await sleep(10);
+        x: async (_input, call) => {
+          if (call.path[1] === 0) return ok('x-ok');
           return { status: 'failed', error: 'x-failed' };
         },
-        y: () => ({ status: 'failed', error: 'y-failed' }),
+        y: async () => { await sleep(10); return { status: 'failed', error: 'y-failed' }; },
       },
     );
 
     const outcome = await runWorkflow(compile(workflow(branch('route', step('x'), step('y'), step('x')))), 'in', { runner });
 
-    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'x', error: 'x-failed' });
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'y', path: [0, 1], error: 'y-failed' });
+  });
+
+  it('ranks the lower of two same-id arms when both fail, by path', async () => {
+    const runner = runnerFor(
+      { route: () => [0, 1] },
+      {
+        // Arm 1 fails first in time; arm 0 is the one Mastra reports.
+        x: async (_input, call) => {
+          if (call.path[1] === 0) { await sleep(15); return { status: 'failed', error: 'arm0' }; }
+          return { status: 'failed', error: 'arm1' };
+        },
+      },
+    );
+
+    const outcome = await runWorkflow(compile(workflow(branch('route', step('x'), step('x')))), 'in', { runner });
+
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'x', path: [0, 0], error: 'arm0' });
+  });
+
+  it('runs arm i at the block path plus i, as control-flow.ts:569 hands it', async () => {
+    const paths: Record<string, readonly number[]> = {};
+    const record: Behaviour = (input, call) => { paths[`${call.path.join('-')}`] = call.path; return ok(input); };
+    const runner = runnerFor({ route: () => [0, 2] }, { email: record, push: record });
+
+    await runWorkflow(compile(workflow(step('prep'), branch('route', step('email'), step('sms'), step('push')))), 'x', { runner });
+
+    expect(Object.values(paths).sort()).toEqual([[1, 0], [1, 2]]);
+  });
+
+  it('fails a broken evaluation with the block as origin, at the block path', async () => {
+    const runner = runnerFor({ route: () => { throw new Error('no'); } });
+    const outcome = await runWorkflow(compile(workflow(step('prep'), branch('route', step('a')))), 'x', { runner });
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'route', path: [1], error: expect.any(Error) });
+  });
+
+  it('a broken evaluation after the condition aborted: canceled, the origin still at the block path', async () => {
+    // Mastra's condition context carries `abort()` (`handlers/control-flow.ts:428-432`). The
+    // evaluation then breaks, the block fails, and the after-entry check re-stamps the failure
+    // canceled (`handlers/entry.ts:815-817`). The origin is the failure's, so it shows the path.
+    const ac = new AbortController();
+    const runner = runnerFor({ route: () => { ac.abort(); throw new Error('no'); } });
+    const outcome = await runWorkflow(compile(workflow(step('prep'), branch('route', step('a')), step('audit'))), 'x', {
+      runner,
+      signal: ac.signal,
+      timeoutMs: 5_000,
+    });
+    expect(runner.calls).toEqual(['prep']);
+    expect(outcome).toStrictEqual({ status: 'canceled', origin: { stepId: 'route', path: [1] } });
   });
 });
 
@@ -510,9 +560,12 @@ describe('branch: an empty block', () => {
     expect(outcome).toStrictEqual({ status: 'success', output: {} });
   });
 
-  it('is a single pass-through transition', () => {
+  it('is a single pass-through transition, plus its cancellation sweep', () => {
     const compiled = compile(workflow(branch('route')));
-    expect([...compiled.net.transitions].map((t) => t.name)).toEqual(['t.0.route.pass']);
+    expect([...compiled.net.transitions].map((t) => t.name).filter((n) => n.startsWith('t.0.')).sort()).toEqual([
+      't.0.route.cancel',
+      't.0.route.pass',
+    ]);
   });
 });
 
@@ -522,15 +575,15 @@ describe('branch: structure', () => {
     expect(compile(threeArmsThenAudit).structuralHash).toBe(compile(threeArmsThenAudit).structuralHash);
   });
 
-  it('emits 2n + 8 transitions of its own plus one per arm, every name unique', () => {
+  it('emits 2n + 9 transitions of its own plus one per arm, every name unique', () => {
     const compiled = compile(workflow(branch('route', step('x'), step('x'), step('y'))));
 
     const places = [...compiled.net.places].map((p) => p.name);
     const transitions = [...compiled.net.transitions].map((t) => t.name);
     expect(new Set(places).size).toBe(places.length);
     expect(new Set(transitions).size).toBe(transitions.length);
-    // decide, gate-i and collect-i per arm, four exit collects, three joins.
-    expect(transitions.filter((name) => name.startsWith('t.0.route.'))).toHaveLength(2 * 3 + 8);
+    // decide, its cancellation sweep, gate-i and collect-i per arm, four exit collects, three joins.
+    expect(transitions.filter((name) => name.startsWith('t.0.route.'))).toHaveLength(2 * 3 + 9);
     // Two arms share the id `x` and still get distinct transitions, because the path differs.
     expect(transitions.filter((name) => /^t\.0-\d\.x\.run$/.test(name)).sort()).toEqual(['t.0-0.x.run', 't.0-1.x.run']);
   });
@@ -542,5 +595,224 @@ describe('branch: structure', () => {
     } as unknown as WorkflowDescription;
 
     expect(() => compile(nested)).toThrow(/arm 'inner' is a 'parallel' entry/);
+  });
+});
+
+describe('branch: cancellation', () => {
+  const armsThenAudit = workflow(step('prep'), branch('route', step('email'), step('sms'), step('push')), step('audit'));
+
+  it('aborted before the block: canceled at the block, no condition evaluated, no arm runs', async () => {
+    const ac = new AbortController();
+    const runner = runnerFor(
+      { route: () => [0, 1, 2] },
+      { prep: (input) => { ac.abort(); return ok(input); } },
+    );
+
+    const report = await runWorkflowDetailed(compile(armsThenAudit), 'x', { runner, signal: ac.signal, clock: new ManualClock() });
+
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'route', path: [1] } });
+    expect(runner.selected).toEqual([]);
+    expect(runner.calls).toEqual(['prep']);
+    expect(report.stepResults.get('prep')).toMatchObject({ status: 'success', output: 'x' });
+  });
+
+  // Mastra checks before the first entry (`default.ts:815`), so a pre-aborted run never starts it.
+  // These two fail against the kernel as integrated: `kernel.ts:142` seeds the *request* place, so
+  // the immediate `t.cancel.arrive` and the first entry's start are enabled together and the start
+  // fires first (deterministically, in 20 of 20 runs). Seeding `compiled.cancel` instead makes both
+  // pass — checked on a scratch copy of the kernel. Reported to the lead; not a branch defect.
+  it('aborted before the run: canceled at a first-entry block', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const runner = runnerFor({ route: () => [0] });
+
+    const outcome = await runWorkflow(compile(threeArms), 'x', { runner, signal: ac.signal });
+
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'route', path: [0] } });
+    expect(runner.selected).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('aborted before an empty block: canceled there too', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const outcome = await runWorkflow(compile(workflow(branch('route'), step('audit'))), 'x', {
+      runner: new RecordingRunner(),
+      signal: ac.signal,
+    });
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'route', path: [0] } });
+  });
+
+  it('aborted while an arm runs: every selected arm still runs and is recorded, the next entry is swept', async () => {
+    const ac = new AbortController();
+    const runner = runnerFor(
+      { route: () => [0, 1, 2] },
+      {
+        email: (input) => { ac.abort(); return ok(`email(${String(input)})`); },
+        sms: async (input) => { await sleep(15); return ok(`sms(${String(input)})`); },
+        push: async (input) => { await sleep(5); return ok(`push(${String(input)})`); },
+      },
+    );
+
+    const report = await runWorkflowDetailed(compile(armsThenAudit), 'x', { runner, signal: ac.signal, timeoutMs: 5_000 });
+
+    expect([...runner.calls].sort()).toEqual(['email', 'prep', 'push', 'sms']);
+    for (const arm of ['email', 'sms', 'push']) {
+      expect(report.stepResults.get(arm), arm).toMatchObject({ status: 'success', output: `${arm}(x)`, payload: 'x' });
+    }
+    // Mastra re-stamps the block `canceled` after it (`handlers/entry.ts:815-817`) and never
+    // starts `audit`; the net's check is the next entry's sweep.
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'audit', path: [2] } });
+  });
+
+  it('aborted while an arm runs in a last-entry block: the settle stage re-stamps the success canceled', async () => {
+    const ac = new AbortController();
+    const runner = runnerFor(
+      { route: () => [0, 2] },
+      {
+        email: async (input) => { await sleep(10); return ok(input); },
+        push: (input) => { ac.abort(); return ok(input); },
+      },
+    );
+
+    const report = await runWorkflowDetailed(compile(threeArms), 'x', { runner, signal: ac.signal, timeoutMs: 5_000 });
+
+    expect([...runner.calls].sort()).toEqual(['email', 'push']);
+    expect(report.stepResults.get('email')).toMatchObject({ status: 'success' });
+    expect(report.outcome).toEqual({ status: 'canceled' });
+  });
+
+  it('aborted while an arm fails: canceled outranks the failure, which keeps its record', async () => {
+    const ac = new AbortController();
+    const runner = runnerFor(
+      { route: () => [0, 1] },
+      {
+        email: async () => { await sleep(10); return ok('late'); },
+        sms: () => { ac.abort(); return { status: 'failed', error: 'down' }; },
+      },
+    );
+
+    const report = await runWorkflowDetailed(compile(threeArms), 'x', { runner, signal: ac.signal, timeoutMs: 5_000 });
+
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'sms', path: [0, 1] } });
+    expect(report.stepResults.get('sms')).toMatchObject({ status: 'failed', error: 'down' });
+    expect(report.stepResults.get('email')).toMatchObject({ status: 'success', output: 'late' });
+  });
+
+  // A condition may abort the run itself: Mastra hands every condition `abort()` and the
+  // signal (`handlers/control-flow.ts:428-434`), and then runs every truthy arm with no check in
+  // between (`:497-540` filter, then `Promise.all` over the arms with none either). These two
+  // are the only runs in which the abort is already set when the arms would start, so they are
+  // the ones that tell "no check inside a started block" from an arm-level gate.
+  it('a condition aborts, then selects two arms, as a middle entry: both arms run and are recorded', async () => {
+    const ac = new AbortController();
+    const seen: boolean[] = [];
+    const runner = runnerFor(
+      {
+        route: (_input, view) => {
+          ac.abort();
+          seen.push(view.abortSignal.aborted);
+          return [0, 1];
+        },
+      },
+      { email: tag('email'), sms: tag('sms') },
+    );
+
+    const report = await runWorkflowDetailed(compile(armsThenAudit), 'x', { runner, signal: ac.signal, timeoutMs: 5_000 });
+
+    // The view's signal is the run's: the condition sees its own abort.
+    expect(seen).toEqual([true]);
+    expect([...runner.calls].sort()).toEqual(['email', 'prep', 'sms']);
+    expect(report.stepResults.get('email')).toMatchObject({ status: 'success', output: 'email(x)', payload: 'x' });
+    expect(report.stepResults.get('sms')).toMatchObject({ status: 'success', output: 'sms(x)', payload: 'x' });
+    expect(report.stepResults.has('push')).toBe(false);
+    // `toStrictEqual` also refuses a `residue` key. The origin is the next entry's sweep; Mastra
+    // stops at the block itself (`handlers/entry.ts:815-817`) — the contract-level origin
+    // difference recorded for every top-level entry, not specific to `.branch()`.
+    expect(report.outcome).toStrictEqual({ status: 'canceled', origin: { stepId: 'audit', path: [2] } });
+  });
+
+  it('a condition aborts, then selects two arms, as the last entry: both arms run, the run ends canceled', async () => {
+    const ac = new AbortController();
+    const runner = runnerFor(
+      { route: () => { ac.abort(); return [0, 1]; } },
+      { email: tag('email'), sms: tag('sms') },
+    );
+
+    const report = await runWorkflowDetailed(compile(threeArms), 'x', { runner, signal: ac.signal, timeoutMs: 5_000 });
+
+    expect([...runner.calls].sort()).toEqual(['email', 'sms']);
+    expect(report.stepResults.get('email')).toMatchObject({ status: 'success', output: 'email(x)' });
+    expect(report.stepResults.get('sms')).toMatchObject({ status: 'success', output: 'sms(x)' });
+    // Mastra's ladder reaches `canceled` (`:612`) and `entry.ts:815-817` re-stamps it anyway; the
+    // settle stage is where the net does it, and a canceled run carries no step id.
+    expect(report.outcome).toStrictEqual({ status: 'canceled' });
+  });
+
+  it('a condition aborts and selects a reused arm: the reuse still arrives, nothing is left behind', async () => {
+    // `sms` already succeeded as entry 0, so arm 1 is reused rather than run (`:552-553`). The
+    // reuse goes gate -> arrived directly, so an arm-level gate cannot see it — but a gated arm
+    // 0 beside it would strand the reused arrival.
+    const ac = new AbortController();
+    const runner = runnerFor(
+      { route: () => { ac.abort(); return [0, 1]; } },
+      { sms: tag('first-sms'), email: tag('email') },
+    );
+
+    const report = await runWorkflowDetailed(compile(workflow(step('sms'), branch('route', step('email'), step('sms')))), 'x', {
+      runner,
+      signal: ac.signal,
+      timeoutMs: 5_000,
+    });
+
+    expect(runner.calls).toEqual(['sms', 'email']);
+    expect(report.outcome).toStrictEqual({ status: 'canceled' });
+  });
+
+  it('an arm retrying after the abort keeps retrying: retries are not gated', async () => {
+    const ac = new AbortController();
+    const runner = runnerFor(
+      { route: () => [0] },
+      { flaky: (input, call) => { if (call.attempt === 0) { ac.abort(); return { status: 'failed', error: 'blip' }; } return ok(input); } },
+    );
+
+    const outcome = await runWorkflow(compile(workflow(branch('route', step('flaky', { retries: 2 })))), 'x', {
+      runner,
+      signal: ac.signal,
+      timeoutMs: 5_000,
+    });
+
+    expect(runner.attempts).toEqual([{ stepId: 'flaky', attempt: 0 }, { stepId: 'flaky', attempt: 1 }]);
+    expect(outcome).toEqual({ status: 'canceled' });
+  });
+
+  it('a signal that never fires changes nothing, and every outcome still ends the run', async () => {
+    const signal = new AbortController().signal;
+    const cases: ReadonlyArray<readonly [string, WorkflowDescription, ReturnType<typeof runnerFor>, RunOutcome]> = [
+      ['success, last entry', threeArms, runnerFor({ route: () => [0, 2] }), { status: 'success', output: { email: 'x', push: 'x' } }],
+      [
+        'success, middle entry',
+        armsThenAudit,
+        runnerFor({ route: () => [1] }),
+        { status: 'success', output: { email: undefined, sms: 'x', push: undefined } },
+      ],
+      ['no truthy arm', threeArms, runnerFor({ route: () => [] }), { status: 'success', output: {} }],
+      [
+        'failed',
+        threeArms,
+        runnerFor({ route: () => [0, 1] }, { sms: () => ({ status: 'failed', error: 'down' }) }),
+        { status: 'failed', stepId: 'sms', path: [0, 1], error: 'down' },
+      ],
+      [
+        'suspended',
+        threeArms,
+        runnerFor({ route: () => [2] }, { push: () => ({ status: 'suspended', suspendPayload: 'wait' }) }),
+        { status: 'suspended', stepId: 'push', path: [0, 2], payload: 'wait' },
+      ],
+    ];
+    for (const [label, description, runner, expected] of cases) {
+      const outcome = await runWorkflow(compile(description), 'x', { runner, signal, clock: new ManualClock(), timeoutMs: 5_000 });
+      expect(outcome, label).toStrictEqual(expected);
+    }
   });
 });

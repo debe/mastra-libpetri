@@ -5,12 +5,14 @@ export { parallelGadget } from './gadgets/parallel.js';
 export { branchGadget } from './gadgets/branch.js';
 export { loopGadget, MAX_ITERATION_BOUND } from './gadgets/loop.js';
 export { foreachGadget, MAX_FOREACH_LANES } from './gadgets/foreach.js';
-export type { Gadget, GadgetContext, GadgetResult } from './gadgets/types.js';
+export type { Gadget, GadgetContext, GadgetResult, NestedOptions } from './gadgets/types.js';
 export {
   NameVocabulary,
   pathSegment,
   slug,
   WF_BAILED,
+  WF_CANCEL,
+  WF_CANCELED,
   WF_DONE,
   WF_FAILED,
   WF_PAUSED,
@@ -22,17 +24,20 @@ export type { RunScope } from './scope.js';
 export type {
   BailToken,
   BuildOrRun,
+  CanceledToken,
   CompiledWorkflow,
   EntryDescription,
   Exits,
   FailureToken,
   FlowToken,
   NetMap,
+  Origin,
   PauseToken,
   RunView,
   StepCall,
   StepDescription,
   StepOutcome,
+  StepRecord,
   StepRunner,
   StepSource,
   SuspendToken,

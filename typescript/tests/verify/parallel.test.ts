@@ -1,7 +1,14 @@
+import { appendFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { Transition, and, one, outPlace, place, type In, type Out, type Place } from 'libpetri';
 import { compile, parallelGadget, type Gadget } from '../../src/compiler/index.js';
-import { describeReport, verifyWorkflow, type PropertyReport } from '../../src/verify/index.js';
+import {
+  cancelStructureViolations,
+  describeReport,
+  verifyWorkflow,
+  type PropertyReport,
+  type Segment,
+} from '../../src/verify/index.js';
 import type {
   EntryDescription,
   Exits,
@@ -15,22 +22,50 @@ const step = (id: string, extra: Partial<Omit<StepDescription, 'kind' | 'id'>> =
 const fan = (id: string, arms: readonly StepDescription[]): EntryDescription => ({ kind: 'parallel', id, arms });
 const wf = (...entries: EntryDescription[]): WorkflowDescription => ({ id: 'w', entries });
 
-const verify = (description: WorkflowDescription, gadget: Gadget = parallelGadget) =>
-  verifyWorkflow(compile(description, { gadgets: { parallel: gadget } }), { timeoutMs: 120_000 });
+const build = (description: WorkflowDescription, gadget: Gadget = parallelGadget) =>
+  compile(description, { gadgets: { parallel: gadget } });
 
-const verdictOf = (reports: readonly PropertyReport[], property: string): PropertyReport => {
-  const report = reports.find((r) => r.property === property);
-  if (report === undefined) throw new Error(`no '${property}' report`);
+/** Both segments unless a caller narrows them: `verifyWorkflow`'s default is the claim. */
+const verify = (description: WorkflowDescription, gadget: Gadget = parallelGadget, segments?: readonly Segment[]) =>
+  verifyWorkflow(build(description, gadget), { timeoutMs: 120_000, ...(segments ? { segments } : {}) });
+
+/** Every property of both segments, in the order `verifyWorkflow` runs them. */
+const BOTH = [
+  'closed/deadlockFree',
+  'closed/terminatesAtSink',
+  'closed/exactlyOneTerminal',
+  'closed/neverCanceled',
+  'cancel/deadlockFree',
+  'cancel/terminatesAtSink',
+  'cancel/exactlyOneTerminal',
+];
+const keyOf = (r: PropertyReport): string => `${r.segment}/${r.property}`;
+
+/** Appends a proof line to the file `PROOF_LOG` names, when it names one — the route-and-ms record. */
+const proofLog = (line: string): void => {
+  const file = process.env.PROOF_LOG;
+  if (file) appendFileSync(file, `${line}\n`);
+};
+
+const verdictOf = (reports: readonly PropertyReport[], key: string): PropertyReport => {
+  const report = reports.find((r) => keyOf(r) === key);
+  if (report === undefined) throw new Error(`no '${key}' report`);
   return report;
 };
 
 /**
- * Every shape must come back `proven` for **both** properties, not merely un-violated.
+ * Every shape must come back `proven` for **every** property of **both** segments, not merely
+ * un-violated — `verifyWorkflow`'s default, after its structural cancel check has passed.
  *
- * Initial marking: one token in the workflow's entry place. Environment: none (no environment
- * places are declared, so this is the closed net). Sinks: all five terminals — `wf.done`,
- * `wf.failed`, `wf.bailed`, `wf.suspended`, `wf.paused`. The route is whatever the verifier
- * reports, and a failed assertion prints it.
+ * Initial marking: one token in the workflow's entry place; in the `cancel` segment also one
+ * token in `wf.cancel.request`, whose immediate `arrive` may then fire at every reachable point —
+ * before the block, mid-arm, between an arm's retries, after the join. Environment: closed in
+ * both (the arrival is part of the net). Sinks: all six terminals — `wf.done`, `wf.failed`,
+ * `wf.bailed`, `wf.suspended`, `wf.paused`, `wf.canceled` — and `wf.cancel`. `closed` proves
+ * deadlockFree, terminatesAtSink, exactlyOneTerminal and neverCanceled (`wf.canceled` bounded
+ * by 0); `cancel` proves the first three. The route is whatever the verifier reports, and a
+ * failed assertion prints it. Under cancellation `terminatesAtSink` is blind (the marked cancel
+ * place satisfies it); `exactlyOneTerminal` is the property that sees a stranding.
  *
  * The two properties are complementary ([VER-013]): `deadlockFree` fails on a quiescent marking
  * holding a token *outside* the sinks — a sibling stranded in `arrived`, a marker left in
@@ -59,16 +94,19 @@ const shapes: ReadonlyArray<readonly [string, WorkflowDescription]> = [
 
 describe('compiled parallel, proved', () => {
   for (const [shape, description] of shapes) {
-    it(`is deadlock-free and terminates at a declared sink: ${shape}`, async () => {
+    it(`every property of both segments is proven: ${shape}`, async () => {
+      const started = performance.now();
       const reports = await verify(description);
+      const ms = performance.now() - started;
 
       // `proven` explicitly. `isViolated()` is false for `unknown` too, so asserting "not
       // violated" would silently pass on a query that timed out. An `unknown` is a finding.
-      expect(reports.map((r) => r.property)).toEqual(['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal']);
+      expect(reports.map(keyOf)).toEqual(BOTH);
       for (const report of reports) {
         expect(report.result.verdict.type, describeReport(report)).toBe('proven');
       }
-    }, 180_000);
+      proofLog(`[proof] ${shape} (${ms.toFixed(0)}ms): ${reports.map(describeReport).join('; ')}`);
+    }, 360_000);
   }
 });
 
@@ -116,10 +154,10 @@ const mutate = (role: string, edit: (t: Transition) => readonly Transition[]): G
   };
 
 /** The real gadget, with one of the arms' exits pointed at the enclosing exit instead. */
-const bypass = (exit: keyof Exits): Gadget => (entry, next, ctx) =>
+const bypass = (exit: Exclude<keyof Exits, 'canceled'>): Gadget => (entry, next, ctx) =>
   parallelGadget(entry, next, {
     ...ctx,
-    emitNested: (s, p, n, exits) => ctx.emitNested(s, p, n, { ...exits, [exit]: ctx.exits[exit] } as Exits),
+    emitNested: (s, p, n, exits, o) => ctx.emitNested(s, p, n, { ...exits, [exit]: ctx.exits[exit] } as Exits, o),
   });
 
 const placeNamed = (t: Transition, suffix: string): Place<unknown> => {
@@ -134,10 +172,12 @@ const twoArms = wf(fan('fan', [step('a'), step('b')]));
 async function expectDeadlockFreeViolated(gadget: Gadget): Promise<void> {
   // Control: the same shape through the unmutated gadget is proven, so the flip below is the
   // mutation's doing and not the shape's.
-  const control = verdictOf(await verify(twoArms), 'deadlockFree');
+  // The closed segment alone: these safeguards are about arm outcomes, not cancellation, and
+  // deadlock freedom without a cancel is where each removal shows.
+  const control = verdictOf(await verify(twoArms, parallelGadget, ['closed']), 'closed/deadlockFree');
   expect(control.result.verdict.type, describeReport(control)).toBe('proven');
 
-  const report = verdictOf(await verify(twoArms, gadget), 'deadlockFree');
+  const report = verdictOf(await verify(twoArms, gadget, ['closed']), 'closed/deadlockFree');
   expect(report.result.verdict.type, describeReport(report)).toBe('violated');
 }
 
@@ -220,4 +260,73 @@ describe('compiled parallel, non-vacuity by mutation', () => {
       }),
     );
   }, 180_000);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Non-vacuity of the cancellation safeguards. The sweep is removed and a proof flips. The two
+// inhibitors are removed and the *structural* check flags each by name — no proof can see them,
+// because the extra work an ungated start does still drains to exactly one terminal. The run-level
+// flip for the fork inhibitor is in `tests/compiler/parallel.test.ts`.
+// ---------------------------------------------------------------------------------------------
+
+describe('compiled parallel, cancellation non-vacuity', () => {
+  const guarded = wf(step('before'), fan('fan', [step('a'), step('b')]), step('after'));
+  const guardedEmpty = wf(step('before'), fan('fan', []), step('after'));
+  const withoutSweep: Gadget = (entry, next, ctx) => {
+    const result = parallelGadget(entry, next, ctx);
+    const transitions = result.transitions.filter((t) => !t.name.endsWith('.cancel'));
+    if (transitions.length !== result.transitions.length - 1) throw new Error('sweep not found exactly once');
+    return { ...result, transitions };
+  };
+
+  for (const [label, shape] of [['n = 2 between two steps', guarded], ['n = 0 between two steps', guardedEmpty]] as const) {
+    it(`needs the sweep: without it the canceled block's input is stranded (${label})`, async () => {
+      // No sweep, no start to compete with it: the structural check has nothing to flag, so the
+      // default run proves — and this is the proof that sees it.
+      expect(cancelStructureViolations(build(shape, withoutSweep))).toEqual([]);
+      const reports = await verify(shape, withoutSweep);
+      const v = Object.fromEntries(reports.map((r) => [keyOf(r), r.result.verdict.type]));
+      const all = reports.map(describeReport).join('; ');
+      expect(v, all).toStrictEqual({
+        'closed/deadlockFree': 'proven',
+        'closed/terminatesAtSink': 'proven',
+        'closed/exactlyOneTerminal': 'proven',
+        'closed/neverCanceled': 'proven',
+        'cancel/deadlockFree': 'violated',
+        // Blind under cancellation: the marked `wf.cancel` is a sink.
+        'cancel/terminatesAtSink': 'proven',
+        'cancel/exactlyOneTerminal': 'violated',
+      });
+      proofLog(`[mutant sweep ${label}] ${all}`);
+    }, 360_000);
+  }
+
+  // The lead's pattern: the same transition, rebuilt without its inhibitors, reads re-added.
+  const stripInhibitors = (role: 'fork' | 'empty'): Gadget =>
+    mutate(role, (t) => {
+      const b = Transition.builder(t.name).inputs(...t.inputSpecs).outputs(t.outputSpec!).action(t.action).timing(t.timing);
+      for (const r of t.reads) b.read(r.place);
+      return [b.build()];
+    });
+
+  for (const [role, label, shape, name] of [
+    ['fork', 'n = 2 between two steps', guarded, 't.1.fan.fork'],
+    ['empty', 'n = 0 between two steps', guardedEmpty, 't.1.fan.empty'],
+  ] as const) {
+    it(`the '${role}' inhibitor on the cancel signal: stripped, the structural check names '${name}' (${label})`, async () => {
+      const real = build(shape);
+      const sweepName = name.replace(/\.[a-z]+$/, '.cancel');
+      // Control: the real gadget's net is structurally sound and the transition does carry it.
+      expect(cancelStructureViolations(real)).toEqual([]);
+      const original = [...real.net.transitions].find((t) => t.name === name);
+      expect(original?.inhibitors.map((a) => a.place.name)).toEqual([real.cancel.name]);
+
+      const mutant = build(shape, stripInhibitors(role));
+      expect(cancelStructureViolations(mutant)).toEqual([
+        `'${name}' competes with sweep '${sweepName}' for [s.1.fan.in] without an inhibitor on '${mutant.cancel.name}'`,
+      ]);
+      // And the default proof refuses the net before proving anything about it.
+      await expect(verifyWorkflow(mutant, { timeoutMs: 120_000 })).rejects.toThrow(`'${name}' competes with sweep`);
+    }, 60_000);
+  }
 });

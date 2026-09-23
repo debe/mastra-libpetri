@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { compile } from '../../src/compiler/index.js';
-import { runWorkflow } from '../../src/engine/index.js';
+import { runWorkflow, runWorkflowDetailed } from '../../src/engine/index.js';
 import type { WorkflowDescription } from '../../src/compiler/types.js';
 import { RecordingRunner, type Behaviour } from '../fixtures/runner.js';
 import { ManualClock } from '../support/manual-clock.js';
@@ -115,5 +115,80 @@ describe('virtual time', () => {
     expect(outcome).toEqual({ status: 'success', output: 'x' });
     expect(at).toEqual([0, 3_600_000, 7_200_000]);
     expect(Date.now() - startedWall).toBeLessThan(5_000);
+  });
+
+  describe('record timestamps are epoch milliseconds on the run\'s clock ([TIME-015])', () => {
+    const EPOCH = 1_700_000_000_000;
+
+    it('stamps a step, a fixed sleep and a per-run sleep at their virtual instants', async () => {
+      const clock = new ManualClock(EPOCH);
+      const { stepResults } = await runWorkflowDetailed(
+        compile({
+          id: 'stamps',
+          entries: [
+            { kind: 'step', id: 'charge' },
+            { kind: 'sleep', id: 'fixed', duration: { fixed: 60_000 } },
+            { kind: 'sleep', id: 'computed', duration: { perRun: true } },
+            { kind: 'step', id: 'ship' },
+          ],
+        }),
+        'o',
+        { runner: new RecordingRunner({ waits: { computed: () => 5_000 } }), clock },
+      );
+
+      expect(stepResults.get('charge')).toMatchObject({ startedAt: EPOCH, endedAt: EPOCH });
+      // The fixed sleep's wait is the transition's timing, so it began `ms` before it fired.
+      expect(stepResults.get('fixed')).toMatchObject({ startedAt: EPOCH, endedAt: EPOCH + 60_000 });
+      expect(stepResults.get('computed')).toMatchObject({ startedAt: EPOCH + 60_000, endedAt: EPOCH + 65_000 });
+      expect(stepResults.get('ship')).toMatchObject({ startedAt: EPOCH + 65_000, endedAt: EPOCH + 65_000 });
+    });
+
+    it('stamps a retried step from its FIRST attempt, as Mastra stamps before the retry loop', async () => {
+      // `const startTime = Date.now()` (`handlers/step.ts:166`) is taken once, before
+      // `executeStepWithRetry` (`:320`) runs any attempt or waits any delay, and the record's
+      // `startedAt` is that value (`:174`). Retries and their delays sit inside startedAt..endedAt.
+      const clock = new ManualClock(EPOCH);
+      const runner = new RecordingRunner({
+        steps: {
+          flaky: (input, call) => (call.attempt < 2 ? { status: 'failed', error: 'busy' } : { status: 'success', output: input }),
+        },
+      });
+
+      const { stepResults } = await runWorkflowDetailed(
+        compile({ id: 'retry-stamps', entries: [{ kind: 'step', id: 'flaky', retries: 2, retryDelayMs: 3_600_000 }] }),
+        'x',
+        { runner, clock },
+      );
+
+      expect(stepResults.get('flaky')).toMatchObject({ status: 'success', startedAt: EPOCH, endedAt: EPOCH + 7_200_000 });
+    });
+
+    it('keeps the first start through a final failure, and never leaks it into the next entry', async () => {
+      const clock = new ManualClock(EPOCH);
+      const runner = new RecordingRunner({
+        steps: {
+          flaky: (input, call) => (call.attempt < 1 ? { status: 'failed', error: 'busy' } : { status: 'success', output: input }),
+          doomed: () => ({ status: 'failed', error: 'no' }),
+        },
+      });
+
+      const { outcome, stepResults } = await runWorkflowDetailed(
+        compile({
+          id: 'retry-stamps-2',
+          entries: [
+            { kind: 'step', id: 'flaky', retries: 1, retryDelayMs: 1_000 },
+            { kind: 'step', id: 'doomed', retries: 2, retryDelayMs: 500 },
+          ],
+        }),
+        'x',
+        { runner, clock },
+      );
+
+      expect(outcome).toEqual({ status: 'failed', stepId: 'doomed', path: [1], error: 'no' });
+      expect(stepResults.get('flaky')).toMatchObject({ startedAt: EPOCH, endedAt: EPOCH + 1_000 });
+      // `doomed` started when `flaky` ended — its own first attempt — not at `flaky`'s start: the
+      // carried `startedAt` stays on the retry chain's own places.
+      expect(stepResults.get('doomed')).toMatchObject({ status: 'failed', startedAt: EPOCH + 1_000, endedAt: EPOCH + 2_000 });
+    });
   });
 });

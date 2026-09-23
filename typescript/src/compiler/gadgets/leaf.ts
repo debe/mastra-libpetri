@@ -10,7 +10,7 @@ import {
   type TransitionAction,
 } from 'libpetri';
 import type { EntryPath } from '../names.js';
-import { scopeOf, viewOf } from '../scope.js';
+import { scopeOf, viewOf, type RunScope } from '../scope.js';
 import type { Exits, FlowToken, StepOutcome, StepSource } from '../types.js';
 import type { Gadget, GadgetContext } from './types.js';
 
@@ -56,6 +56,12 @@ export const MAX_RETRIES = 100;
  * `TripWire` included, unless it is a `MastraNonRetryableError`. A `bailed`, `suspended` or
  * `paused` outcome is not a failure and is never retried. Only the final attempt's outcome is
  * recorded, as Mastra records only the final one.
+ *
+ * **Cancellation gates the first attempt only.** Given a signal, the step's first run is
+ * inhibited by it and a sweep moves a waiting input to `exits.canceled` — that is Mastra's check
+ * before an entry. A retry is not gated: `executeStepWithRetry` never looks at the signal between
+ * attempts (`default.ts:455-460`), so a retrying step keeps retrying, and the step's own
+ * `abortSignal` (`scope.signal`) is what cuts a well-behaved step short.
  */
 export const stepGadget: Gadget = (entry, next, ctx) => {
   if (entry.kind !== 'step') throw new Error(`stepGadget received a '${entry.kind}' entry`);
@@ -70,9 +76,10 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
   }
 
   const source = entry.source ?? 'step';
-  const { names, path, exits } = ctx;
+  const { names, path, viewPath, exits, cancel } = ctx;
   const inPlace = place<FlowToken>(names.entryIn(path, entry.id));
   const transitions: Transition[] = [];
+  if (cancel !== undefined) transitions.push(sweep(names.entryTransition(path, entry.id, 'cancel'), inPlace, cancel, exits, entry.id, viewPath));
 
   let attemptIn = inPlace;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -88,13 +95,14 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
     ];
     if (retry !== undefined) outcomes.push(outPlace(retry));
 
-    transitions.push(
-      Transition.builder(attempt === 0 ? names.entryRun(path, entry.id) : names.entryTransition(path, entry.id, `run-${attempt}`))
-        .inputs(one(attemptIn))
-        .outputs(xor(...outcomes))
-        .action(stepAction({ stepId: entry.id, path, source, attempt, from: attemptIn, next, exits, retry }))
-        .build(),
-    );
+    const run = Transition.builder(
+      attempt === 0 ? names.entryRun(path, entry.id) : names.entryTransition(path, entry.id, `run-${attempt}`),
+    )
+      .inputs(one(attemptIn))
+      .outputs(xor(...outcomes))
+      .action(stepAction({ stepId: entry.id, path: viewPath, source, attempt, from: attemptIn, next, exits, retry }));
+    if (attempt === 0 && cancel !== undefined) run.inhibitor(cancel);
+    transitions.push(run.build());
 
     if (retry !== undefined) {
       const nextAttempt = place<FlowToken>(names.entryPlace(path, entry.id, `attempt-${attempt + 1}`));
@@ -153,25 +161,56 @@ export const sleepGadget: Gadget = (entry, next, ctx) => {
     }
   }
 
+  const { cancel, viewPath } = ctx;
   const inPlace = place<FlowToken>(ctx.names.entryIn(ctx.path, entry.id));
   const builder = Transition.builder(ctx.names.entryWake(ctx.path, entry.id)).inputs(one(inPlace));
+  // A sleep in progress ends on cancel, as Mastra's `abortableSleep` resolves early and the entry
+  // is re-stamped `canceled`. For a fixed sleep the token *waits in* `inPlace` while the delay
+  // runs, so the sweep ends it the moment the signal lands; a wait resolved in the action ends
+  // through `scope.signal` instead, and the settle stage or the next entry's sweep does the rest.
+  const extra: Transition[] =
+    cancel === undefined ? [] : [sweep(ctx.names.entryTransition(ctx.path, entry.id, 'cancel'), inPlace, cancel, ctx.exits, entry.id, viewPath)];
+  if (cancel !== undefined) builder.inhibitor(cancel);
+
+  const record = (scope: RunScope, incoming: FlowToken, startedAt: number): void =>
+    scope.recordStepResult(entry.id, {
+      status: 'success',
+      output: incoming.data,
+      payload: incoming.data,
+      startedAt,
+      endedAt: scope.epochNow(),
+    });
 
   if (entry.kind === 'sleep' && 'fixed' in wait) {
+    const ms = wait.fixed;
     builder
-      .timing(delayed(wait.fixed))
+      .timing(delayed(ms))
       .outputs(outPlace(next))
       .action(async (tctx) => {
         const incoming = tctx.input(inPlace);
-        scopeOf(tctx).recordStepResult(entry.id, { status: 'success', output: incoming.data });
+        const scope = scopeOf(tctx);
+        // The wait already happened as the transition's timing; it began `ms` before now.
+        record(scope, incoming, scope.epochNow() - ms);
         tctx.output(next, incoming);
       });
-    return { inPlace, transitions: [builder.build()] };
+    return { inPlace, transitions: [builder.build(), ...extra] };
   }
 
+  // **The wait's end is routed by the net, not by the action.** An action-side wait that the
+  // signal cuts short must be canceled *at the sleep* with no record — Mastra leaves
+  // `{status: 'waiting'}` and returns the entry canceled (`handlers/entry.ts:605-609,642-643`).
+  // Deciding that in the action by reading `scope.signal.aborted` made `wf.canceled` reachable in
+  // a run no cancel reaches, as far as a value-blind verifier can tell, and broke `neverCanceled`
+  // — a flag deciding cancellation, which the hard rule forbids. So the action only waits and
+  // deposits into `waited`; the same inhibitor/sweep pair as everywhere else then sends it on or
+  // to `canceled`. By the time the wait has ended on abort, the kernel's abort listener —
+  // registered before any action ran — has already injected the signal.
   const failed = ctx.exits.failed;
-  builder.outputs(xor(outPlace(next), outPlace(failed))).action(async (tctx) => {
+  const waited = place<RetryToken>(ctx.names.entryPlace(ctx.path, entry.id, 'waited'));
+  builder.outputs(xor(outPlace(waited), outPlace(failed))).action(async (tctx) => {
     const incoming = tctx.input(inPlace);
     const scope = scopeOf(tctx);
+    const startedAt = scope.epochNow();
 
     // Decide, then emit: resolve and wait first, where a throw writes nothing. `threw` is a
     // flag of its own because a rejection may carry `undefined` as its reason, and testing the
@@ -187,7 +226,7 @@ export const sleepGadget: Gadget = (entry, next, ctx) => {
         if (resolve === undefined) {
           throw new Error(`${entry.kind} '${entry.id}' is computed per run, and the runner has no resolveWait`);
         }
-        resolved = await resolve.call(scope.runner, entry.id, incoming.data, viewOf(scope, ctx.path));
+        resolved = await resolve.call(scope.runner, entry.id, incoming.data, viewOf(scope, viewPath));
       }
       await scope.wait(resolveWaitMs(entry.kind, entry.id, resolved, scope.epochNow()));
     } catch (e) {
@@ -198,14 +237,55 @@ export const sleepGadget: Gadget = (entry, next, ctx) => {
     if (threw) {
       // Mastra has no status here: a throwing sleep `fn` rejects `run.start()` outright
       // (`handlers/sleep.ts:83-128`). Failing the run is the nearest outcome a net can declare.
-      tctx.output(failed, { stepId: entry.id, error });
+      tctx.output(failed, withIndex({ stepId: entry.id, path: viewPath, error }, incoming));
       return;
     }
-    scope.recordStepResult(entry.id, { status: 'success', output: incoming.data });
-    tctx.output(next, incoming);
+    const done: RetryToken = { ...incoming, startedAt };
+    tctx.output(waited, done);
   });
-  return { inPlace, transitions: [builder.build()] };
+
+  const resume = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'resume'))
+    .inputs(one(waited))
+    .outputs(outPlace(next))
+    .action(async (tctx) => {
+      const done = tctx.input(waited);
+      record(scopeOf(tctx), done, done.startedAt ?? scopeOf(tctx).epochNow());
+      tctx.output(next, { ...carried(done), data: done.data });
+    });
+  if (cancel !== undefined) {
+    resume.inhibitor(cancel);
+    extra.push(sweep(ctx.names.entryTransition(ctx.path, entry.id, 'cancel-waited'), waited, cancel, ctx.exits, entry.id, viewPath));
+  }
+  return { inPlace, transitions: [builder.build(), resume.build(), ...extra] };
 };
+
+/**
+ * The cancellation sweep: reads the signal, consumes the token waiting to start, and reports the
+ * work that never ran. It records nothing — Mastra writes no step result for an entry it skipped.
+ */
+function sweep(
+  name: string,
+  from: Place<FlowToken>,
+  cancel: Place<null>,
+  exits: Exits,
+  stepId: string,
+  path: EntryPath,
+): Transition {
+  return Transition.builder(name)
+    .inputs(one(from))
+    .read(cancel)
+    .outputs(outPlace(exits.canceled))
+    .action(async (tctx) => {
+      const incoming = tctx.input(from);
+      tctx.output(exits.canceled, { origin: withIndex({ stepId, path }, incoming) });
+    })
+    .build();
+}
+
+/** Carries a foreach item's index onto an origin, only when there is one. */
+function withIndex<T extends object>(origin: T, incoming: FlowToken): T & { foreachIndex?: number } {
+  return incoming.foreachIndex === undefined ? origin : { ...origin, foreachIndex: incoming.foreachIndex };
+}
 
 /**
  * Normalises a wait resolved at firing time exactly as Mastra does where Mastra is well-defined,
@@ -252,6 +332,7 @@ function describe(value: unknown): string {
 
 interface StepActionSpec {
   readonly stepId: string;
+  /** The view path — Mastra's `executionPath` for the call, and every outcome token's `path`. */
   readonly path: EntryPath;
   readonly source: StepSource;
   readonly attempt: number;
@@ -275,12 +356,20 @@ const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bai
 export function stepAction(spec: StepActionSpec): TransitionAction {
   const { stepId, path, source, attempt, from, next, exits, retry } = spec;
   return async (tctx) => {
-    const incoming = tctx.input(from);
+    const incoming = tctx.input(from) as RetryToken;
     const scope = scopeOf(tctx);
+    // Stamped once, by the first attempt, and carried on the retry token: Mastra takes the step's
+    // start before its retry loop (`handlers/step.ts:166,174`).
+    const startedAt = incoming.startedAt ?? scope.epochNow();
 
     let outcome: StepOutcome;
     try {
-      outcome = await scope.runner.run(stepId, incoming.data, { ...viewOf(scope, path), source, attempt });
+      outcome = await scope.runner.run(stepId, incoming.data, {
+        ...viewOf(scope, path),
+        source,
+        attempt,
+        ...(incoming.foreachIndex === undefined ? {} : { foreachIndex: incoming.foreachIndex }),
+      });
       if (outcome === null || typeof outcome !== 'object' || !OUTCOME_STATUSES.has((outcome as { status: unknown }).status as string)) {
         throw new Error(`runner returned an unrecognised outcome for step '${stepId}': ${describe(outcome)}`);
       }
@@ -291,38 +380,67 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     }
 
     if (outcome.status === 'failed' && retry !== undefined && outcome.nonRetryable !== true) {
-      tctx.output(retry, { data: incoming.data });
+      const carry: RetryToken = { ...incoming, startedAt };
+      tctx.output(retry, carry);
       return;
     }
 
-    scope.recordStepResult(stepId, outcome);
+    const metadata = {
+      ...(incoming.iteration === undefined ? {} : { iterationCount: incoming.iteration }),
+      ...(incoming.foreachIndex === undefined ? {} : { foreachIndex: incoming.foreachIndex }),
+    };
+    // A suspended or paused step has not ended: Mastra stamps `suspendedAt` and no `endedAt`
+    // (`handlers/step.ts:516-526`).
+    const now = scope.epochNow();
+    const when =
+      outcome.status === 'suspended' ? { suspendedAt: now } : outcome.status === 'paused' ? {} : { endedAt: now };
+    scope.recordStepResult(stepId, {
+      ...outcome,
+      payload: incoming.data,
+      startedAt,
+      ...when,
+      ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+    });
+
+    const origin = withIndex({ stepId, path }, incoming);
     switch (outcome.status) {
       case 'success':
-        tctx.output(next, { data: outcome.output });
+        // The item's index and the iteration ride on, so the combinator that started the step can
+        // tell its results apart without trusting the step's output.
+        tctx.output(next, { ...carried(incoming), data: outcome.output });
         return;
       case 'failed':
-        tctx.output(
-          exits.failed,
-          outcome.tripwire === undefined
-            ? { stepId, error: outcome.error }
-            : { stepId, error: outcome.error, tripwire: outcome.tripwire },
-        );
+        tctx.output(exits.failed, {
+          ...origin,
+          error: outcome.error,
+          ...(outcome.tripwire === undefined ? {} : { tripwire: outcome.tripwire }),
+          ...(outcome.nonRetryable === true ? { nonRetryable: true as const } : {}),
+        });
         return;
       case 'bailed':
-        tctx.output(exits.bailed, { stepId, output: outcome.output });
+        tctx.output(exits.bailed, { ...origin, output: outcome.output });
         return;
       case 'suspended':
-        tctx.output(
-          exits.suspended,
-          outcome.output === undefined
-            ? { stepId, path, payload: outcome.payload }
-            : { stepId, path, payload: outcome.payload, output: outcome.output },
-        );
+        tctx.output(exits.suspended, { ...origin, payload: outcome.suspendPayload });
         return;
       case 'paused':
-        tctx.output(exits.paused, { stepId, path });
+        tctx.output(exits.paused, origin);
         return;
     }
+  };
+}
+
+/**
+ * A flow token between attempts of one step. `startedAt` exists only on the retry chain's own
+ * places; `carried()` never copies it, so it cannot leak downstream.
+ */
+type RetryToken = FlowToken & { readonly startedAt?: number };
+
+/** The ride-along fields of a flow token, without its data. */
+function carried(incoming: FlowToken): Omit<FlowToken, 'data'> {
+  return {
+    ...(incoming.foreachIndex === undefined ? {} : { foreachIndex: incoming.foreachIndex }),
+    ...(incoming.iteration === undefined ? {} : { iteration: incoming.iteration }),
   };
 }
 

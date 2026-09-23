@@ -93,16 +93,42 @@
       disabling the bound leaves every proof green. The bound stops the loop at runtime by
       construction, pinned by a structural test, and is now described that way in `types.ts`,
       `properties.ts` and row 13
-- [ ] **Track A, contract completion — the next phase, and it comes before M2.** Four changes
-      each touch a type every gadget uses, so none can be bolted on after the engine exists:
-      (1) a structural cancellation path — a `_cancel` place in `GadgetContext` that every
-      gadget's starts are inhibited on, plus a `canceled` outcome at Mastra's four check points
-      (row 28); (2) `FailureToken` carries `path` and `nonRetryable`, which fixes duplicate-id
-      ranking and gives the codec an execution path for every failure (rows 33, 36);
-      (3) `foreachIndex` on `StepCall`, and a view path separate from the naming path, so the
-      Mastra runner can build Mastra's per-item context (row 32); (4) what the step-result
-      store holds for the codec — Mastra's `payload` and `metadata.iterationCount` too, or an
-      opaque host record beside the outcome (rows 27, 37)
+- [x] Track A, contract completion ([ADR 0004]). Three workflows — build, integrate, migrate —
+      each with an adversarial verifier per area, 39 agents in all. **Structural cancellation**
+      exactly where Mastra checks its signal: before each top-level entry (an inhibitor plus a
+      sweep), after each (the settle stage, Mastra's re-stamp), between loop iterations, before
+      each foreach dispatch — and nowhere else, so a started block's arms and a step's retries run
+      on, as in Mastra. **Failures carry their origin**, closing duplicate-id ranking. **Foreach
+      items carry their index** at the foreach's view path. **Step records hold what Mastra's
+      `StepResult` holds** — payload, first-attempt `startedAt`, `suspendedAt`, `iterationCount`,
+      and a `canceled` variant only combinators write. Measured: 895 tests across 27 files plus 2
+      opt-in slow proofs (foreach at three lanes, both **proven** in 72s), check and build clean,
+      against the released libpetri 6.1.0
+- [x] Proofs in two segments on one closed net, paired inside `verifyWorkflow` so neither can be
+      dropped: no cancel ever (plus `neverCanceled`), and one cancel landing at **every** reachable
+      point. Registering the cancel place as an environment place sent every proof to SMT — 0 of
+      103 enumerated, slowest 411s, `unknown` on mutants a closed proof refutes in 7ms — so the
+      arrival is a transition in the net and the proof seeds it. Parallel, branch and loop cancel
+      proofs now run by enumeration in 18–29ms. At runtime the kernel injects into the signal
+      directly: routing a real abort through the arrival cost one firing, and every verifier found
+      a start slipping past its inhibitor in it
+- [x] A **structural cancel check**, run before every proof, because a start that lost its
+      inhibitor still drains to exactly one terminal and no property can see it. Rules: the signal
+      is never consumed or reset; a transition whose inputs contain, or are contained in, a sweep's
+      is inhibited by the signal. Stripping inhibitors produces exactly one named violation each.
+      A source guard keeps any gadget from reading the signal at all
+- [x] Found against the lead's own code and fixed, each pinned: a suspended record lost its
+      suspension (two fields shared the key `payload`); an aborted sleep recorded success; a retried
+      step took its last attempt's start; **an aborted sleep decided cancellation by reading the
+      signal in its action** — `neverCanceled`, new that day, was violated by it, and the fix routes
+      it through the same inhibitor/sweep pair; a pre-aborted run started its first step; an abort a
+      microtask after a step let the next one start. A vacuous race test — its abort landed after
+      the run in 120 of 120 runs — was replaced by a deterministic pin of Mastra's ordering
+- [x] Help from the libpetri sessions, asked rather than reconstructed: drain-on-terminal is safe
+      in 6.1.0 (wake-ups are latched); a soundness scare was our misuse (`environmentPlace` takes a
+      name); a seeded arrival proves only runs the cancel reached, hence the pairing; the
+      structural check stands in for a missing `neverEnabledWhile` property, which they passed on
+      to the maintainer with enumeration for bounded environment places
 - [ ] Track A, remaining after that: dot export, and the `.branch` split threshold, now chosen
       from the measured curve above
 - [ ] Open question carried out of the audit, cheap and worth answering before renaming

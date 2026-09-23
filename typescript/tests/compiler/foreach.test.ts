@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { Transition, delayed, type Timing } from 'libpetri';
+import { Transition, delayed, one, outPlace, place, type Place, type Timing } from 'libpetri';
 import { compile, type Gadget } from '../../src/compiler/index.js';
 import { foreachGadget, itemsOf, MAX_FOREACH_LANES } from '../../src/compiler/gadgets/foreach.js';
 import { runWorkflowDetailed, type RunReport } from '../../src/engine/index.js';
 import type {
+  CanceledToken,
   CompiledWorkflow,
   EntryDescription,
+  Exits,
   StepCall,
   StepDescription,
   StepOutcome,
@@ -109,8 +111,34 @@ async function run(
   input: unknown,
   runner: RecordingRunner,
   gadget?: Gadget,
+  signal?: AbortSignal,
 ): Promise<RunReport> {
-  return runWorkflowDetailed(build(entries, gadget), input, { runner, timeoutMs: 10_000 });
+  return runWorkflowDetailed(build(entries, gadget), input, { runner, timeoutMs: 10_000, ...(signal ? { signal } : {}) });
+}
+
+/**
+ * Observes what the foreach puts on one of its exits, without changing what happens next: the
+ * real gadget is compiled with a local place in that exit's stead, and one forwarding transition
+ * copies each token to the real exit. `RunOutcome` does not carry a canceled foreach's partial
+ * array or a failure's `nonRetryable`, and this is how a test reads them.
+ */
+function tapped<K extends keyof Exits>(which: K, inner: Gadget = foreachGadget) {
+  const seen: unknown[] = [];
+  const gadget: Gadget = (entry, next, ctx) => {
+    const tap = place(ctx.names.reserve(`test.tap.${which}`, 'test observation tap')) as Exits[K];
+    const result = inner(entry, next, { ...ctx, exits: { ...ctx.exits, [which]: tap } });
+    const forward = Transition.builder(`test.tap.${which}.forward`)
+      .inputs(one(tap as Place<unknown>))
+      .outputs(outPlace(ctx.exits[which] as Place<unknown>))
+      .action(async (tctx) => {
+        const token = tctx.input(tap as Place<unknown>);
+        seen.push(token);
+        tctx.output(ctx.exits[which] as Place<unknown>, token);
+      })
+      .build();
+    return { ...result, transitions: [...result.transitions, forward] };
+  };
+  return { gadget, seen };
 }
 
 // -------------------------------------------------------------------------------------------
@@ -164,8 +192,13 @@ describe('foreach: dispatch and order', () => {
 
     expect(log.trace).toEqual(['enter:a', 'exit:a', 'enter:b', 'exit:b', 'enter:c', 'exit:c']);
     expect(report.outcome).toEqual({ status: 'success', output: ['a!', 'b!', 'c!'] });
-    // The leaf recorded each item under `body` as it ran; the aggregate is the last write.
-    expect(report.stepResults.get('body')).toEqual({ status: 'success', output: ['a!', 'b!', 'c!'] });
+    // The leaf recorded each item under `body` as it ran; the aggregate is the last write, and it
+    // is Mastra's `{...stepInfo, status, output, endedAt}`: the foreach's input as payload, no metadata.
+    const record = report.stepResults.get('body')!;
+    expect(record).toMatchObject({ status: 'success', output: ['a!', 'b!', 'c!'], payload: ['a', 'b', 'c'] });
+    expect(typeof record.startedAt).toBe('number');
+    expect(typeof record.endedAt).toBe('number');
+    expect(record.metadata).toBeUndefined();
   });
 
   it('admits fluidly: a freed lane takes the next item while its sibling is still running', async () => {
@@ -234,7 +267,7 @@ describe('foreach: dispatch and order', () => {
 
     expect(runner.calls).toEqual([]);
     expect(report.outcome).toEqual({ status: 'success', output: [] });
-    expect(report.stepResults.get('body')).toEqual({ status: 'success', output: [] });
+    expect(report.stepResults.get('body')).toMatchObject({ status: 'success', output: [], payload: [] });
   });
 
   it('hands the array to the entry after it, and runs nothing after a failure', async () => {
@@ -249,7 +282,7 @@ describe('foreach: dispatch and order', () => {
       label === 'b' ? { status: 'failed', error: 'boom:b' } : { status: 'success', output: `${label}!` },
     );
     const failed = await run(entries, ['a', 'b', 'c'], bad.runner);
-    expect(failed.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:b' });
+    expect(failed.outcome).toEqual({ status: 'failed', stepId: 'body', path: [1], foreachIndex: 1, error: 'boom:b' });
     expect(bad.runner.calls).not.toContain('after');
   });
 });
@@ -288,8 +321,8 @@ describe('foreach: input that is not an array (row 22)', () => {
     const report = await run([foreach(2)], input, runner);
 
     expect(runner.calls).toEqual([]);
-    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: expect.any(kind) });
-    expect(report.stepResults.get('body')).toEqual({ status: 'failed', error: expect.any(kind) });
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], error: expect.any(kind) });
+    expect(report.stepResults.get('body')).toMatchObject({ status: 'failed', error: expect.any(kind), payload: input });
   });
 
   it('reads items exactly as the for-loop does', () => {
@@ -310,8 +343,9 @@ describe('foreach: fail-fast (row 18)', () => {
 
     expect(runner.calls).toEqual(['body']);
     expect(log.started).toEqual(['a']);
-    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:a' });
-    expect(report.stepResults.get('body')).toEqual({ status: 'failed', error: 'boom:a' });
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 0, error: 'boom:a' });
+    // The failing item's own result, as `{...finalErrorResult}` is (`:1360-1369`): its payload is the item.
+    expect(report.stepResults.get('body')).toMatchObject({ status: 'failed', error: 'boom:a', payload: 'a', metadata: { foreachIndex: 0 } });
   });
 
   it('stops after a later failure too, having run everything before it', async () => {
@@ -321,7 +355,7 @@ describe('foreach: fail-fast (row 18)', () => {
     const report = await run([foreach(1)], ['a', 'b', 'c', 'd'], runner);
 
     expect(log.started).toEqual(['a', 'b']);
-    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:b' });
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 1, error: 'boom:b' });
   });
 
   it('lets in-flight items finish and starts none of the queued ones at concurrency 3', async () => {
@@ -342,8 +376,9 @@ describe('foreach: fail-fast (row 18)', () => {
     expect(log.started).toEqual(['a', 'b', 'c']);
     expect([...log.finished].sort()).toEqual(['a', 'b', 'c']);
     expect(runner.calls).toHaveLength(3);
-    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:a' });
-    expect(report.stepResults.get('body')).toEqual({ status: 'failed', error: 'boom:a' });
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 0, error: 'boom:a' });
+    // `b` and `c` finished after `a` and their leaf wrote over `body`; the aggregate is still `a`'s.
+    expect(report.stepResults.get('body')).toMatchObject({ status: 'failed', error: 'boom:a', payload: 'a', metadata: { foreachIndex: 0 } });
   });
 
   it('reports the first failure in time, not the lowest index', async () => {
@@ -357,7 +392,7 @@ describe('foreach: fail-fast (row 18)', () => {
     const report = await run([foreach(3)], ['a', 'b', 'c'], runner);
 
     // `.parallel()` would say `a` here (lowest arm index); a foreach keeps the first to settle.
-    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:c' });
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 2, error: 'boom:c' });
   });
 
   it('ends as tripwire when the failing item carries one, and stops dispatch', async () => {
@@ -369,7 +404,7 @@ describe('foreach: fail-fast (row 18)', () => {
     const report = await run([foreach(1)], ['a', 'b'], runner);
 
     expect(log.started).toEqual(['a']);
-    expect(report.outcome).toEqual({ status: 'tripwire', stepId: 'body', tripwire: { reason: 'policy' } });
+    expect(report.outcome).toEqual({ status: 'tripwire', stepId: 'body', path: [0], foreachIndex: 0, tripwire: { reason: 'policy' } });
   });
 
   it('treats a throwing runner as a failed item', async () => {
@@ -380,7 +415,7 @@ describe('foreach: fail-fast (row 18)', () => {
     const report = await run([foreach(1)], ['a', 'b'], runner);
 
     expect(log.started).toEqual(['a']);
-    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: new Error('crashed') });
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 0, error: new Error('crashed') });
   });
 
   it('retries an item inside its own lane before anything counts as a failure', async () => {
@@ -407,7 +442,7 @@ describe('foreach: fail-fast (row 18)', () => {
     const report = await run([foreach(1, body({ retries: 3 }))], ['a', 'b'], runner);
 
     expect(log.started).toEqual(['a']);
-    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'fatal' });
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 0, error: 'fatal' });
   });
 });
 
@@ -422,7 +457,7 @@ describe('foreach: bail, pause and suspend', () => {
     expect(report.outcome).toEqual({ status: 'success', output: 'early', bailed: true });
     // Rewritten to 'success' when the bail ends the run, as Mastra rewrites the object its
     // stepResults holds (`default.ts:926-928`).
-    expect(report.stepResults.get('body')).toEqual({ status: 'success', output: 'early' });
+    expect(report.stepResults.get('body')).toMatchObject({ status: 'success', output: 'early', payload: 'b', metadata: { foreachIndex: 1 } });
   });
 
   it('pauses at the foreach path when a nested workflow item pauses', async () => {
@@ -433,8 +468,11 @@ describe('foreach: bail, pause and suspend', () => {
 
     expect(log.started).toEqual(['a']);
     // Mastra runs each item at the foreach's own execution path, so [1], not the lane's [1, 0].
-    expect(report.outcome).toEqual({ status: 'paused', stepId: 'body', path: [1] });
-    expect(report.stepResults.get('body')).toEqual({ status: 'paused' });
+    expect(report.outcome).toEqual({ status: 'paused', stepId: 'body', path: [1], foreachIndex: 0 });
+    // Mastra's paused item result is `{...stepInfo, status}` — no `endedAt` (`handlers/step.ts:525`).
+    const record = report.stepResults.get('body')!;
+    expect(record).toMatchObject({ status: 'paused', payload: 'a', metadata: { foreachIndex: 0 } });
+    expect(record.endedAt).toBeUndefined();
   });
 
   it('takes the first bail or pause in time', async () => {
@@ -453,7 +491,7 @@ describe('foreach: bail, pause and suspend', () => {
 
     const pauseFirst = race('a');
     const paused = await run([foreach(2)], ['a', 'b'], pauseFirst.runner);
-    expect(paused.outcome).toEqual({ status: 'paused', stepId: 'body', path: [0] });
+    expect(paused.outcome).toEqual({ status: 'paused', stepId: 'body', path: [0], foreachIndex: 0 });
 
     const bailFirst = race('b');
     const bailed = await run([foreach(2)], ['a', 'b'], bailFirst.runner);
@@ -470,14 +508,14 @@ describe('foreach: bail, pause and suspend', () => {
     });
     const report = await run([foreach(2)], ['a', 'b'], runner);
 
-    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:b' });
-    expect(report.stepResults.get('body')).toEqual({ status: 'failed', error: 'boom:b' });
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 1, error: 'boom:b' });
+    expect(report.stepResults.get('body')).toMatchObject({ status: 'failed', error: 'boom:b', payload: 'b' });
   });
 
   it('lets a bail outrank a suspension that happened first', async () => {
     const { runner, log } = itemRunner(async (label) => {
       await until(() => log.started.length >= 2);
-      if (label === 'a') return { status: 'suspended', payload: { ask: 'a' } };
+      if (label === 'a') return { status: 'suspended', suspendPayload: { ask: 'a' } };
       await until(() => log.finished.includes('a'));
       await sleep(5);
       return { status: 'bailed', output: 'early' };
@@ -490,28 +528,35 @@ describe('foreach: bail, pause and suspend', () => {
   it('suspends at the lowest suspended index, whatever order they suspended in', async () => {
     const { runner, log } = itemRunner(async (label) => {
       await until(() => log.started.length >= 3);
-      if (label === 'c') return { status: 'suspended', payload: { ask: 'c' } };
+      if (label === 'c') return { status: 'suspended', suspendPayload: { ask: 'c' } };
       await until(() => log.finished.includes('c'));
       await sleep(5);
       return label === 'a'
-        ? { status: 'suspended', payload: { ask: 'a' }, output: 'partial' }
+        ? { status: 'suspended', suspendPayload: { ask: 'a' }, suspendOutput: 'partial' }
         : { status: 'success', output: `${label}!` };
     });
     const report = await run([foreach(3)], ['a', 'b', 'c'], runner);
 
-    expect(report.outcome).toEqual({ status: 'suspended', stepId: 'body', path: [0], payload: { ask: 'a' } });
-    // Mastra's per-index record keeps no `suspendOutput`, so the foreach's suspension has none.
-    expect(report.stepResults.get('body')).toEqual({ status: 'suspended', payload: { ask: 'a' } });
+    expect(report.outcome).toEqual({ status: 'suspended', stepId: 'body', path: [0], foreachIndex: 0, payload: { ask: 'a' } });
+    // `{...stepInfo, suspendedAt, status, suspendPayload}` (`:1432-1450`): the foreach's input and
+    // start, the lowest item's suspend payload, `suspendedAt`, and no `endedAt`. No `suspendOutput`
+    // either — Mastra reads it from `foreachIndexObj`, which never stores one (`:1119-1124`).
+    const record = report.stepResults.get('body')!;
+    expect(record).toMatchObject({ status: 'suspended', payload: ['a', 'b', 'c'], suspendPayload: { ask: 'a' } });
+    expect(typeof record.startedAt).toBe('number');
+    expect(typeof record.suspendedAt).toBe('number');
+    expect(record.endedAt).toBeUndefined();
+    expect('suspendOutput' in record).toBe(false);
   });
 
   it('stops dispatch on a suspension too', async () => {
     const { runner, log } = itemRunner((label) =>
-      label === 'a' ? { status: 'suspended', payload: 'wait' } : { status: 'success', output: `${label}!` },
+      label === 'a' ? { status: 'suspended', suspendPayload: 'wait' } : { status: 'success', output: `${label}!` },
     );
     const report = await run([foreach(1)], ['a', 'b', 'c'], runner);
 
     expect(log.started).toEqual(['a']);
-    expect(report.outcome).toEqual({ status: 'suspended', stepId: 'body', path: [0], payload: 'wait' });
+    expect(report.outcome).toEqual({ status: 'suspended', stepId: 'body', path: [0], foreachIndex: 0, payload: 'wait' });
   });
 });
 
@@ -561,7 +606,8 @@ describe('foreach: structure', () => {
     for (const lane of lanes) {
       const start = transitions.find((t) => t.name === `t.0.items.lane${lane}.start`)!;
       // Its own lane needs no arc: while that outcome is pending the lane holds a slot, not a permit.
-      const others = lanes.filter((l) => l !== lane).flatMap(outcomesOf);
+      // Plus the signal: Mastra's worker checks it before each task (`:1160`).
+      const others = [...lanes.filter((l) => l !== lane).flatMap(outcomesOf), 'wf.cancel'];
       expect(start.inhibitors.map((a) => a.place.name).sort()).toEqual(others.sort());
     }
     const settles = transitions.filter((t) => /\.lane\d+\.(fail|bail|pause|suspend)$/.test(t.name));
@@ -597,7 +643,7 @@ describe('foreach: each safeguard is load-bearing (mutated copies)', () => {
     const intact = itemRunner(plan);
     const kept = await run([foreach(2)], ['a', 'b', 'c'], intact.runner, mutated(slowSettle));
     expect(intact.log.started).toEqual(['a', 'b']);
-    expect(kept.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:a' });
+    expect(kept.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 0, error: 'boom:a' });
 
     const broken = itemRunner(plan);
     await run(
@@ -618,10 +664,454 @@ describe('foreach: each safeguard is load-bearing (mutated copies)', () => {
 
     const intact = itemRunner(plan);
     const kept = await run([foreach(2)], ['a', 'b'], intact.runner);
-    expect(kept.outcome).toEqual({ status: 'failed', stepId: 'body', error: 'boom:a' });
+    expect(kept.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 0, error: 'boom:a' });
 
     const broken = itemRunner(plan);
     const lost = await run([foreach(2)], ['a', 'b'], broken.runner, mutated({ transition: /\.items\.fail$/, dropInput: /permit/ }));
     expect(lost.outcome).toMatchObject({ status: 'failed', residue: expect.any(Array) });
+  });
+});
+
+describe('foreach: per-item context (row 32)', () => {
+  it('runs every item at the foreach\'s own path, told apart by foreachIndex', async () => {
+    const calls: { path: readonly number[]; foreachIndex: number | undefined; input: unknown }[] = [];
+    const { runner } = itemRunner((label, call) => {
+      calls.push({ path: call.path, foreachIndex: call.foreachIndex, input: label });
+      return { status: 'success', output: `${label}!` };
+    });
+    const report = await run([{ kind: 'step', id: 'before' }, foreach(3)], ['a', 'b', 'c', 'd'], runner);
+
+    expect(report.outcome).toEqual({ status: 'success', output: ['a!', 'b!', 'c!', 'd!'] });
+    // Mastra: `executionContext: { ...executionContext, foreachIndex: k }` (`:1101`) — the path is
+    // the foreach's, whichever lane the net ran the item in.
+    expect([...calls].sort((x, y) => x.foreachIndex! - y.foreachIndex!)).toEqual([
+      { path: [1], foreachIndex: 0, input: 'a' },
+      { path: [1], foreachIndex: 1, input: 'b' },
+      { path: [1], foreachIndex: 2, input: 'c' },
+      { path: [1], foreachIndex: 3, input: 'd' },
+    ]);
+  });
+
+  it('places results by foreachIndex when items finish out of order', async () => {
+    const { runner, log } = itemRunner(async (_label, call) => {
+      await until(() => log.started.length === 3);
+      await sleep(5 * (3 - call.foreachIndex!));
+      return { status: 'success', output: call.foreachIndex };
+    });
+    const report = await run([foreach(3)], ['x', 'y', 'z'], runner);
+    expect(log.finished).toEqual(['z', 'y', 'x']);
+    expect(report.outcome).toEqual({ status: 'success', output: [0, 1, 2] });
+  });
+
+  it('reports the foreach\'s path and the item\'s index on a suspension', async () => {
+    const s = tapped('suspended');
+    const { runner } = itemRunner((label) =>
+      label === 'b' ? { status: 'suspended', suspendPayload: 'wait' } : { status: 'success', output: `${label}!` },
+    );
+    const report = await run([{ kind: 'step', id: 'before' }, foreach(1)], ['a', 'b', 'c'], runner, s.gadget);
+    expect(report.outcome).toEqual({ status: 'suspended', stepId: 'body', path: [1], foreachIndex: 1, payload: 'wait' });
+    expect(s.seen).toEqual([{ stepId: 'body', path: [1], foreachIndex: 1, payload: 'wait' }]);
+  });
+});
+
+describe('foreach: nonRetryable on the aggregate failure (row 36)', () => {
+  it('keeps nonRetryable on the failure and on the record, as {...finalErrorResult} does', async () => {
+    const f = tapped('failed');
+    const { runner, log } = itemRunner(async (label) => {
+      await until(() => log.started.length >= 2);
+      if (label === 'a') return { status: 'failed', error: 'fatal', nonRetryable: true };
+      // `b` finishes after `a` failed, and its leaf writes a success over `body`.
+      await until(() => log.finished.includes('a'));
+      await sleep(10);
+      return { status: 'success', output: 'b!' };
+    });
+    const report = await run([foreach(2, body({ retries: 3 }))], ['a', 'b'], runner, f.gadget);
+
+    expect(runner.attempts.filter((a) => a.attempt > 0)).toEqual([]);
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 0, error: 'fatal' });
+    expect(f.seen).toEqual([{ stepId: 'body', path: [0], foreachIndex: 0, error: 'fatal', nonRetryable: true }]);
+    expect(report.stepResults.get('body')).toMatchObject({
+      status: 'failed',
+      error: 'fatal',
+      nonRetryable: true,
+      payload: 'a',
+      metadata: { foreachIndex: 0 },
+    });
+  });
+
+  it('keeps a retryable failure retryable', async () => {
+    const f = tapped('failed');
+    const { runner } = itemRunner(() => ({ status: 'failed', error: 'plain' }));
+    await run([foreach(1)], ['a'], runner, f.gadget);
+    expect(f.seen).toEqual([{ stepId: 'body', path: [0], foreachIndex: 0, error: 'plain' }]);
+    expect('nonRetryable' in (f.seen[0] as object)).toBe(false);
+  });
+});
+
+describe('foreach: cancellation (row 28)', () => {
+  const origin = { stepId: 'body', path: [0] };
+  const canceledAt0 = { status: 'canceled', origin } as const;
+
+  /** `{...stepInfo, status: 'canceled', output: results, endedAt}` (`:1164-1169`, `:1298-1312`). */
+  const expectCanceledRecord = (report: RunReport, payload: unknown, output: unknown[]): void => {
+    const record = report.stepResults.get('body')!;
+    expect(record).toMatchObject({ status: 'canceled', payload });
+    expect(record.status === 'canceled' ? record.output : 'not canceled').toEqual(output);
+    expect(typeof record.startedAt).toBe('number');
+    expect(typeof record.endedAt).toBe('number');
+    expect(record.metadata).toBeUndefined();
+  };
+
+  /** A `before` step that aborts the run and passes its input on; `body` follows `plan`. */
+  const abortingBefore = (ac: AbortController, plan: Plan = succeed) =>
+    new RecordingRunner({
+      steps: {
+        before: (x) => {
+          ac.abort();
+          return { status: 'success', output: x };
+        },
+        body: (input, call) => plan(String(input), call),
+      },
+    });
+
+  it('cancels before any dispatch when the step before it aborts: no item runs, nothing recorded', async () => {
+    const ac = new AbortController();
+    const c = tapped('canceled');
+    const runner = abortingBefore(ac);
+    const report = await run([{ kind: 'step', id: 'before' }, foreach(3)], ['a', 'b'], runner, c.gadget, ac.signal);
+
+    expect(runner.calls).toEqual(['before']);
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'body', path: [1] } });
+    // Mastra's check before the entry (`default.ts:815`): the foreach never started — the sweep
+    // took its input, so there is no partial array and no record under the body id.
+    expect(c.seen).toEqual([{ origin: { stepId: 'body', path: [1] } }]);
+    expect(report.stepResults.has('body')).toBe(false);
+  });
+
+  /**
+   * A signal aborted before the run starts is seeded into the cancel *signal*, so the foreach's
+   * `split` is inhibited from the first marking — Mastra's check before the first entry. This was
+   * an `it.fails` while the kernel seeded the *request* place instead, where `split` and the
+   * arrival were enabled together and `split` could open the foreach.
+   */
+  it('a run aborted before it starts never opens the foreach', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const c = tapped('canceled');
+    const { runner } = itemRunner();
+    const report = await run([foreach(2)], ['a', 'b'], runner, c.gadget, ac.signal);
+
+    expect(runner.calls).toEqual([]);
+    expect(report.outcome).toEqual(canceledAt0);
+    expect(c.seen).toEqual([{ origin }]);
+    expect(report.stepResults.has('body')).toBe(false);
+  });
+
+  it('at concurrency 1, an abort during item 0 records the foreach canceled with item 0 and starts nothing after it', async () => {
+    const ac = new AbortController();
+    const c = tapped('canceled');
+    const { runner, log } = itemRunner((label) => {
+      if (label === 'a') ac.abort();
+      return { status: 'success', output: `${label}!` };
+    });
+    const report = await run([foreach(1)], ['a', 'b', 'c'], runner, c.gadget, ac.signal);
+
+    expect(log.started).toEqual(['a']);
+    expect(report.outcome).toEqual(canceledAt0);
+    // `canceledResult.output` is the workers' `results` array (`:1160-1172`): `a` finished.
+    expect(c.seen).toEqual([{ origin, output: ['a!'] }]);
+    // ... and it is what Mastra stores under the body id (`entry.ts:811-812`), over item 0's own record.
+    expectCanceledRecord(report, ['a', 'b', 'c'], ['a!']);
+  });
+
+  it('at concurrency 3, in-flight items finish and queued ones never start; holes stay holes', async () => {
+    const ac = new AbortController();
+    const c = tapped('canceled');
+    const { runner, log } = itemRunner(async (label) => {
+      await until(() => log.started.length >= 3);
+      if (label === 'a') {
+        ac.abort();
+        return { status: 'success', output: 'a!' };
+      }
+      // `b` and `c` are still running when the abort lands, and finish after it.
+      await sleep(20);
+      return { status: 'success', output: label === 'b' ? undefined : `${label}!` };
+    });
+    const items = ['a', 'b', 'c', 'd', 'e', 'f'];
+    const report = await run([foreach(3)], items, runner, c.gadget, ac.signal);
+
+    expect(log.started).toEqual(['a', 'b', 'c']);
+    expect([...log.finished].sort()).toEqual(['a', 'b', 'c']);
+    expect(report.outcome).toEqual(canceledAt0);
+    expect(c.seen).toHaveLength(1);
+    const output = (c.seen[0] as CanceledToken).output as unknown[];
+    expect(output).toHaveLength(3);
+    expect(1 in output).toBe(false);
+    expect(output[0]).toBe('a!');
+    expect(output[2]).toBe('c!');
+    const recorded = (report.stepResults.get('body') as { readonly output?: unknown }).output as unknown[];
+    expect(recorded).toEqual(output);
+    expect(1 in recorded).toBe(false);
+    expectCanceledRecord(report, items, output);
+  });
+
+  it('outranks a failure recorded before the drain, as the check after the drain does (:1298)', async () => {
+    const ac = new AbortController();
+    const c = tapped('canceled');
+    const { runner, log } = itemRunner(async (label) => {
+      await until(() => log.started.length >= 2);
+      if (label === 'a') return { status: 'failed', error: 'boom:a' };
+      await until(() => log.finished.includes('a'));
+      await sleep(10);
+      ac.abort();
+      return { status: 'success', output: 'b!' };
+    });
+    const report = await run([foreach(2)], ['a', 'b', 'c'], runner, c.gadget, ac.signal);
+
+    expect(log.started).toEqual(['a', 'b']);
+    expect(report.outcome).toEqual(canceledAt0);
+    expect(c.seen).toEqual([{ origin, output: [undefined, 'b!'] }]);
+    expectCanceledRecord(report, ['a', 'b', 'c'], [undefined, 'b!']);
+  });
+
+  /**
+   * An item that ends badly **after** the abort. Mastra's worker records it regardless
+   * (`handleNonSuccessResult`, `:1176-1191` — the settle is never gated), then the check after the
+   * drain (`:1298-1312`) runs before the error check (`:1315`), so canceled wins over the failure,
+   * bail, pause, suspension or throw. Each would hang the run if a settle were gated on the signal:
+   * the lane would never give its permit back.
+   */
+  it.each<[string, (label: string) => StepOutcome]>([
+    ['fails', () => ({ status: 'failed', error: 'late' })],
+    ['fails non-retryably', () => ({ status: 'failed', error: 'late', nonRetryable: true })],
+    ['bails', () => ({ status: 'bailed', output: 'late' })],
+    ['suspends', () => ({ status: 'suspended', suspendPayload: 'late' })],
+    ['throws', () => {
+      throw new Error('late');
+    }],
+  ])('an item that %s after the abort still settles, and the foreach leaves canceled', async (_what, outcome) => {
+    const ac = new AbortController();
+    const c = tapped('canceled');
+    const { runner, log } = itemRunner(async (label) => {
+      await until(() => log.started.length >= 2);
+      if (label === 'a') {
+        ac.abort();
+        return outcome(label);
+      }
+      // `b` is still running when `a` lands its outcome, and succeeds after it.
+      await until(() => log.finished.includes('a'));
+      await sleep(20);
+      return { status: 'success', output: 'b!' };
+    });
+    const report = await run([foreach(2)], ['a', 'b', 'c'], runner, c.gadget, ac.signal);
+
+    expect(log.started).toEqual(['a', 'b']);
+    expect(report.outcome).toEqual(canceledAt0);
+    expect(c.seen).toEqual([{ origin, output: [undefined, 'b!'] }]);
+    expectCanceledRecord(report, ['a', 'b', 'c'], [undefined, 'b!']);
+  });
+
+  it('an item that pauses after the abort still settles, and the foreach leaves canceled', async () => {
+    const ac = new AbortController();
+    const c = tapped('canceled');
+    const { runner } = itemRunner((label) => {
+      if (label === 'a') {
+        ac.abort();
+        return { status: 'paused' };
+      }
+      return { status: 'success', output: `${label}!` };
+    });
+    const report = await run([foreach(1, body({ source: 'workflow' }))], ['a', 'b'], runner, c.gadget, ac.signal);
+    expect(report.outcome).toEqual(canceledAt0);
+    expect(c.seen).toEqual([{ origin, output: [] }]);
+    expectCanceledRecord(report, ['a', 'b'], []);
+  });
+
+  it('without the cancel inhibitor gated onto the settles, an item failing after the abort hangs the run (mutant)', async () => {
+    // Over-gating: the settle is inhibited by the signal, so the failed item never gives its lane
+    // back and no finisher can fire. The intact gadget ends at once; the mutant only at the timeout.
+    const gateSettles: Gadget = (entry, next, ctx) => {
+      const r = foreachGadget(entry, next, ctx);
+      const transitions = r.transitions.map((t) => {
+        if (!/\.lane\d+\.(fail|bail|pause|suspend)$/.test(t.name)) return t;
+        const b = Transition.builder(t.name).inputs(...t.inputSpecs).outputs(t.outputSpec!).action(t.action).timing(t.timing);
+        for (const a of t.inhibitors) b.inhibitor(a.place);
+        for (const a of t.reads) b.read(a.place);
+        for (const a of t.resets) b.reset(a.place);
+        b.inhibitor(ctx.cancel!);
+        return b.build();
+      });
+      return { ...r, transitions };
+    };
+    const once = async (gadget: Gadget) => {
+      const ac = new AbortController();
+      const { runner } = itemRunner((label) => {
+        if (label === 'a') {
+          ac.abort();
+          return { status: 'failed', error: 'late' };
+        }
+        return { status: 'success', output: `${label}!` };
+      });
+      return runWorkflowDetailed(build([foreach(1)], gadget), ['a', 'b'], { runner, timeoutMs: 300, signal: ac.signal });
+    };
+
+    expect((await once(foreachGadget)).outcome).toEqual(canceledAt0);
+    await expect(once(gateSettles)).rejects.toThrow();
+  });
+
+  it('outranks success when the abort lands during the last item', async () => {
+    const ac = new AbortController();
+    const c = tapped('canceled');
+    const { runner } = itemRunner((label) => {
+      if (label === 'b') ac.abort();
+      return { status: 'success', output: `${label}!` };
+    });
+    const report = await run([foreach(1), { kind: 'step', id: 'after' }], ['a', 'b'], runner, c.gadget, ac.signal);
+    expect(report.outcome).toEqual(canceledAt0);
+    expect(runner.calls).not.toContain('after');
+    expect(c.seen).toEqual([{ origin, output: ['a!', 'b!'] }]);
+    expectCanceledRecord(report, ['a', 'b'], ['a!', 'b!']);
+  });
+
+  it('with a signal that never fires, runs to success and leaves nothing behind', async () => {
+    const ac = new AbortController();
+    const { runner } = itemRunner();
+    const report = await run([foreach(2)], ['a', 'b', 'c'], runner, undefined, ac.signal);
+    expect(report.outcome).toEqual({ status: 'success', output: ['a!', 'b!', 'c!'] });
+    expect(report.stepResults.get('body')).toMatchObject({ status: 'success', output: ['a!', 'b!', 'c!'] });
+  });
+
+  it('never gates the body: a retry after the abort still runs', async () => {
+    const ac = new AbortController();
+    const { runner } = itemRunner((label, call) => {
+      if (call.attempt === 0) {
+        ac.abort();
+        return { status: 'failed', error: 'flaky' };
+      }
+      return { status: 'success', output: `${label}!` };
+    });
+    const report = await run([foreach(1, body({ retries: 1 }))], ['a', 'b'], runner, undefined, ac.signal);
+    expect(runner.attempts).toEqual([
+      { stepId: 'body', attempt: 0 },
+      { stepId: 'body', attempt: 1 },
+    ]);
+    expect(report.outcome).toEqual(canceledAt0);
+    expectCanceledRecord(report, ['a', 'b'], ['a!']);
+  });
+
+  it('never gates the body: no transition of any lane\'s body touches the signal', () => {
+    // Mastra never checks between an item's start and its end, so the body is emitted without the
+    // signal. A gated first attempt would be invisible to these runs (the abort lands inside it);
+    // the arcs say it directly, and the cancel proof would strand the lane's slot.
+    const compiled = build([foreach(3)]);
+    const bodies = [...compiled.net.transitions].filter((t) => /^t\.0-\d+\./.test(t.name));
+    expect(bodies.length).toBeGreaterThanOrEqual(3);
+    for (const t of bodies) {
+      const arcs = [...t.inhibitors, ...t.reads].map((a) => a.place.name);
+      expect(arcs, t.name).not.toContain(compiled.cancel.name);
+    }
+  });
+
+  it('without the start inhibitors on the signal, queued items start after the abort (mutant)', async () => {
+    const plan = (ac: AbortController): Plan => (label) => {
+      if (label === 'a') ac.abort();
+      return { status: 'success', output: `${label}!` };
+    };
+
+    const keptAc = new AbortController();
+    const intact = itemRunner(plan(keptAc));
+    await run([foreach(1)], ['a', 'b', 'c'], intact.runner, undefined, keptAc.signal);
+    expect(intact.log.started).toEqual(['a']);
+
+    const brokenAc = new AbortController();
+    const broken = itemRunner(plan(brokenAc));
+    // The start is also moved ahead of `refuse` in declaration order, so the tie-break
+    // ([EXEC-002]) hands it the cursor the arc would have kept from it.
+    const startFirst = (inner: Gadget): Gadget => (entry, next, ctx) => {
+      const r = inner(entry, next, ctx);
+      const starts = r.transitions.filter((t) => /\.lane\d+\.start$/.test(t.name));
+      return { ...r, transitions: [...starts, ...r.transitions.filter((t) => !starts.includes(t))] };
+    };
+    const report = await run(
+      [foreach(1)],
+      ['a', 'b', 'c'],
+      broken.runner,
+      startFirst(mutated({ transition: /\.lane\d+\.start$/, dropInhibitor: /^wf\.cancel$/ })),
+      brokenAc.signal,
+    );
+    expect(broken.log.started).toEqual(['a', 'b', 'c']);
+    // The run is still canceled — the foreach's cancel finisher still decides — so only dispatch shows the arc.
+    expect(report.outcome).toEqual(canceledAt0);
+  });
+
+  it('without split\'s inhibitor on the signal, a canceled run opens the foreach anyway (mutant)', async () => {
+    // Both copies declare `split` ahead of the sweep, so the tie-break ([EXEC-002]: equal priority
+    // and enablement time, then declaration order) would let `split` win the race the arc prevents.
+    const splitFirst = (inner: Gadget): Gadget => (entry, next, ctx) => {
+      const r = inner(entry, next, ctx);
+      const split = r.transitions.filter((t) => t.name.endsWith('.items.split'));
+      return { ...r, transitions: [...split, ...r.transitions.filter((t) => !split.includes(t))] };
+    };
+    const entries: EntryDescription[] = [{ kind: 'step', id: 'before' }, foreach(2)];
+    const at1 = { stepId: 'body', path: [1] };
+
+    const intactAc = new AbortController();
+    const intact = tapped('canceled', splitFirst(foreachGadget));
+    const kept = await run(entries, ['a', 'b'], abortingBefore(intactAc), intact.gadget, intactAc.signal);
+    // The sweep took the input: the foreach never opened, so there is no partial array and no record.
+    expect(intact.seen).toEqual([{ origin: at1 }]);
+    expect(kept.stepResults.has('body')).toBe(false);
+
+    const brokenAc = new AbortController();
+    const broken = tapped('canceled', splitFirst(mutated({ transition: /\.items\.split$/, dropInhibitor: /^wf\.cancel$/ })));
+    const runner = abortingBefore(brokenAc);
+    const lost = await run(entries, ['a', 'b'], runner, broken.gadget, brokenAc.signal);
+    expect(runner.calls).toEqual(['before']);
+    // It opened — frame, cursor, permits — and the cancel finisher closed it with an empty array.
+    expect(broken.seen).toEqual([{ origin: at1, output: [] }]);
+    expect(lost.stepResults.get('body')).toMatchObject({ status: 'canceled', output: [] });
+  });
+
+  /**
+   * Each ordinary finisher is inhibited by the signal — Mastra's check after the drain (`:1298`)
+   * outranks every other outcome. Remove the arc and, when the last lane comes home, the finisher
+   * (declared before the cancel finishers, so it wins the tie-break) decides instead: the foreach
+   * never leaves through its own canceled exit, the run is canceled only by the settle stage, and
+   * the record under the body id is the ordinary outcome where Mastra's is `canceled`.
+   */
+  it.each<[string, RegExp, Plan, string]>([
+    ['join', /\.items\.join$/, (label) => ({ status: 'success', output: `${label}!` }), 'success'],
+    ['fail', /\.items\.fail$/, (label) => (label === 'a' ? { status: 'failed', error: 'boom' } : { status: 'success', output: 'b!' }), 'failed'],
+    ['exit', /\.items\.exit$/, (label) => (label === 'a' ? { status: 'bailed', output: 'early' } : { status: 'success', output: 'b!' }), 'bailed'],
+    ['suspend', /\.items\.suspend$/, (label) => (label === 'a' ? { status: 'suspended', suspendPayload: 'p' } : { status: 'success', output: 'b!' }), 'suspended'],
+  ])('without %s\'s inhibitor on the signal, the foreach does not leave canceled (mutant)', async (_name, transition, outcomeOf, brokenStatus) => {
+    const once = async (gadget: Gadget) => {
+      const ac = new AbortController();
+      const tap = tapped('canceled', gadget);
+      const { runner, log } = itemRunner(async (label, call) => {
+        await until(() => log.started.length >= 2);
+        if (label === 'b') {
+          // `a` has settled; the abort lands while `b` is the last item in flight.
+          await until(() => log.finished.includes('a'));
+          await sleep(5);
+          ac.abort();
+        }
+        return outcomeOf(label, call);
+      });
+      const report = await run([foreach(2)], ['a', 'b'], runner, tap.gadget, ac.signal);
+      return { report, seen: tap.seen };
+    };
+
+    const kept = await once(foreachGadget);
+    expect(kept.report.outcome).toEqual(canceledAt0);
+    expect(kept.seen).toHaveLength(1);
+    expect(kept.report.stepResults.get('body')?.status).toBe('canceled');
+
+    const broken = await once(mutated({ transition, dropInhibitor: /^wf\.cancel$/ }));
+    expect(broken.report.outcome.status).toBe('canceled');
+    expect(broken.report.outcome).not.toHaveProperty('residue');
+    expect(broken.seen).toEqual([]);
+    // What a host sees: the body id holds the ordinary aggregate, not Mastra's `canceled`.
+    expect(broken.report.stepResults.get('body')?.status).toBe(brokenStatus);
   });
 });

@@ -106,7 +106,7 @@ export interface WorkflowDescription {
  *
  * Failure is an outcome, never a thrown exception.
  */
-export type StepOutcome =
+export type StepOutcome = (
   | { readonly status: 'success'; readonly output: unknown }
   | {
       readonly status: 'failed';
@@ -118,9 +118,58 @@ export type StepOutcome =
     }
   /** `bail(result)`: the run ends early *as a success* whose result is `output`. */
   | { readonly status: 'bailed'; readonly output: unknown }
-  | { readonly status: 'suspended'; readonly payload: unknown; readonly output?: unknown }
+  /**
+   * `suspendPayload` and `suspendOutput`, as Mastra's `StepSuspended` names them
+   * (`handlers/step.ts:516-522`). Not `payload`: on a record that key is the step's input, and an
+   * earlier version of this type used it for both — the record lost the suspension.
+   */
+  | { readonly status: 'suspended'; readonly suspendPayload: unknown; readonly suspendOutput?: unknown }
   /** A nested workflow paused; only a `workflow`-sourced step produces it. */
-  | { readonly status: 'paused' };
+  | { readonly status: 'paused' }
+) & {
+  /**
+   * The host's own record of the step, carried verbatim — for Mastra, its `StepResult`, with the
+   * fields this engine does not model (`suspendedAt`, `resumePayload`, scorer output …). The
+   * engine never reads it; the codec prefers it when it rebuilds `WorkflowRunState`.
+   */
+  readonly host?: unknown;
+};
+
+/**
+ * What the run-scoped store holds for a step: the outcome plus what Mastra's `StepResult` carries
+ * beside it, so the codec can rebuild `WorkflowRunState.context` and a loop can re-enter from a
+ * recorded result (`handlers/control-flow.ts:727-734`).
+ */
+export type StepRecord =
+  | (StepOutcome & RecordFields)
+  /**
+   * A loop or foreach canceled mid-run. Mastra persists `{status: 'canceled'}` under the body's id
+   * (`handlers/entry.ts:810-815`), with a foreach's partial results as `output`
+   * (`handlers/control-flow.ts:1164-1169`). Only a combinator writes it — it is not a
+   * `StepOutcome`, so a runner cannot return it.
+   */
+  | ({ readonly status: 'canceled'; readonly output?: unknown; readonly host?: unknown } & Partial<RecordFields>);
+
+/** What a record carries beside the outcome — the rest of Mastra's `StepResult`. */
+export interface RecordFields {
+  /** The input the step received — Mastra's `payload`. */
+  readonly payload: unknown;
+  /**
+   * Epoch milliseconds on the run's clock ([TIME-015]). Taken **once**, when the first attempt
+   * starts: a retried step keeps its first start, as Mastra stamps before its retry loop
+   * (`handlers/step.ts:166,174`).
+   */
+  readonly startedAt?: number;
+  /** When the step finished. Absent for `suspended` and `paused`, which Mastra never ends. */
+  readonly endedAt?: number;
+  /** When the step suspended — Mastra's `suspendedAt`. */
+  readonly suspendedAt?: number;
+  /**
+   * `iterationCount` is stamped by a loop (1-based, as Mastra's `metadata.iterationCount`);
+   * `foreachIndex` by a foreach. Absent outside those.
+   */
+  readonly metadata?: { readonly iterationCount?: number; readonly foreachIndex?: number };
+}
 
 /**
  * A read-only view of the run, handed to every runner call.
@@ -133,11 +182,21 @@ export type StepOutcome =
  * places are unaffected by what a step returns.
  */
 export interface RunView {
-  /** The positional path of the entry making the call — Mastra's `executionPath`. */
+  /**
+   * Mastra's `executionPath` for the call — the **view path**, which is not always the path the
+   * compiler names places by. Every `.foreach()` item runs at the foreach's own path
+   * (`handlers/control-flow.ts:1101`), however many lanes the net gives it.
+   */
   readonly path: EntryPath;
   /** The workflow's input — Mastra's `getInitData()`. */
   readonly initData: unknown;
-  getStepResult(stepId: string): StepOutcome | undefined;
+  getStepResult(stepId: string): StepRecord | undefined;
+  /**
+   * The run's abort signal, which Mastra hands every step and every condition
+   * (`handlers/step.ts:450`; `handlers/control-flow.ts:419-455,858-859`). Reading it cuts work
+   * already running short; *raising* an abort is the runner's, through the run's own controller.
+   */
+  readonly abortSignal: AbortSignal;
 }
 
 /** A runner call that executes a step. */
@@ -145,6 +204,8 @@ export interface StepCall extends RunView {
   readonly source: StepSource;
   /** 0-based. Mastra's `retryCount`. */
   readonly attempt: number;
+  /** Which `.foreach()` item this call runs — Mastra's `executionContext.foreachIndex`. */
+  readonly foreachIndex?: number;
 }
 
 /**
@@ -176,36 +237,61 @@ export interface StepRunner {
   resolveWait?(entryId: string, input: unknown, view: RunView): Promise<number>;
 }
 
-/** The token travelling the success path: whatever the previous entry produced. */
+/**
+ * The token travelling the success path: whatever the previous entry produced.
+ *
+ * `foreachIndex` and `iteration` ride along when a foreach or a loop starts the step, so the leaf
+ * can hand them to the runner and stamp them on the step's record. A gadget that does not own
+ * them passes them through untouched.
+ */
 export interface FlowToken {
   readonly data: unknown;
+  readonly foreachIndex?: number;
+  /** 1-based loop iteration, as Mastra's `metadata.iterationCount`. */
+  readonly iteration?: number;
+}
+
+/**
+ * Where an outcome came from. `path` is the view path — Mastra's `executionPath` — so the codec
+ * can write `suspendedPaths` and a failure can be ranked by arm without guessing from the id.
+ */
+export interface Origin {
+  readonly stepId: string;
+  readonly path: EntryPath;
+  readonly foreachIndex?: number;
 }
 
 /** The failure path. `tripwire` set means the run ends as `'tripwire'`, not `'failed'`. */
-export interface FailureToken {
-  readonly stepId: string;
+export interface FailureToken extends Origin {
   readonly error: unknown;
   readonly tripwire?: unknown;
+  readonly nonRetryable?: true;
 }
 
 /** The early-exit path of `bail(result)`. */
-export interface BailToken {
-  readonly stepId: string;
+export interface BailToken extends Origin {
   readonly output: unknown;
 }
 
-/** A step that suspended. `path` is what Mastra records in `suspendedPaths`. */
-export interface SuspendToken {
-  readonly stepId: string;
-  readonly path: EntryPath;
+/**
+ * A step that suspended. The suspension's output, if any, is on the step's record in the store —
+ * the codec reads it there, as `fmtReturnValue` reads `stepResults` (`default.ts:630-643`).
+ */
+export interface SuspendToken extends Origin {
   readonly payload: unknown;
-  readonly output?: unknown;
 }
 
 /** A nested workflow that paused. */
-export interface PauseToken {
-  readonly stepId: string;
-  readonly path: EntryPath;
+export interface PauseToken extends Origin {}
+
+/**
+ * Work that stopped because the run was canceled. `origin` names the entry that was waiting or
+ * running, when there was one; `output` carries a foreach's partial results
+ * (`handlers/control-flow.ts:1160-1172`).
+ */
+export interface CanceledToken {
+  readonly origin?: Origin;
+  readonly output?: unknown;
 }
 
 /**
@@ -223,6 +309,7 @@ export interface Exits {
   readonly bailed: Place<BailToken>;
   readonly suspended: Place<SuspendToken>;
   readonly paused: Place<PauseToken>;
+  readonly canceled: Place<CanceledToken>;
 }
 
 /**
@@ -254,6 +341,20 @@ export interface CompiledWorkflow {
   /** Where the initial token is injected to start a run. */
   readonly entryPlace: Place<FlowToken>;
   readonly terminals: Terminals;
+  /**
+   * The cancellation signal. Nothing consumes it — every start transition where Mastra checks its
+   * abort carries an inhibitor arc on it, and every place where work waits to start there a sweep
+   * that reads it — so once marked it stays marked, and it is excluded from residue.
+   */
+  readonly cancel: Place<null>;
+  /**
+   * Where a cancellation **arrives, for a proof**. An immediate `arrive` transition moves its token
+   * to `cancel`; the verifier's `cancel` segment seeds it, so `arrive` may fire at every reachable
+   * point while the net stays closed and takes the enumeration route. At runtime the kernel does
+   * not use it: the environment injects into `cancel` directly — the same event, without the extra
+   * firing in which an already-enabled start could slip past the inhibitor. [ADR 0004]
+   */
+  readonly cancelRequest: Place<null>;
   /** Stable over structure alone, so it keys a compile cache across runs. */
   readonly structuralHash: string;
 }

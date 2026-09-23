@@ -107,7 +107,7 @@ describe('parallel: failure', () => {
 
     // `c` failed first in time; Mastra's `results.find` over index-aligned results picks `a`.
     expect(s.settled).toEqual(['c', 'b', 'a']);
-    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', error: 'a!' });
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', path: [0, 0], error: 'a!' });
   });
 
   it('waits for every sibling before failing the block, and stops the entries after it', async () => {
@@ -123,7 +123,26 @@ describe('parallel: failure', () => {
     // the same. `after` never runs.
     expect(s.settled).toEqual(['a', 'b']);
     expect(runner.calls).not.toContain('after');
-    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', error: 'a!' });
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', path: [0, 0], error: 'a!' });
+  });
+
+  it('two arms sharing an id: the lower index\'s error is reported though the higher failed first', async () => {
+    // Ranking by step id collapsed both arms onto index 0 and let the FIFO head — arm 1, first in
+    // time — win (`docs/divergences.md` row 33). The origin's path names the arm exactly.
+    const settled: number[] = [];
+    const runner = new RecordingRunner({
+      a: async (_input, call) => {
+        const arm = call.path[1]!;
+        if (arm === 0) await after(30);
+        settled.push(arm);
+        return { status: 'failed', error: `arm ${arm}!` };
+      },
+    });
+
+    const outcome = await run(wf(fan('fan', [step('a'), step('a')])), runner);
+
+    expect(settled).toEqual([1, 0]);
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', path: [0, 0], error: 'arm 0!' });
   });
 
   it('forwards a failing arm\'s tripwire, so the run ends tripwire', async () => {
@@ -133,7 +152,7 @@ describe('parallel: failure', () => {
 
     const outcome = await run(wf(fan('fan', [step('a'), step('b')])), runner);
 
-    expect(outcome).toStrictEqual({ status: 'tripwire', stepId: 'b', tripwire: { reason: 'policy' } });
+    expect(outcome).toStrictEqual({ status: 'tripwire', stepId: 'b', path: [0, 1], tripwire: { reason: 'policy' } });
   });
 
   it('takes tripwire-or-not from the lowest-indexed failure, whichever failed first', async () => {
@@ -148,26 +167,26 @@ describe('parallel: failure', () => {
     });
     const shape = wf(fan('fan', [step('a'), step('b')]));
 
-    expect(await run(shape, plainFirst)).toStrictEqual({ status: 'failed', stepId: 'a', error: 'a!' });
-    expect(await run(shape, tripwireFirst)).toStrictEqual({ status: 'tripwire', stepId: 'a', tripwire: { reason: 'policy' } });
+    expect(await run(shape, plainFirst)).toStrictEqual({ status: 'failed', stepId: 'a', path: [0, 0], error: 'a!' });
+    expect(await run(shape, tripwireFirst)).toStrictEqual({ status: 'tripwire', stepId: 'a', path: [0, 0], tripwire: { reason: 'policy' } });
   });
 
   it('lets a failure outrank a suspension, and leaves no suspension marker behind', async () => {
     const runner = new RecordingRunner({
-      a: () => ({ status: 'suspended', payload: 'wait for approval' }),
+      a: () => ({ status: 'suspended', suspendPayload: 'wait for approval' }),
       b: async () => { await after(10); return { status: 'failed', error: 'b!' }; },
     });
 
     const outcome = await run(wf(fan('fan', [step('a'), step('b')])), runner);
 
-    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'b', error: 'b!' });
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'b', path: [0, 1], error: 'b!' });
   });
 
   it('settles every one of the five outcomes in one block, and the failure decides it', async () => {
     const runner = new RecordingRunner({
       ok: tag('ok'),
       bad: async () => { await after(15); return { status: 'failed', error: 'bad!' }; },
-      wait: () => ({ status: 'suspended', payload: 'p' }),
+      wait: () => ({ status: 'suspended', suspendPayload: 'p' }),
       early: () => ({ status: 'bailed', output: 'early' }),
       sub: () => ({ status: 'paused' }),
     });
@@ -178,7 +197,7 @@ describe('parallel: failure', () => {
     );
 
     expect(runner.calls).not.toContain('after');
-    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'bad', error: 'bad!' });
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'bad', path: [0, 1], error: 'bad!' });
   });
 
   it('treats a runner that throws as a failed arm', async () => {
@@ -190,7 +209,7 @@ describe('parallel: failure', () => {
 
     const outcome = await run(wf(fan('fan', [step('a'), step('b')])), runner);
 
-    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', error: boom });
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', path: [0, 0], error: boom });
   });
 
   it('fails a retrying arm only once its retries are spent', async () => {
@@ -199,7 +218,7 @@ describe('parallel: failure', () => {
     const outcome = await run(wf(fan('fan', [step('a', { retries: 2 }), step('b')])), runner);
 
     expect(runner.attempts.filter((a) => a.stepId === 'a')).toHaveLength(3);
-    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', error: 'attempt 2' });
+    expect(outcome).toStrictEqual({ status: 'failed', stepId: 'a', path: [0, 0], error: 'attempt 2' });
   });
 });
 
@@ -207,9 +226,9 @@ describe('parallel: suspension', () => {
   it('suspends the block on the lowest-indexed suspended arm, and records every suspension', async () => {
     const s = new Script();
     const runner = new RecordingRunner({
-      a: s.at(20, 'a', { status: 'suspended', payload: 'pa' }),
+      a: s.at(20, 'a', { status: 'suspended', suspendPayload: 'pa' }),
       b: s.at(0, 'b', tag('b')),
-      c: s.at(0, 'c', { status: 'suspended', payload: 'pc' }),
+      c: s.at(0, 'c', { status: 'suspended', suspendPayload: 'pc' }),
     });
 
     const { outcome, stepResults } = await runWorkflowDetailed(
@@ -223,15 +242,18 @@ describe('parallel: suspension', () => {
     expect(outcome).toStrictEqual({ status: 'suspended', stepId: 'a', path: [0, 0], payload: 'pa' });
     // Mastra's `fmtReturnValue` lists *every* step result that is suspended, not only the one
     // that decided the block (`default.ts:630-643`); both are in the step results to list.
-    expect(stepResults.get('a')).toStrictEqual({ status: 'suspended', payload: 'pa' });
-    expect(stepResults.get('c')).toStrictEqual({ status: 'suspended', payload: 'pc' });
+    // Each record keeps both of Mastra's fields apart: `payload` is the step's input and
+    // `suspendPayload` what it suspended with (`handlers/step.ts:516-522`). They once shared one
+    // key and the input overwrote the suspension.
+    expect(stepResults.get('a')).toMatchObject({ status: 'suspended', payload: 'x', suspendPayload: 'pa' });
+    expect(stepResults.get('c')).toMatchObject({ status: 'suspended', payload: 'x', suspendPayload: 'pc' });
   });
 
   it('picks the lowest index by path, exactly, even when two arms share an id', async () => {
     const runner = new RecordingRunner({
       a: async (_input, call) => {
         if (call.path[1] === 0) await after(20);
-        return { status: 'suspended', payload: `arm ${call.path[1]}` };
+        return { status: 'suspended', suspendPayload: `arm ${call.path[1]}` };
       },
     });
 
@@ -244,7 +266,7 @@ describe('parallel: suspension', () => {
     const runner = new RecordingRunner({
       a: () => ({ status: 'bailed', output: 'early' }),
       b: () => ({ status: 'paused' }),
-      c: async () => { await after(10); return { status: 'suspended', payload: 'pc' }; },
+      c: async () => { await after(10); return { status: 'suspended', suspendPayload: 'pc' }; },
     });
 
     const outcome = await run(wf(fan('fan', [step('a'), step('b', { source: 'workflow' }), step('c')])), runner);
@@ -428,7 +450,7 @@ const mutate = (role: string, edit: (t: Transition) => Transition): Gadget => (e
 const bypass = (exit: keyof Exits): Gadget => (entry, next, ctx) =>
   parallelGadget(entry, next, {
     ...ctx,
-    emitNested: (s, p, n, exits) => ctx.emitNested(s, p, n, { ...exits, [exit]: ctx.exits[exit] } as Exits),
+    emitNested: (s, p, n, exits, o) => ctx.emitNested(s, p, n, { ...exits, [exit]: ctx.exits[exit] } as Exits, o),
   });
 
 describe('parallel: removing a safeguard breaks a run', () => {
@@ -438,9 +460,9 @@ describe('parallel: removing a safeguard breaks a run', () => {
   it('without the failure arrival deposit, a failing arm ends the run and strands its sibling', async () => {
     const runner = () => new RecordingRunner({ a: () => ({ status: 'failed', error: 'a!' }), b: slowB });
 
-    expect(await run(twoArms, runner())).toStrictEqual({ status: 'failed', stepId: 'a', error: 'a!' });
+    expect(await run(twoArms, runner())).toStrictEqual({ status: 'failed', stepId: 'a', path: [0, 0], error: 'a!' });
     expect(await run(twoArms, runner(), bypass('failed')))
-      .toStrictEqual({ status: 'failed', stepId: 'a', error: 'a!', residue: ['s.0.fan.arrived'] });
+      .toStrictEqual({ status: 'failed', stepId: 'a', path: [0, 0], error: 'a!', residue: ['s.0.fan.arrived'] });
   });
 
   it('without the bail arrival deposit, a bailing arm ends the run and strands its sibling', async () => {
@@ -453,13 +475,13 @@ describe('parallel: removing a safeguard breaks a run', () => {
 
   it('without the reset on susp-seen, a failure beside a suspension leaves the marker behind', async () => {
     const runner = () => new RecordingRunner({
-      a: () => ({ status: 'suspended', payload: 'p' }),
+      a: () => ({ status: 'suspended', suspendPayload: 'p' }),
       b: () => ({ status: 'failed', error: 'b!' }),
     });
 
-    expect(await run(twoArms, runner())).toStrictEqual({ status: 'failed', stepId: 'b', error: 'b!' });
+    expect(await run(twoArms, runner())).toStrictEqual({ status: 'failed', stepId: 'b', path: [0, 1], error: 'b!' });
     expect(await run(twoArms, runner(), mutate('join-fail', (t) => rebuild(t, { resets: [] }))))
-      .toStrictEqual({ status: 'failed', stepId: 'b', error: 'b!', residue: ['s.0.fan.susp-seen'] });
+      .toStrictEqual({ status: 'failed', stepId: 'b', path: [0, 1], error: 'b!', residue: ['s.0.fan.susp-seen'] });
   });
 
   it('with one() instead of all() on err-seen, a second failure is left behind', async () => {
@@ -470,8 +492,195 @@ describe('parallel: removing a safeguard breaks a run', () => {
     const oneErr = mutate('join-fail', (t) =>
       rebuild(t, { inputs: t.inputSpecs.map((s) => (s.place.name.endsWith('.err-seen') ? one(s.place) : s)) }));
 
-    expect(await run(twoArms, runner())).toStrictEqual({ status: 'failed', stepId: 'a', error: 'a!' });
+    expect(await run(twoArms, runner())).toStrictEqual({ status: 'failed', stepId: 'a', path: [0, 0], error: 'a!' });
     const mutated = await run(twoArms, runner(), oneErr);
     expect(mutated).toMatchObject({ status: 'failed', residue: ['s.0.fan.err-seen'] });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Cancellation. Mastra checks its signal before each top-level entry (`default.ts:815`) and
+// re-stamps a top-level entry's result after it (`handlers/entry.ts:815-817`), never inside a
+// step. So the block is gated at its start and at nothing else: once `fork` fires, every arm runs.
+// ---------------------------------------------------------------------------------------------
+
+describe('parallel: cancellation', () => {
+  const three = [step('a'), step('b'), step('c')];
+
+  it('aborted before the block: canceled at the block, and no arm runs', async () => {
+    const ac = new AbortController();
+    const runner = new RecordingRunner({ before: (input) => { ac.abort(); return ok(input); } });
+
+    const { outcome, stepResults } = await runWorkflowDetailed(
+      compile(wf(step('before'), fan('fan', three), step('after'))),
+      'x',
+      { runner, signal: ac.signal },
+    );
+
+    expect(outcome).toStrictEqual({ status: 'canceled', origin: { stepId: 'fan', path: [1] } });
+    expect(runner.calls).toEqual(['before']);
+    expect([...stepResults.keys()]).toEqual(['before']);
+  });
+
+  it('aborted before the run: the block as first entry is canceled, nothing runs', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const runner = new RecordingRunner();
+
+    expect(await runWorkflow(compile(wf(fan('fan', three))), 'x', { runner, signal: ac.signal }))
+      .toStrictEqual({ status: 'canceled', origin: { stepId: 'fan', path: [0] } });
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('an empty block is gated too', async () => {
+    const ac = new AbortController();
+    const runner = new RecordingRunner({ before: (input) => { ac.abort(); return ok(input); } });
+
+    expect(await runWorkflow(compile(wf(step('before'), fan('fan', []), step('after'))), 'x', { runner, signal: ac.signal }))
+      .toStrictEqual({ status: 'canceled', origin: { stepId: 'fan', path: [1] } });
+    expect(runner.calls).toEqual(['before']);
+  });
+
+  it('aborted while an arm runs: every arm still runs and is recorded, and the next entry never starts', async () => {
+    const ac = new AbortController();
+    const s = new Script();
+    const runner = new RecordingRunner({
+      a: s.at(0, 'a', (input) => { ac.abort(); return tag('a')(input); }),
+      b: s.at(20, 'b', tag('b')),
+      c: s.at(40, 'c', tag('c')),
+    });
+
+    const { outcome, stepResults } = await runWorkflowDetailed(
+      compile(wf(fan('fan', three), step('after'))),
+      'x',
+      { runner, signal: ac.signal },
+    );
+
+    expect(s.settled).toEqual(['a', 'b', 'c']);
+    expect(runner.calls).not.toContain('after');
+    // The block succeeded; the next entry's own check is where the run stops.
+    expect(outcome).toStrictEqual({ status: 'canceled', origin: { stepId: 'after', path: [1] } });
+    for (const id of ['a', 'b', 'c']) {
+      expect(stepResults.get(id)).toMatchObject({ status: 'success', output: `x/${id}`, payload: 'x' });
+    }
+  });
+
+  it('aborted while an arm runs, block last: the settle stage re-stamps the success canceled', async () => {
+    const ac = new AbortController();
+    const runner = new RecordingRunner({
+      a: (input) => { ac.abort(); return tag('a')(input); },
+      b: async (input) => { await after(20); return tag('b')(input); },
+    });
+
+    const { outcome, stepResults } = await runWorkflowDetailed(
+      compile(wf(fan('fan', [step('a'), step('b')]))),
+      'x',
+      { runner, signal: ac.signal },
+    );
+
+    expect(outcome).toStrictEqual({ status: 'canceled' });
+    expect(stepResults.get('a')).toMatchObject({ status: 'success', output: 'x/a' });
+    expect(stepResults.get('b')).toMatchObject({ status: 'success', output: 'x/b' });
+  });
+
+  it('aborted while arms fail: canceled wins over the block\'s failure, the records keep the failure', async () => {
+    const ac = new AbortController();
+    const runner = new RecordingRunner({
+      a: async () => { await after(20); return { status: 'failed', error: 'a!' }; },
+      b: () => { ac.abort(); return { status: 'failed', error: 'b!' }; },
+    });
+
+    const { outcome, stepResults } = await runWorkflowDetailed(
+      compile(wf(fan('fan', [step('a'), step('b')]), step('after'))),
+      'x',
+      { runner, signal: ac.signal },
+    );
+
+    // The block's failure (lowest index, `a`) settles first, then is re-stamped.
+    expect(outcome).toStrictEqual({ status: 'canceled', origin: { stepId: 'a', path: [0, 0] } });
+    expect(runner.calls).not.toContain('after');
+    expect(stepResults.get('a')).toMatchObject({ status: 'failed', error: 'a!' });
+    expect(stepResults.get('b')).toMatchObject({ status: 'failed', error: 'b!' });
+  });
+
+  it('a retrying arm keeps retrying after the abort, as Mastra never checks between retries', async () => {
+    const ac = new AbortController();
+    const runner = new RecordingRunner({
+      a: (input, call) => {
+        if (call.attempt === 0) { ac.abort(); return { status: 'failed', error: 'first' }; }
+        return tag('a')(input);
+      },
+    });
+
+    const { outcome, stepResults } = await runWorkflowDetailed(
+      compile(wf(fan('fan', [step('a', { retries: 2 }), step('b')]))),
+      'x',
+      { runner, signal: ac.signal },
+    );
+
+    expect(runner.attempts.filter((a) => a.stepId === 'a').map((a) => a.attempt)).toEqual([0, 1]);
+    expect(stepResults.get('a')).toMatchObject({ status: 'success', output: 'x/a' });
+    expect(outcome).toStrictEqual({ status: 'canceled' });
+  });
+
+  it('a signal that never fires changes nothing, and the run does not hang', async () => {
+    const signal = new AbortController().signal;
+    const opts = (runner: RecordingRunner) => ({ runner, signal, timeoutMs: 5_000 });
+
+    expect(await runWorkflow(compile(wf(fan('fan', three), step('after'))), 'x', opts(new RecordingRunner({
+      a: tag('a'), b: tag('b'), c: tag('c'), after: (input) => ok({ saw: input }),
+    })))).toStrictEqual({ status: 'success', output: { saw: { a: 'x/a', b: 'x/b', c: 'x/c' } } });
+
+    expect(await runWorkflow(compile(wf(fan('fan', three))), 'x', opts(new RecordingRunner({
+      b: () => ({ status: 'failed', error: 'b!' }),
+    })))).toStrictEqual({ status: 'failed', stepId: 'b', path: [0, 1], error: 'b!' });
+
+    expect(await runWorkflow(compile(wf(fan('fan', three))), 'x', opts(new RecordingRunner({
+      c: () => ({ status: 'suspended', suspendPayload: 'pc' }),
+    })))).toStrictEqual({ status: 'suspended', stepId: 'c', path: [0, 2], payload: 'pc' });
+
+    expect(await runWorkflow(compile(wf(fan('fan', []))), 'x', opts(new RecordingRunner())))
+      .toStrictEqual({ status: 'success', output: {} });
+  });
+});
+
+describe('parallel: removing a cancellation safeguard breaks a run', () => {
+  const dropInhibitor = (role: 'fork' | 'empty'): Gadget => mutate(role, (t) => {
+    const b = Transition.builder(t.name).inputs(...t.inputSpecs).timing(t.timing).priority(t.priority).action(t.action);
+    if (t.outputSpec !== null) b.outputs(t.outputSpec);
+    return b.build();
+  });
+  const dropSweep: Gadget = (entry, next, ctx) => {
+    const result = parallelGadget(entry, next, ctx);
+    const transitions = result.transitions.filter((t) => !t.name.endsWith('.cancel'));
+    expect(transitions).toHaveLength(result.transitions.length - 1);
+    return { ...result, transitions };
+  };
+  const abortingBefore = () => {
+    const ac = new AbortController();
+    const runner = new RecordingRunner({ before: (input) => { ac.abort(); return ok(input); } });
+    return { runner, signal: ac.signal };
+  };
+  const shape = wf(step('before'), fan('fan', [step('a'), step('b')]), step('after'));
+
+  it('without the fork inhibitor, a block whose start was canceled still runs its arms', async () => {
+    const control = abortingBefore();
+    expect(await runWorkflow(compile(shape), 'x', { ...control, timeoutMs: 5_000 }))
+      .toStrictEqual({ status: 'canceled', origin: { stepId: 'fan', path: [1] } });
+    expect(control.runner.calls).toEqual(['before']);
+
+    const mutated = abortingBefore();
+    await runWorkflow(compile(shape, { gadgets: { parallel: dropInhibitor('fork') } }), 'x', { ...mutated, timeoutMs: 5_000 });
+    expect(mutated.runner.calls.slice(1).sort()).toEqual(['a', 'b']);
+  });
+
+  it('without the sweep, the canceled block\'s input is stranded and no terminal is reached', async () => {
+    const mutated = abortingBefore();
+    // With a signal the executor ends only when a terminal is marked, so a stranded input runs
+    // out the harness budget — the run rejects instead of classifying.
+    await expect(
+      runWorkflow(compile(shape, { gadgets: { parallel: dropSweep } }), 'x', { ...mutated, timeoutMs: 300 }),
+    ).rejects.toThrow();
+    expect(mutated.runner.calls).toEqual(['before']);
   });
 });

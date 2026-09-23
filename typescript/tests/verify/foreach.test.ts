@@ -1,3 +1,4 @@
+import { appendFileSync } from 'node:fs';
 import { describe, it, type ExpectStatic } from 'vitest';
 import { Transition, and, xor, type Out, type Place } from 'libpetri';
 import {
@@ -11,27 +12,37 @@ import {
 } from 'libpetri/verification';
 import { compile, type Gadget } from '../../src/compiler/index.js';
 import { foreachGadget } from '../../src/compiler/gadgets/foreach.js';
-import { verifyWorkflow, describeReport } from '../../src/verify/index.js';
+import {
+  cancelStructureViolations,
+  describeReport,
+  verifyWorkflow,
+  type PropertyReport,
+  type Segment,
+} from '../../src/verify/index.js';
 import type { CompiledWorkflow, EntryDescription, StepDescription } from '../../src/compiler/types.js';
 
 /**
  * `.foreach`, proved.
  *
  * **What every proof here is about.** The initial marking is one token in the workflow's entry
- * place; there are no environment places; the route is the SMT (IC3/PDR) route with semiflow
- * invariants on; all five workflow terminals are declared sinks. The encoding is untimed and
- * value-blind, so `start.l`'s "more items" / "last item" choice is free: **one proof covers every
- * item count at once**, including the empty array (`split`'s second branch) and a non-array
- * (its third). The `(items, concurrency)` shapes below therefore vary only in concurrency and in
- * what surrounds the foreach.
+ * place; the route is whichever `verifyWorkflow` takes (SMT for every foreach shape measured —
+ * the per-lane copies put it past enumeration), recorded beside each figure; semiflow invariants
+ * on; all six workflow terminals and the cancel place are declared sinks. Two segments on the one
+ * closed net: **closed** (the cancel request place empty — a run nobody cancels) and **cancel**
+ * (the request place seeded with one token, so the arrival may fire at every reachable point, from
+ * before `split` to after the terminal). `verifyWorkflow` runs both by default and runs
+ * `cancelStructureViolations` first. The encoding is untimed and value-blind, so `start.l`'s "more
+ * items" / "last item" choice is free: **one proof covers every item count at once**, including
+ * the empty array (`split`'s second branch) and a non-array (its third). The shapes below therefore
+ * vary only in concurrency and in what surrounds the foreach.
  *
  * `proven` is compared by string. `isViolated()` is false for `unknown` too, so a "not violated"
- * assertion would keep passing once a query started timing out.
+ * assertion would keep passing once a query started timing out. `unknown` fails, everywhere.
  *
- * **The nested 2x2 limit is gone, not fixed.** The previous suite held a foreach-in-a-foreach to
- * 1x1 because Z3 returned `unknown` on `DeadlockFree` at 2x2. A foreach body is now a single step
- * (Mastra's `SingleStepEntry`), so that net can no longer be compiled — the gadget refuses it, see
- * `tests/compiler/foreach.test.ts` — and nothing here needs to prove it.
+ * **Cost.** foreach stays on SMT; `closed/deadlockFree` is the expensive query (tens of seconds at
+ * two lanes, minutes at three). One and two lanes run in the default suite; three and more run
+ * only in the slow lane below (`SLOW_PROOFS=1`, 600s per query). Set `PROOF_LOG` to a file to
+ * record every figure with its route.
  */
 
 const body = (extra: Omit<StepDescription, 'kind' | 'id'> = {}): StepDescription => ({ kind: 'step', id: 'body', ...extra });
@@ -46,28 +57,81 @@ function build(entries: readonly EntryDescription[], gadget?: Gadget): CompiledW
   return compile({ id: 'batch', entries }, gadget ? { gadgets: { foreach: gadget } } : {});
 }
 
-async function prove(expect: ExpectStatic, compiled: CompiledWorkflow): Promise<void> {
-  const reports = await verifyWorkflow(compiled, { timeoutMs: 120_000 });
-  expect(reports.map((r) => r.property)).toEqual(['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal']);
-  for (const report of reports) {
-    expect(report.result.verdict.type, describeReport(report)).toBe('proven');
-  }
+/** Every property of both segments, in the order `verifyWorkflow` runs them. */
+const BOTH = [
+  'closed/deadlockFree',
+  'closed/terminatesAtSink',
+  'closed/exactlyOneTerminal',
+  'closed/neverCanceled',
+  'cancel/deadlockFree',
+  'cancel/terminatesAtSink',
+  'cancel/exactlyOneTerminal',
+];
+const keyOf = (r: PropertyReport): string => `${r.segment}/${r.property}`;
+
+/** Appends a line to the file `PROOF_LOG` names, when it names one — the route-and-ms record. */
+const proofLog = (line: string): void => {
+  const file = process.env['PROOF_LOG'];
+  if (file) appendFileSync(file, `${line}\n`);
+};
+
+/**
+ * `verifyWorkflow`'s default — the structural check, then both segments — with every property
+ * `proven`. Logs each report's route and time under `label`.
+ */
+async function prove(
+  expect: ExpectStatic,
+  label: string,
+  compiled: CompiledWorkflow,
+  timeoutMs = 300_000,
+): Promise<readonly PropertyReport[]> {
+  const reports = await verifyWorkflow(compiled, { timeoutMs });
+  proofLog(`[${label}] ${reports.map(describeReport).join('; ')}`);
+  expect(reports.map(keyOf)).toEqual(BOTH);
+  for (const report of reports) expect(report.result.verdict.type, `${label}: ${describeReport(report)}`).toBe('proven');
+  return reports;
 }
 
-/** One property, under exactly the hypotheses `verifyWorkflow` uses. */
-function check(compiled: CompiledWorkflow, property: SmtProperty): Promise<SmtVerificationResult> {
+/** Each verdict by `segment/property`, for a mutant whose verdicts are expected to flip. */
+async function verdicts(label: string, compiled: CompiledWorkflow, timeoutMs = 300_000): Promise<Record<string, string>> {
+  const reports = await verifyWorkflow(compiled, { timeoutMs });
+  proofLog(`[${label}] ${reports.map(describeReport).join('; ')}`);
+  return Object.fromEntries(reports.map((r) => [keyOf(r), r.result.verdict.type]));
+}
+
+/**
+ * One property, under exactly the hypotheses `verifyWorkflow` uses — every terminal and the cancel
+ * place are sinks, and in the `cancel` segment the request place is seeded with one token.
+ */
+function check(
+  compiled: CompiledWorkflow,
+  property: SmtProperty,
+  segment: Segment = 'closed',
+  timeoutMs = 120_000,
+): Promise<SmtVerificationResult> {
   const { terminals } = compiled;
   return SmtVerifier.forNet(compiled.net)
-    .initialMarking((m) => m.tokens(compiled.entryPlace, 1))
-    .sinkPlaces(terminals.done, terminals.failed, terminals.bailed, terminals.suspended, terminals.paused)
+    .initialMarking((m) => {
+      m.tokens(compiled.entryPlace, 1);
+      if (segment === 'cancel') m.tokens(compiled.cancelRequest, 1);
+    })
+    .sinkPlaces(
+      terminals.done,
+      terminals.failed,
+      terminals.bailed,
+      terminals.suspended,
+      terminals.paused,
+      terminals.canceled,
+      compiled.cancel,
+    )
     .semiflowInvariants(true)
-    .timeout(120_000)
+    .timeout(timeoutMs)
     .property(property)
     .verify();
 }
 
 const verdict = (r: SmtVerificationResult): string =>
-  `${r.verdict.type} via ${r.route}${r.verdict.type === 'unknown' ? ` (${r.verdict.reason})` : ''}`;
+  `${r.verdict.type} via ${r.route} in ${r.elapsedMs}ms${r.verdict.type === 'unknown' ? ` (${r.verdict.reason})` : ''}`;
 
 function placeNamed(compiled: CompiledWorkflow, name: string): Place<unknown> {
   const found = [...compiled.net.places].find((p) => p.name === name);
@@ -86,6 +150,7 @@ interface Mutation {
   readonly dropInhibitor?: RegExp;
   readonly dropReset?: RegExp;
   readonly dropInput?: RegExp;
+  readonly dropRead?: RegExp;
   /** Removes matching places from every `and` in the output spec. */
   readonly dropOutput?: RegExp;
 }
@@ -109,7 +174,7 @@ function rebuild(t: Transition, m: Mutation): Transition {
     .priority(t.priority)
     .action(t.action);
   for (const arc of t.inhibitors) if (!(m.dropInhibitor?.test(arc.place.name) ?? false)) b.inhibitor(arc.place);
-  for (const arc of t.reads) b.read(arc.place);
+  for (const arc of t.reads) if (!(m.dropRead?.test(arc.place.name) ?? false)) b.read(arc.place);
   for (const arc of t.resets) if (!(m.dropReset?.test(arc.place.name) ?? false)) b.reset(arc.place);
   return b.build();
 }
@@ -130,28 +195,50 @@ function mutated(m: Mutation): Gadget {
 
 // ===========================================================================================
 
-/** Per-test budget: each query's own solver budget is 120s, and a test runs up to six of them. */
-const SLOW = { timeout: 300_000 } as const;
+/** Per-test budget: each query's own solver budget is at most 300s, and a test runs up to seven. */
+const SLOW = { timeout: 1_800_000 } as const;
+
+/** The slow lane: three lanes and more, 600s per query. Opt in with `SLOW_PROOFS=1`. */
+const SLOW_LANE = process.env['SLOW_PROOFS'] === '1';
 
 /**
  * Every query spawns its own Z3 process and no test shares state, so the blocks run concurrently;
  * assertions therefore use the test's own `expect`.
  */
-describe.concurrent('compiled foreach, proved', () => {
-  it.for([1, 2, 3])('is deadlock-free and terminates at a sink with %i lane(s)', SLOW, async (lanes, { expect }) => {
-    await prove(expect, build([foreach(lanes)]));
+describe.concurrent('compiled foreach, proved (both segments)', () => {
+  it.for([1, 2])('is deadlock-free, never canceled unasked, and ends in exactly one terminal with %i lane(s)', SLOW, async (lanes, { expect }) => {
+    await prove(expect, `foreach(c=${lanes})`, build([foreach(lanes)]));
   });
 
-  it('stays provable when the foreach is neither first nor last', async ({ expect }) => {
+  it('stays provable when the foreach is neither first nor last', SLOW, async ({ expect }) => {
     // `next` is then another entry's input rather than `wf.done`, so `join` and `split`'s
-    // no-items branch deposit into live structure.
-    await prove(expect, build([{ kind: 'step', id: 'before' }, foreach(2), { kind: 'step', id: 'after' }]));
-  }, SLOW.timeout);
+    // no-items branch deposit into live structure — and, under cancel, into its sweep.
+    await prove(expect, '[before, foreach(c=2), after]', build([{ kind: 'step', id: 'before' }, foreach(2), { kind: 'step', id: 'after' }]));
+  });
 
-  it('stays provable when the body retries with a delay', async ({ expect }) => {
-    // The leaf's unrolled retries sit inside each lane, between `start.l` and the settles.
-    await prove(expect, build([foreach(2, body({ retries: 1, retryDelayMs: 10 }))]));
-  }, SLOW.timeout);
+  it('stays provable when the body retries with a delay', SLOW, async ({ expect }) => {
+    // The leaf's unrolled retries sit inside each lane, between `start.l` and the settles, and are
+    // not gated: a cancel landing mid-retry must still let the lane come home.
+    await prove(expect, 'foreach(c=2, body retries=1 delay=10)', build([foreach(2, body({ retries: 1, retryDelayMs: 10 }))]));
+  });
+});
+
+describe.runIf(SLOW_LANE).concurrent('SLOW LANE (SLOW_PROOFS=1): compiled foreach with three lanes, 600s per query', () => {
+  const BUDGET = { timeout: 7 * 600_000 + 60_000 } as const;
+
+  it('is deadlock-free, never canceled unasked, and ends in exactly one terminal with 3 lanes', BUDGET, async ({ expect }) => {
+    await prove(expect, 'foreach(c=3)', build([foreach(3)]), 600_000);
+  });
+
+  it('never holds the cursor beside a recorded outcome with 3 lanes', BUDGET, async ({ expect }) => {
+    const compiled = build([foreach(3)]);
+    const cursor = placeNamed(compiled, 's.0.items.cursor');
+    for (const record of ['faults', 'exits', 'suspensions']) {
+      const r = await check(compiled, mutualExclusion(cursor, placeNamed(compiled, `s.0.items.${record}`)), 'closed', 600_000);
+      proofLog(`[foreach(c=3) closed mutualExclusion(cursor, ${record})] ${verdict(r)}`);
+      expect(r.verdict.type, `cursor vs ${record}: ${verdict(r)}`).toBe('proven');
+    }
+  });
 });
 
 describe.concurrent('compiled foreach: dispatch stops at the first non-success item', () => {
@@ -165,12 +252,15 @@ describe.concurrent('compiled foreach: dispatch stops at the first non-success i
    * marking cannot say which of two firings came first). It is shown structurally and by an
    * executor test in `tests/compiler/foreach.test.ts`.
    */
-  it.for([2, 3])('never holds the cursor beside a recorded outcome with %i lanes', SLOW, async (lanes, { expect }) => {
-    const compiled = build([foreach(lanes)]);
+  it.for<Segment>(['closed', 'cancel'])('never holds the cursor beside a recorded outcome with 2 lanes (%s)', SLOW, async (segment, { expect }) => {
+    // Under cancel, `refuse.l` or a cancel finisher removes the cursor; neither may reopen the
+    // window in which an item starts beside a recorded outcome.
+    const compiled = build([foreach(2)]);
     const cursor = placeNamed(compiled, 's.0.items.cursor');
     for (const record of ['faults', 'exits', 'suspensions']) {
-      const r = await check(compiled, mutualExclusion(cursor, placeNamed(compiled, `s.0.items.${record}`)));
-      expect(r.verdict.type, `cursor vs ${record}: ${verdict(r)}`).toBe('proven');
+      const r = await check(compiled, mutualExclusion(cursor, placeNamed(compiled, `s.0.items.${record}`)), segment, 300_000);
+      proofLog(`[foreach(c=2) ${segment} mutualExclusion(cursor, ${record})] ${verdict(r)}`);
+      expect(r.verdict.type, `${segment}: cursor vs ${record}: ${verdict(r)}`).toBe('proven');
     }
   });
 
@@ -252,7 +342,9 @@ describe.concurrent('compiled foreach: each safeguard is load-bearing (mutated c
     ['a failure is decided under a running item', { transition: /\.items\.fail$/, dropInput: /permit/ }],
     ['a settle does not give the lane back', { transition: /\.lane\d+\.fail$/, dropOutput: /permit/ }],
   ])('DeadlockFree is violated when %s', SLOW, async ([, mutation], { expect }) => {
-    const r = await check(build([foreach(2)], mutated(mutation)), deadlockFree());
+    // 300s: the suspension-vs-bail rows take 70-100s alone and time out at 120s when the suite's
+    // solvers run side by side. A counterexample is found or the test fails; `unknown` is no pass.
+    const r = await check(build([foreach(2)], mutated(mutation)), deadlockFree(), 'closed', 300_000);
     expect(r.verdict.type, verdict(r)).toBe('violated');
   });
 
@@ -262,4 +354,129 @@ describe.concurrent('compiled foreach: each safeguard is load-bearing (mutated c
     const r = await check(build([foreach(2)], mutated({ transition: /\.lane\d+\.fail$/, dropOutput: /permit/ })), terminatesAtSink());
     expect(r.verdict.type, verdict(r)).toBe('violated');
   }, SLOW.timeout);
+});
+
+/**
+ * The cancellation safeguards the *proofs* see, each removed once: invisible to the closed segment
+ * — without a cancel none of these arcs is consulted — and flipping the cancel segment. The
+ * structural check passes on each (none of them is an inhibitor on the signal), so these go
+ * through `verifyWorkflow`'s default unchanged.
+ */
+describe.concurrent('compiled foreach: each cancellation safeguard is load-bearing (mutated copies, 1 lane)', () => {
+  const closedProven = {
+    'closed/deadlockFree': 'proven',
+    'closed/terminatesAtSink': 'proven',
+    'closed/exactlyOneTerminal': 'proven',
+    'closed/neverCanceled': 'proven',
+  };
+
+  it('without the sweep on its input, a cancel before split strands the input', SLOW, async ({ expect }) => {
+    const noSweep: Gadget = (entry, next, ctx) => {
+      const r = foreachGadget(entry, next, ctx);
+      const kept = r.transitions.filter((t) => !/\.items\.cancel$/.test(t.name));
+      if (kept.length !== r.transitions.length - 1) throw new Error('the sweep was not found — the check would be vacuous');
+      return { ...r, transitions: kept };
+    };
+    const compiled = build([foreach(1)], noSweep);
+    expect(cancelStructureViolations(compiled)).toEqual([]);
+    const v = await verdicts('MUTANT c=1 no sweep', compiled);
+    expect(v).toMatchObject(closedProven);
+    expect(v).toMatchObject({ 'cancel/deadlockFree': 'violated', 'cancel/exactlyOneTerminal': 'violated' });
+  });
+
+  it.for<[string, Mutation]>([
+    ['the cancel finishers leave the queued tail behind', { transition: /\.items\.canceled(-empty)?$/, dropReset: /cursor/ }],
+    ['the cancel finishers leave a recorded failure behind', { transition: /\.items\.canceled(-empty)?$/, dropReset: /faults/ }],
+    ['the cancel finishers leave a recorded bail or pause behind', { transition: /\.items\.canceled(-empty)?$/, dropReset: /exits/ }],
+    ['the cancel finishers leave a recorded suspension behind', { transition: /\.items\.canceled(-empty)?$/, dropReset: /suspensions/ }],
+    ['the empty cancel finisher fires beside results', { transition: /\.items\.canceled-empty$/, dropInhibitor: /results/ }],
+    ['a cancel finisher fires under a running item', { transition: /\.items\.canceled$/, dropInput: /permit/ }],
+  ])('closed segment proven, cancel segment violated, when %s', SLOW, async ([label, mutation], { expect }) => {
+    const compiled = build([foreach(1)], mutated(mutation));
+    expect(cancelStructureViolations(compiled)).toEqual([]);
+    const v = await verdicts(`MUTANT c=1 ${label}`, compiled);
+    expect(v).toMatchObject(closedProven);
+    expect(v).toMatchObject({ 'cancel/deadlockFree': 'violated' });
+  });
+
+  /**
+   * The finishers' read arc on the signal. Without it the net still drains to exactly one terminal
+   * in both segments — the deadlock and terminal proofs stay green, and at run time the executor's
+   * declaration-order tie-break hides it — but a run nobody canceled can end in `wf.canceled`.
+   * `closed/neverCanceled` is the property that sees it; the arc-level check does not, because a
+   * transition that neither reads nor inhibits the signal is not a sweep.
+   */
+  it('without the cancel finishers\' read arc, closed/neverCanceled is violated and nothing else is', SLOW, async ({ expect }) => {
+    const compiled = build([foreach(1)], mutated({ transition: /\.items\.canceled(-empty)?$/, dropRead: /^wf\.cancel$/ }));
+    expect(cancelStructureViolations(compiled)).toEqual([]);
+    const v = await verdicts('MUTANT c=1 cancel finishers without read(cancel)', compiled);
+    expect(v).toEqual({
+      'closed/deadlockFree': 'proven',
+      'closed/terminatesAtSink': 'proven',
+      'closed/exactlyOneTerminal': 'proven',
+      'closed/neverCanceled': 'violated',
+      'cancel/deadlockFree': 'proven',
+      'cancel/terminatesAtSink': 'proven',
+      'cancel/exactlyOneTerminal': 'proven',
+    });
+  });
+});
+
+/**
+ * The inhibitors on the signal, which no quiescence property can see: each only stops work Mastra
+ * would not start, and the run still drains to one terminal. Each is checked from the arcs — it is
+ * what `cancelStructureViolations` exists for — and each has a run-level flip in
+ * `tests/compiler/foreach.test.ts`. Only the inhibitor on `wf.cancel` is removed; every other arc
+ * stays.
+ */
+describe('compiled foreach: every inhibitor on the signal has structural teeth', () => {
+  const stripSignal = (transition: RegExp): Gadget => (entry, next, ctx) => {
+    const r = foreachGadget(entry, next, ctx);
+    let touched = 0;
+    const transitions = r.transitions.map((t) => {
+      if (!transition.test(t.name)) return t;
+      touched++;
+      const b = Transition.builder(t.name).inputs(...t.inputSpecs).outputs(t.outputSpec!).action(t.action).timing(t.timing);
+      for (const a of t.inhibitors) if (a.place.name !== ctx.cancel?.name) b.inhibitor(a.place);
+      for (const a of t.reads) b.read(a.place);
+      for (const a of t.resets) b.reset(a.place);
+      return b.build();
+    });
+    if (touched === 0) throw new Error(`${String(transition)} matched no transition — the check would be vacuous`);
+    return { ...r, transitions };
+  };
+
+  const lanes = 2;
+  const permits = (): string => [0, 1].map((l) => `s.0.items.lane${l}.permit`).join(', ');
+  const competes = (name: string, sweep: string, inputs: string): string =>
+    `'${name}' competes with sweep '${sweep}' for [${inputs}] without an inhibitor on 'wf.cancel'`;
+
+  it('the real gadget is structurally sound, and every one of these transitions carries the inhibitor', () => {
+    const real = build([foreach(lanes)]);
+    expect(cancelStructureViolations(real)).toEqual([]);
+    for (const name of ['split', 'lane0.start', 'lane1.start', 'join', 'fail', 'exit', 'suspend']) {
+      const t = [...real.net.transitions].find((x) => x.name === `t.0.items.${name}`);
+      expect(t?.inhibitors.map((a) => a.place.name), name).toContain('wf.cancel');
+    }
+  });
+
+  it.each<[string, RegExp, readonly string[]]>([
+    ['split', /\.items\.split$/, [competes('t.0.items.split', 't.0.items.cancel', 's.0.items.in')]],
+    [
+      'lane.start (dispatch)',
+      /\.lane\d+\.start$/,
+      [0, 1].map((l) => competes(`t.0.items.lane${l}.start`, `t.0.items.lane${l}.refuse`, `s.0.items.cursor, s.0.items.lane${l}.permit`)),
+    ],
+    ['join', /\.items\.join$/, [
+      competes('t.0.items.join', 't.0.items.canceled', `s.0.items.results, s.0.items.frame, ${permits()}`),
+      competes('t.0.items.join', 't.0.items.canceled-empty', `s.0.items.frame, ${permits()}`),
+    ]],
+    ['fail', /\.items\.fail$/, [competes('t.0.items.fail', 't.0.items.canceled-empty', `s.0.items.frame, ${permits()}`)]],
+    ['exit', /\.items\.exit$/, [competes('t.0.items.exit', 't.0.items.canceled-empty', `s.0.items.frame, ${permits()}`)]],
+    ['suspend', /\.items\.suspend$/, [competes('t.0.items.suspend', 't.0.items.canceled-empty', `s.0.items.frame, ${permits()}`)]],
+  ])('%s without its inhibitor on the signal: the structural check names it, and the proof refuses the net', async (_role, transition, expected) => {
+    const mutant = build([foreach(lanes)], stripSignal(transition));
+    expect([...cancelStructureViolations(mutant)].sort()).toEqual([...expected].sort());
+    await expect(verifyWorkflow(mutant, { timeoutMs: 1_000 })).rejects.toThrow('cancellation structure is unsound');
+  });
 });

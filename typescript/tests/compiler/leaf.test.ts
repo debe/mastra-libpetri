@@ -1,20 +1,24 @@
 import { describe, expect, it } from 'vitest';
-import { Transition, one, outPlace, place, xor } from 'libpetri';
+import { Transition, one, outPlace, place, xor, type Place } from 'libpetri';
 import {
   compile,
   MAX_NET_PLACES, MAX_RETRIES, MAX_WAIT_MS,
   stepAction,
+  sleepGadget,
   stepGadget,
   type Gadget,
 } from '../../src/compiler/index.js';
 import { runWorkflow, runWorkflowDetailed } from '../../src/engine/index.js';
-import { describeReport, verifyWorkflow, type PropertyReport } from '../../src/verify/index.js';
+import { cancelStructureViolations, describeReport, verifyWorkflow, type PropertyReport } from '../../src/verify/index.js';
 import type {
   EntryDescription,
+  Exits,
   FlowToken,
   RunView,
+  StepCall,
   StepDescription,
   StepOutcome,
+  StepRecord,
   SuspendToken,
   WorkflowDescription,
 } from '../../src/compiler/types.js';
@@ -83,24 +87,55 @@ function firstAt(log: readonly Stamp[], id: string): number | undefined {
 }
 
 /** A failure outcome whose error is an `Error` with a message matching `message`. */
-function failedWith(stepId: string, message: RegExp): unknown {
+function failedWith(stepId: string, message: RegExp, path: readonly number[] = [0]): unknown {
   return {
     status: 'failed',
     stepId,
+    path,
     error: expect.objectContaining({ message: expect.stringMatching(message) }),
   };
 }
 
-function expectBothProven(reports: readonly PropertyReport[]): void {
-  expect(reports.map((r) => r.property)).toEqual(['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal']);
+/** Every report `verifyWorkflow` returns by default, in order: both segments on one closed net. */
+const ALL_REPORTS = [
+  'closed/deadlockFree',
+  'closed/terminatesAtSink',
+  'closed/exactlyOneTerminal',
+  'closed/neverCanceled',
+  'cancel/deadlockFree',
+  'cancel/terminatesAtSink',
+  'cancel/exactlyOneTerminal',
+];
+
+function expectAllProven(reports: readonly PropertyReport[]): void {
+  expect(reports.map((r) => `${r.segment}/${r.property}`)).toEqual(ALL_REPORTS);
   for (const report of reports) {
     // `proven`, explicitly: `isViolated()` is false for `unknown` too.
     expect(report.result.verdict.type, describeReport(report)).toBe('proven');
   }
 }
 
-function verdictOf(reports: readonly PropertyReport[], property: string): string | undefined {
-  return reports.find((r) => r.property === property)?.result.verdict.type;
+/**
+ * Proves the default property set: the structural cancel check first (it throws on a violation),
+ * then the closed segment (no cancel request: `deadlockFree`, `terminatesAtSink`,
+ * `exactlyOneTerminal`, `neverCanceled`) and the cancel segment (one request seeded, so the arrival
+ * lands at every reachable point: the first three). All seven must be `proven`.
+ */
+async function expectProvenBothSegments(description: WorkflowDescription): Promise<void> {
+  expectAllProven(await verifyWorkflow(compile(description)));
+}
+
+/**
+ * A step's record as the store holds it (`StepRecord`): the outcome, the input it received as
+ * `payload`, and timestamps on the run's clock. `toEqual`, not `toMatchObject`, so a field the
+ * record should not carry still fails the assertion.
+ */
+function rec(fields: Record<string, unknown>, extra: Record<string, unknown> = {}): unknown {
+  return { ...fields, startedAt: expect.any(Number), endedAt: expect.any(Number), ...extra };
+}
+
+function verdictOf(reports: readonly PropertyReport[], property: string, segment = 'closed'): string | undefined {
+  return reports.find((r) => r.property === property && r.segment === segment)?.result.verdict.type;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -121,7 +156,7 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
       { stepId: 'charge', attempt: 2 },
     ]);
     // The run reports the LAST attempt's error.
-    expect(outcome).toEqual({ status: 'failed', stepId: 'charge', error: errors[2] });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'charge', path: [0], error: errors[2] });
   });
 
   it('stops retrying at the first success and hands every attempt the same input', async () => {
@@ -204,8 +239,8 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
     );
 
     expect(runner.calls).toEqual(['charge']);
-    expect(outcome).toEqual({ status: 'failed', stepId: 'charge', error: fatal });
-    expect(stepResults.get('charge')).toEqual({ status: 'failed', error: fatal, nonRetryable: true });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'charge', path: [0], error: fatal });
+    expect(stepResults.get('charge')).toEqual(rec({ status: 'failed', error: fatal, nonRetryable: true, payload: 'order' }));
   });
 
   it('honours nonRetryable on a later attempt, after ordinary failures were retried', async () => {
@@ -221,7 +256,7 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
     const outcome = await runWorkflow(compile(wf(step('charge', { retries: 4 }))), 'order', { runner });
 
     expect(runner.attempts.map((a) => a.attempt)).toEqual([0, 1]);
-    expect(outcome).toEqual({ status: 'failed', stepId: 'charge', error: 'permanent' });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'charge', path: [0], error: 'permanent' });
   });
 
   it('retries a TripWire like any error, and ends the run as tripwire when the last attempt carries one', async () => {
@@ -243,6 +278,7 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
     expect(outcome).toEqual({
       status: 'tripwire',
       stepId: 'guard',
+      path: [0],
       tripwire: { reason: 'blocked 2', processorId: 'moderation' },
     });
   });
@@ -275,7 +311,7 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
     const outcome = await runWorkflow(compile(wf(step('guard', { retries: 1 }))), 'q', { runner });
 
     // Only the final `e` is inspected for `instanceof TripWire` (`default.ts:498-506`).
-    expect(outcome).toEqual({ status: 'failed', stepId: 'guard', error: 'plain' });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'guard', path: [0], error: 'plain' });
   });
 
   it.each([
@@ -286,7 +322,7 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
     ],
     [
       'suspended',
-      { status: 'suspended', payload: { ask: 'approve' } },
+      { status: 'suspended', suspendPayload: { ask: 'approve' } },
       { status: 'suspended', stepId: 'charge', path: [0], payload: { ask: 'approve' } },
     ],
     ['paused', { status: 'paused' }, { status: 'paused', stepId: 'charge', path: [0] }],
@@ -302,7 +338,7 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
   });
 
   it('records only the final attempt in stepResults, never an intermediate failure', async () => {
-    const seenOwnResult: (StepOutcome | undefined)[] = [];
+    const seenOwnResult: (StepRecord | undefined)[] = [];
     const runner = new RecordingRunner({
       steps: {
         charge: (_input, call) => {
@@ -324,7 +360,7 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
     // `stepResults[id] = execResults` runs once, after the retry loop (`handlers/entry.ts:810`),
     // so no attempt ever sees an earlier attempt's failure recorded under its own id.
     expect(seenOwnResult).toEqual([undefined, undefined, undefined]);
-    expect([...stepResults]).toEqual([['charge', { status: 'success', output: 'ok' }]]);
+    expect([...stepResults]).toEqual([['charge', rec({ status: 'success', output: 'ok', payload: 'order' })]]);
   });
 
   it('records the final failure, not the first, when every attempt fails', async () => {
@@ -334,7 +370,7 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
 
     const { stepResults } = await runWorkflowDetailed(compile(wf(step('charge', { retries: 2 }))), 'o', { runner });
 
-    expect(stepResults.get('charge')).toEqual({ status: 'failed', error: 'e2' });
+    expect(stepResults.get('charge')).toEqual(rec({ status: 'failed', error: 'e2', payload: 'o' }));
   });
 
   it('retries a throwing runner, as Mastra retries a throwing execute', async () => {
@@ -353,31 +389,74 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
     expect(outcome).toEqual({ status: 'success', output: 'order' });
   });
 
-  it('emits exactly one transition and no retry places for retries: 0', () => {
+  it('emits one run transition, its cancel sweep, and no retry places for retries: 0', () => {
     const explicitZero = compile(wf(step('charge', { retries: 0 })));
     const absent = compile(wf(step('charge')));
 
-    expect([...explicitZero.net.transitions].map((t) => t.name)).toEqual(['t.0.charge.run']);
+    const own = [...explicitZero.net.transitions].filter((t) => explicitZero.netMap.transitionToEntry.has(t.name));
+    expect(own.map((t) => t.name).sort()).toEqual(['t.0.charge.cancel', 't.0.charge.run']);
     const placeNames = [...explicitZero.net.places].map((p) => p.name).sort();
-    expect(placeNames).toEqual(['s.0.charge.in', 'wf.bailed', 'wf.done', 'wf.failed', 'wf.paused', 'wf.suspended']);
-    // The run transition has exactly the five outcome branches and no retry branch.
-    const run = [...explicitZero.net.transitions][0]!;
-    expect([...run.outputPlaces()].map((p) => p.name).sort()).toEqual([
+    expect(placeNames).toEqual([
+      's.0.charge.in',
       'wf.bailed',
+      'wf.cancel',
+      'wf.cancel.request',
+      'wf.canceled',
       'wf.done',
       'wf.failed',
       'wf.paused',
+      'wf.settle.bailed',
+      'wf.settle.done',
+      'wf.settle.failed',
+      'wf.settle.paused',
+      'wf.settle.suspended',
       'wf.suspended',
+    ]);
+    // The run transition has exactly the five outcome branches — each into the settle stage, where
+    // the after-entry abort check lives — and no retry branch and no canceled branch: a step that
+    // ran reports what it did, and only the settle stage re-stamps it.
+    const run = own.find((t) => t.name === 't.0.charge.run')!;
+    expect([...run.outputPlaces()].map((p) => p.name).sort()).toEqual([
+      'wf.settle.bailed',
+      'wf.settle.done',
+      'wf.settle.failed',
+      'wf.settle.paused',
+      'wf.settle.suspended',
     ]);
     // An explicit 0 and an absent value are the same net.
     expect(explicitZero.structuralHash).toBe(absent.structuralHash);
+  });
+
+  it('gates the first attempt on the cancel place, sweeps the waiting input, and leaves retries ungated', () => {
+    const compiled = compile(wf(step('charge', { retries: 2, retryDelayMs: 250 })));
+    const byName = new Map([...compiled.net.transitions].map((t) => [t.name, t]));
+    const inhibitors = (name: string) => byName.get(name)!.inhibitors.map((a) => a.place.name);
+    const reads = (name: string) => byName.get(name)!.reads.map((a) => a.place.name);
+
+    // Mastra checks the signal before a top-level entry (`default.ts:815`) ...
+    expect(inhibitors('t.0.charge.run')).toEqual(['wf.cancel']);
+    // ... and never between attempts (`default.ts:455-460`): no retry and no later run is gated.
+    for (const name of ['t.0.charge.retry-1', 't.0.charge.run-1', 't.0.charge.retry-2', 't.0.charge.run-2']) {
+      expect(inhibitors(name), name).toEqual([]);
+      expect(reads(name), name).toEqual([]);
+    }
+    // The sweep reads the signal, consumes the waiting input, and writes only the canceled exit.
+    const sweep = byName.get('t.0.charge.cancel')!;
+    expect(reads('t.0.charge.cancel')).toEqual(['wf.cancel']);
+    expect([...sweep.inputPlaces()].map((p) => p.name)).toEqual(['s.0.charge.in']);
+    expect([...sweep.outputPlaces()].map((p) => p.name)).toEqual(['wf.canceled']);
+    // Nothing consumes the signal: it stays marked once injected.
+    for (const t of compiled.net.transitions) {
+      expect([...t.inputPlaces()].map((p) => p.name), t.name).not.toContain('wf.cancel');
+    }
   });
 
   it('unrolls retries into one run transition per attempt, the last without a retry branch', () => {
     const compiled = compile(wf(step('charge', { retries: 2, retryDelayMs: 250 })));
     const byName = new Map([...compiled.net.transitions].map((t) => [t.name, t]));
 
-    expect([...byName.keys()].sort()).toEqual([
+    expect([...byName.keys()].filter((n) => n.startsWith('t.0.')).sort()).toEqual([
+      't.0.charge.cancel',
       't.0.charge.retry-1',
       't.0.charge.retry-2',
       't.0.charge.run',
@@ -387,14 +466,24 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
     const outputs = (name: string) => [...byName.get(name)!.outputPlaces()].map((p) => p.name).sort();
     expect(outputs('t.0.charge.run')).toContain('s.0.charge.retry-1');
     expect(outputs('t.0.charge.run-1')).toContain('s.0.charge.retry-2');
-    expect(outputs('t.0.charge.run-2')).toEqual(['wf.bailed', 'wf.done', 'wf.failed', 'wf.paused', 'wf.suspended']);
+    expect(outputs('t.0.charge.run-2')).toEqual([
+      'wf.settle.bailed',
+      'wf.settle.done',
+      'wf.settle.failed',
+      'wf.settle.paused',
+      'wf.settle.suspended',
+    ]);
     // The delay sits on the retry arcs only.
     expect(byName.get('t.0.charge.run')!.timing).toEqual({ type: 'immediate' });
     expect(byName.get('t.0.charge.retry-1')!.timing).toEqual({ type: 'delayed', afterMs: 250 });
     expect(byName.get('t.0.charge.retry-2')!.timing).toEqual({ type: 'delayed', afterMs: 250 });
     // Every attempt maps back to the one entry that emitted it.
-    for (const name of byName.keys()) {
+    for (const name of [...byName.keys()].filter((n) => n.startsWith('t.0.'))) {
       expect(compiled.netMap.transitionToEntry.get(name)).toEqual({ path: [0], id: 'charge' });
+    }
+    // The settle stage belongs to the workflow, not to any entry.
+    for (const name of [...byName.keys()].filter((n) => n.startsWith('t.settle.'))) {
+      expect(compiled.netMap.transitionToEntry.has(name), name).toBe(false);
     }
   });
 });
@@ -417,9 +506,9 @@ describe('step outcomes at the top level', () => {
 
     expect(outcome).toEqual({ status: 'success', output: 'x+a+b+c' });
     expect([...stepResults]).toEqual([
-      ['a', { status: 'success', output: 'x+a' }],
-      ['b', { status: 'success', output: 'x+a+b' }],
-      ['c', { status: 'success', output: 'x+a+b+c' }],
+      ['a', rec({ status: 'success', output: 'x+a', payload: 'x' })],
+      ['b', rec({ status: 'success', output: 'x+a+b', payload: 'x+a' })],
+      ['c', rec({ status: 'success', output: 'x+a+b+c', payload: 'x+a+b' })],
     ]);
   });
 
@@ -429,8 +518,8 @@ describe('step outcomes at the top level', () => {
     const { outcome, stepResults } = await runWorkflowDetailed(compile(chain), 'x', { runner });
 
     expect(runner.calls).toEqual(['a', 'b']);
-    expect(outcome).toEqual({ status: 'failed', stepId: 'b', error: 'declined' });
-    expect(stepResults.get('b')).toEqual({ status: 'failed', error: 'declined' });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'b', path: [1], error: 'declined' });
+    expect(stepResults.get('b')).toEqual(rec({ status: 'failed', error: 'declined', payload: 'x' }));
     expect(stepResults.has('c')).toBe(false);
   });
 
@@ -442,7 +531,7 @@ describe('step outcomes at the top level', () => {
     const outcome = await runWorkflow(compile(chain), 'x', { runner });
 
     expect(runner.calls).toEqual(['a', 'b']);
-    expect(outcome).toEqual({ status: 'tripwire', stepId: 'b', tripwire: { reason: 'blocked' } });
+    expect(outcome).toEqual({ status: 'tripwire', stepId: 'b', path: [1], tripwire: { reason: 'blocked' } });
   });
 
   it('ends the run as a success carrying bailed: true on bail, and stops the chain', async () => {
@@ -456,21 +545,47 @@ describe('step outcomes at the top level', () => {
     expect(outcome).toEqual({ status: 'success', output: 'early', bailed: true });
     // Mastra rewrites the bailing entry's own record to 'success' when the bail ends the run
     // (`default.ts:926-928` mutates the object `stepResults` holds), and so does the kernel.
-    expect(stepResults.get('b')).toEqual({ status: 'success', output: 'early' });
+    expect(stepResults.get('b')).toEqual(rec({ status: 'success', output: 'early', payload: 'x' }));
     expect(stepResults.has('c')).toBe(false);
   });
 
   it('ends the run suspended, carrying the step and its execution path', async () => {
+    const clock = new ManualClock(EPOCH);
     const runner = new RecordingRunner({
-      steps: { b: () => ({ status: 'suspended', payload: { ask: 'approve' }, output: { draft: 1 } }) },
+      steps: { b: () => ({ status: 'suspended', suspendPayload: { ask: 'approve' }, suspendOutput: { draft: 1 } }) },
     });
 
-    const { outcome, stepResults } = await runWorkflowDetailed(compile(chain), 'x', { runner });
+    const { outcome, stepResults } = await runWorkflowDetailed(compile(chain), 'x', { runner, clock });
 
     expect(runner.calls).toEqual(['a', 'b']);
     // `suspendedPaths[step.id] = executionPath` (`handlers/step.ts:395-397`).
     expect(outcome).toEqual({ status: 'suspended', stepId: 'b', path: [1], payload: { ask: 'approve' } });
-    expect(stepResults.get('b')).toEqual({ status: 'suspended', payload: { ask: 'approve' }, output: { draft: 1 } });
+    // The record keeps both payloads Mastra keeps apart — the step's input as `payload`
+    // (`handlers/step.ts:173`) and the suspension's as `suspendPayload` (`:519`) — and the
+    // suspension's output, which the exit token does not carry. A suspended step has not ended:
+    // `suspendedAt`, and no `endedAt` (`:516-522`). `toEqual`, so an `endedAt` fails.
+    expect(stepResults.get('b')).toEqual({
+      status: 'suspended',
+      suspendPayload: { ask: 'approve' },
+      suspendOutput: { draft: 1 },
+      payload: 'x',
+      startedAt: EPOCH,
+      suspendedAt: EPOCH,
+    });
+  });
+
+  it('records a paused step with a start and neither endedAt nor suspendedAt', async () => {
+    const clock = new ManualClock(EPOCH);
+    const runner = new RecordingRunner({ steps: { b: () => ({ status: 'paused' }) } });
+
+    const { stepResults } = await runWorkflowDetailed(
+      compile(wf(step('a'), step('b', { source: 'workflow' }))),
+      'x',
+      { runner, clock },
+    );
+
+    // `handlers/step.ts:523-526` writes neither for a paused nested workflow.
+    expect(stepResults.get('b')).toEqual({ status: 'paused', payload: 'x', startedAt: EPOCH });
   });
 
   it('ends the run paused when a nested-workflow step pauses', async () => {
@@ -504,7 +619,13 @@ describe('step outcomes at the top level', () => {
 
     expect(views).toEqual([
       { stepId: 'a', path: [0], source: 'step', initData: 'init', a: undefined },
-      { stepId: 'b', path: [1], source: 'agent', initData: 'init', a: { status: 'success', output: 'init!' } },
+      {
+        stepId: 'b',
+        path: [1],
+        source: 'agent',
+        initData: 'init',
+        a: rec({ status: 'success', output: 'init!', payload: 'init' }),
+      },
     ]);
   });
 });
@@ -610,7 +731,7 @@ describe('fixed sleep and sleepUntil in virtual time', () => {
     });
 
     // `stepResults[entry.id] = { status: 'success', output: prevOutput }` (`handlers/entry.ts:665,776`).
-    expect(stepResults.get('nap')).toEqual({ status: 'success', output: 'A' });
+    expect(stepResults.get('nap')).toEqual(rec({ status: 'success', output: 'A', payload: 'A' }));
     expect(outcome).toEqual({ status: 'success', output: 'A' });
   });
 });
@@ -624,12 +745,12 @@ describe('per-run sleep and sleepUntil (resolveWait)', () => {
   it('waits the duration resolved for this run, handing resolveWait the previous output and the run view', async () => {
     const clock = new ManualClock(EPOCH);
     const log: Stamp[] = [];
-    const seen: { input: unknown; view: Omit<RunView, 'getStepResult'>; a: unknown }[] = [];
+    const seen: { input: unknown; view: Pick<RunView, 'path' | 'initData'>; a: unknown; signal: AbortSignal }[] = [];
     const runner = new RecordingRunner({
       steps: stamped(clock, log, ['a', 'b'], { a: () => ({ status: 'success', output: { waitMs: 250 } }) }),
       waits: {
         nap: (input, view) => {
-          seen.push({ input, view: { path: view.path, initData: view.initData }, a: view.getStepResult('a') });
+          seen.push({ input, view: { path: view.path, initData: view.initData }, a: view.getStepResult('a'), signal: view.abortSignal });
           return (input as { waitMs: number }).waitMs;
         },
       },
@@ -645,12 +766,16 @@ describe('per-run sleep and sleepUntil (resolveWait)', () => {
       {
         input: { waitMs: 250 },
         view: { path: [1], initData: 'init' },
-        a: { status: 'success', output: { waitMs: 250 } },
+        a: rec({ status: 'success', output: { waitMs: 250 }, payload: 'init' }),
+        // Mastra hands a sleep fn the run's `abortSignal` too (`handlers/sleep.ts:103-109`); a run
+        // with no signal gets one that never aborts.
+        signal: expect.any(AbortSignal),
       },
     ]);
+    expect(seen[0]!.signal.aborted).toBe(false);
     expect(firstAt(log, 'b')).toBe(250);
     expect(clock.elapsed()).toBe(250);
-    expect(stepResults.get('nap')).toEqual({ status: 'success', output: { waitMs: 250 } });
+    expect(stepResults.get('nap')).toEqual(rec({ status: 'success', output: { waitMs: 250 }, payload: { waitMs: 250 } }));
     expect(outcome).toEqual({ status: 'success', output: { waitMs: 250 } });
   });
 
@@ -669,7 +794,7 @@ describe('per-run sleep and sleepUntil (resolveWait)', () => {
 
     expect(outcome).toEqual({ status: 'success', output: 'x' });
     expect(firstAt(log, 'b')).toBe(7_000);
-    expect(stepResults.get('until')).toEqual({ status: 'success', output: 'x' });
+    expect(stepResults.get('until')).toEqual(rec({ status: 'success', output: 'x', payload: 'x' }));
   });
 
   it('waits 0 for a per-run instant already in the past', async () => {
@@ -764,7 +889,7 @@ describe('per-run sleep and sleepUntil (resolveWait)', () => {
 
     // Mastra rejects `run.start()` outright here, with no run status at all
     // (`handlers/sleep.ts:83-128`); a failed run is the nearest outcome a net can declare.
-    expect(outcome).toEqual({ status: 'failed', stepId: 'nap', error: boom });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'nap', path: [1], error: boom });
     expect(runner.calls).toEqual(['a']);
   });
 
@@ -774,7 +899,7 @@ describe('per-run sleep and sleepUntil (resolveWait)', () => {
 
     const outcome = await runWorkflow(compile(wf(step('a'), perRunSleep(), step('b'))), 'x', { runner });
 
-    expect(outcome).toEqual(failedWith('nap', /no resolveWait/));
+    expect(outcome).toEqual(failedWith('nap', /no resolveWait/, [1]));
     expect(runner.calls).toEqual(['a']);
   });
 });
@@ -879,40 +1004,35 @@ describe('structuralHash over leaf entries', () => {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Every proof below: properties `deadlockFree` and `terminatesAtSink`, initial marking one token
- * in the entry place, no environment places (a closed net), all five terminals declared as sinks,
- * route reported by `describeReport` on failure.
+ * Every proof below: properties `deadlockFree`, `terminatesAtSink` and `exactlyOneTerminal`;
+ * initial marking one token in the entry place; all six terminals and the cancel place declared as
+ * sinks; proved twice — the closed net (no environment place), then `wf.cancel` as an environment
+ * place under `bounded(1)`. Route reported by `describeReport` on failure.
  */
 describe('leaf chains, proved', () => {
   it('proves a plain chain', async () => {
-    expectBothProven(await verifyWorkflow(compile(wf(step('a'), step('b'), step('c')))));
+    await expectProvenBothSegments(wf(step('a'), step('b'), step('c')));
   }, 90_000);
 
   it('proves a chain with unrolled retries and a retry delay', async () => {
-    expectBothProven(
-      await verifyWorkflow(
-        compile(wf(step('a', { retries: 2, retryDelayMs: 100 }), step('b'), step('c', { retries: 1 }))),
-      ),
+    await expectProvenBothSegments(
+      wf(step('a', { retries: 2, retryDelayMs: 100 }), step('b'), step('c', { retries: 1 })),
     );
   }, 90_000);
 
   it('proves a chain with a fixed sleep', async () => {
-    expectBothProven(
-      await verifyWorkflow(compile(wf(step('a'), { kind: 'sleep', id: 'nap', duration: { fixed: 60_000 } }, step('b')))),
+    await expectProvenBothSegments(
+      wf(step('a'), { kind: 'sleep', id: 'nap', duration: { fixed: 60_000 } }, step('b')),
     );
   }, 90_000);
 
   it('proves a chain with a per-run sleep and a per-run sleepUntil', async () => {
-    expectBothProven(
-      await verifyWorkflow(
-        compile(
-          wf(
-            step('a'),
-            { kind: 'sleep', id: 'nap', duration: { perRun: true } },
-            { kind: 'sleepUntil', id: 'until', until: { perRun: true } },
-            step('b', { retries: 1 }),
-          ),
-        ),
+    await expectProvenBothSegments(
+      wf(
+        step('a'),
+        { kind: 'sleep', id: 'nap', duration: { perRun: true } },
+        { kind: 'sleepUntil', id: 'until', until: { perRun: true } },
+        step('b', { retries: 1 }),
       ),
     );
   }, 90_000);
@@ -957,7 +1077,7 @@ describe('non-vacuity of the leaf', () => {
       runner: mutantRunner,
     });
 
-    expect(intact).toEqual({ status: 'failed', stepId: 'b', error: 'declined' });
+    expect(intact).toEqual({ status: 'failed', stepId: 'b', path: [1], error: 'declined' });
     // The Out spec is enforced at run time: the undeclared write is refused, the consumed input
     // is not restored ([EXEC-031]), and the run reaches no terminal at all.
     expect(mutant).toEqual({ status: 'stranded', places: [] });
@@ -968,7 +1088,7 @@ describe('non-vacuity of the leaf', () => {
     // Why the hard rule "every transition carries a real Out spec, never skipOutputValidation"
     // matters: the mutant still proves, because the verifier reads the Out spec, and only the
     // run-time validation above catches an action that writes outside it.
-    expectBothProven(
+    expectAllProven(
       await verifyWorkflow(compile(wf(step('a'), step('b')), { gadgets: { step: withoutFailedBranch } })),
     );
   }, 90_000);
@@ -980,7 +1100,7 @@ describe('non-vacuity of the leaf', () => {
     const description = wf(step('a'), step('b'));
 
     const reports = await verifyWorkflow(compile(description, { gadgets: { step: suspendsNowhere } }));
-    const runner = new RecordingRunner({ steps: { b: () => ({ status: 'suspended', payload: 'p' }) } });
+    const runner = new RecordingRunner({ steps: { b: () => ({ status: 'suspended', suspendPayload: 'p' }) } });
     const outcome = await runWorkflow(compile(description, { gadgets: { step: suspendsNowhere } }), 'x', { runner });
 
     // Baseline (same shape, intact gadget) is proven in 'proves a plain chain'.
@@ -999,7 +1119,7 @@ describe('a rejection carrying no reason is still a rejection', () => {
     const description = wf({ kind: 'sleep', id: 'nap', duration: { perRun: true } }, step('b'));
     const report = await runWorkflowDetailed(compile(description), 'x', { runner });
 
-    expect(report.outcome).toEqual({ status: 'failed', stepId: 'nap', error: undefined });
+    expect(report.outcome).toEqual({ status: 'failed', stepId: 'nap', path: [0], error: undefined });
     expect(runner.calls).toEqual([]);
     expect(report.stepResults.has('nap')).toBe(false);
   });
@@ -1025,14 +1145,342 @@ describe('a per-run duration is coerced as setTimeout coerces it', () => {
 });
 
 describe('the net-size stopgap', () => {
-  // A chain of 4092 steps is 4092 input places plus the five terminals: 4097, one over.
+  // A chain of n steps is n input places plus 13 of the workflow's own: six terminals, the cancel
+  // place, the cancel request place and five settle places. 4084 steps is 4097 places, one over.
+  const OWN = 13;
   it('refuses a workflow whose net exceeds MAX_NET_PLACES, naming the limit', () => {
-    const entries = Array.from({ length: MAX_NET_PLACES - 4 }, (_, i) => step(`s${i}`));
+    const entries = Array.from({ length: MAX_NET_PLACES - OWN + 1 }, (_, i) => step(`s${i}`));
     expect(() => compile(wf(...entries))).toThrow(new RegExp(`compiles to ${MAX_NET_PLACES + 1} places, above the ${MAX_NET_PLACES}`));
   });
 
   it('compiles one exactly at the limit', () => {
-    const entries = Array.from({ length: MAX_NET_PLACES - 5 }, (_, i) => step(`s${i}`));
+    const entries = Array.from({ length: MAX_NET_PLACES - OWN }, (_, i) => step(`s${i}`));
     expect(compile(wf(...entries)).net.places.size).toBe(MAX_NET_PLACES);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Exposes the tokens a step writes to its non-success exits, which the kernel otherwise folds
+ * into a `RunOutcome`: each exit is redirected to a probe place, and a probe transition forwards
+ * the raw token to `next` as data. Used on a one-step workflow only (the probe names are fixed).
+ */
+function probing(inner: Gadget): Gadget {
+  return (entry, next, ctx) => {
+    const kinds = ['failed', 'bailed', 'suspended', 'paused'] as const;
+    const probes = Object.fromEntries(kinds.map((k) => [k, place<unknown>(`probe.${k}`)])) as Record<
+      (typeof kinds)[number],
+      Place<unknown>
+    >;
+    const result = inner(entry, next, { ...ctx, exits: { ...(probes as unknown as Exits), canceled: ctx.exits.canceled } });
+    const forward = kinds.map((k) =>
+      Transition.builder(`t.probe.${k}`)
+        .inputs(one(probes[k]))
+        .outputs(outPlace(next))
+        .action(async (tctx) => {
+          tctx.output(next, { data: { exit: k, token: tctx.input(probes[k]) } });
+        })
+        .build(),
+    );
+    return { ...result, transitions: [...result.transitions, ...forward] };
+  };
+}
+
+/**
+ * Stamps the ride-along fields a foreach or a loop would put on the token that starts a step, so
+ * the leaf's handling of them can be tested at the top level. Applies to the step `only`.
+ */
+function stamping(only: string, fields: Omit<FlowToken, 'data'>, inner: Gadget = stepGadget): Gadget {
+  return (entry, next, ctx) => {
+    if (entry.id !== only) return stepGadget(entry, next, ctx);
+    const result = inner(entry, next, ctx);
+    const pre = place<FlowToken>(ctx.names.entryPlace(ctx.path, entry.id, 'stamp'));
+    const stamp = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'stamp'))
+      .inputs(one(pre))
+      .outputs(outPlace(result.inPlace))
+      .action(async (tctx) => {
+        tctx.output(result.inPlace, { ...tctx.input(pre), ...fields });
+      })
+      .build();
+    return { inPlace: pre, transitions: [...result.transitions, stamp] };
+  };
+}
+
+describe('the exit tokens a step writes carry their Origin', () => {
+  const exitOf = async (outcome: StepOutcome, fields: Omit<FlowToken, 'data'> = {}) => {
+    const gadget = stamping('s', fields, probing(stepGadget));
+    const probed = await runWorkflow(compile(wf(step('s', { retries: 1 })), { gadgets: { step: gadget } }), 'in', {
+      runner: new RecordingRunner({ steps: { s: () => outcome } }),
+    });
+    return { probed };
+  };
+
+  it('a final failure: stepId, view path, error — and nonRetryable only when set', async () => {
+    const { probed } = await exitOf({ status: 'failed', error: 'no', nonRetryable: true });
+    expect(probed).toEqual({
+      status: 'success',
+      output: { exit: 'failed', token: { stepId: 's', path: [0], error: 'no', nonRetryable: true } },
+    });
+    const plain = await exitOf({ status: 'failed', error: 'no' });
+    // Retried once (retries: 1), then the final failure — with no `nonRetryable` key at all.
+    expect(plain.probed).toEqual({
+      status: 'success',
+      output: { exit: 'failed', token: { stepId: 's', path: [0], error: 'no' } },
+    });
+  });
+
+  it('a tripwire rides the failure token', async () => {
+    const { probed } = await exitOf({ status: 'failed', error: 'e', tripwire: { reason: 'r' }, nonRetryable: true });
+    expect(probed).toEqual({
+      status: 'success',
+      output: { exit: 'failed', token: { stepId: 's', path: [0], error: 'e', tripwire: { reason: 'r' }, nonRetryable: true } },
+    });
+  });
+
+  it('a suspension carries its payload but not its output, which lives on the record', async () => {
+    const { probed } = await exitOf({ status: 'suspended', suspendPayload: { ask: 1 }, suspendOutput: 'partial' });
+    expect(probed).toEqual({
+      status: 'success',
+      output: { exit: 'suspended', token: { stepId: 's', path: [0], payload: { ask: 1 } } },
+    });
+  });
+
+  it('a bail carries its output; a pause carries its origin alone', async () => {
+    expect((await exitOf({ status: 'bailed', output: 'b' })).probed).toEqual({
+      status: 'success',
+      output: { exit: 'bailed', token: { stepId: 's', path: [0], output: 'b' } },
+    });
+    expect((await exitOf({ status: 'paused' })).probed).toEqual({
+      status: 'success',
+      output: { exit: 'paused', token: { stepId: 's', path: [0] } },
+    });
+  });
+
+  it('carries a foreach index onto every exit token', async () => {
+    const fields = { foreachIndex: 3 };
+    expect((await exitOf({ status: 'failed', error: 'x', nonRetryable: true }, fields)).probed).toEqual({
+      status: 'success',
+      output: { exit: 'failed', token: { stepId: 's', path: [0], foreachIndex: 3, error: 'x', nonRetryable: true } },
+    });
+    expect((await exitOf({ status: 'suspended', suspendPayload: 'p' }, fields)).probed).toEqual({
+      status: 'success',
+      output: { exit: 'suspended', token: { stepId: 's', path: [0], foreachIndex: 3, payload: 'p' } },
+    });
+    expect((await exitOf({ status: 'bailed', output: 'o' }, fields)).probed).toEqual({
+      status: 'success',
+      output: { exit: 'bailed', token: { stepId: 's', path: [0], foreachIndex: 3, output: 'o' } },
+    });
+    expect((await exitOf({ status: 'paused' }, fields)).probed).toEqual({
+      status: 'success',
+      output: { exit: 'paused', token: { stepId: 's', path: [0], foreachIndex: 3 } },
+    });
+  });
+});
+
+describe('ride-along foreachIndex and iteration', () => {
+  it('hands foreachIndex to the runner, stamps both on the record, and carries both onto success', async () => {
+    const calls: { id: string; foreachIndex: number | undefined }[] = [];
+    const seeing: Behaviour = (input, call) => {
+      calls.push({ id: calls.length === 0 ? 'a' : 'b', foreachIndex: call.foreachIndex });
+      return { status: 'success', output: input };
+    };
+    const runner = new RecordingRunner({ steps: { a: seeing, b: seeing } });
+    const compiled = compile(wf(step('a'), step('b')), { gadgets: { step: stamping('a', { foreachIndex: 3, iteration: 2 }) } });
+
+    const { outcome, stepResults } = await runWorkflowDetailed(compiled, 'x', { runner });
+
+    expect(outcome).toEqual({ status: 'success', output: 'x' });
+    // `executionContext.foreachIndex` reaches the step (`handlers/step.ts:152`).
+    expect(calls[0]).toEqual({ id: 'a', foreachIndex: 3 });
+    expect(stepResults.get('a')).toEqual(
+      rec({ status: 'success', output: 'x', payload: 'x' }, { metadata: { iterationCount: 2, foreachIndex: 3 } }),
+    );
+    // The success token kept both, so the next gadget — here a plain step — sees them untouched.
+    expect(calls[1]).toEqual({ id: 'b', foreachIndex: 3 });
+    expect(stepResults.get('b')).toEqual(
+      rec({ status: 'success', output: 'x', payload: 'x' }, { metadata: { iterationCount: 2, foreachIndex: 3 } }),
+    );
+  });
+
+  it('keeps metadata and foreachIndex off a record and a call that has none', async () => {
+    let seen: StepCall | undefined;
+    const runner = new RecordingRunner({ steps: { a: (i, call) => ((seen = call), { status: 'success', output: i }) } });
+    const { stepResults } = await runWorkflowDetailed(compile(wf(step('a'))), 'x', { runner });
+    expect(stepResults.get('a')).not.toHaveProperty('metadata');
+    expect(seen).not.toHaveProperty('foreachIndex');
+  });
+
+  it('carries the foreach index onto the canceled origin when the settle stage re-stamps', async () => {
+    const ac = new AbortController();
+    const runner = new RecordingRunner({
+      steps: { a: () => (ac.abort(), { status: 'failed', error: 'x', nonRetryable: true }) },
+    });
+    const compiled = compile(wf(step('a')), { gadgets: { step: stamping('a', { foreachIndex: 5 }) } });
+
+    const outcome = await runWorkflow(compiled, 'x', { runner, signal: ac.signal });
+
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'a', path: [0], foreachIndex: 5 } });
+  });
+});
+
+describe('sleeps honour the cancel place at the top level', () => {
+  it.each([
+    ['a fixed sleep', { kind: 'sleep', id: 'nap', duration: { fixed: 1_000 } }],
+    ['a per-run sleep', { kind: 'sleep', id: 'nap', duration: { perRun: true } }],
+    ['a fixed sleepUntil', { kind: 'sleepUntil', id: 'nap', until: { fixed: EPOCH } }],
+    ['a per-run sleepUntil', { kind: 'sleepUntil', id: 'nap', until: { perRun: true } }],
+  ] as const)('%s: wake inhibited by wf.cancel, a sweep reads it', (_label, entry) => {
+    const compiled = compile(wf(entry));
+    const byName = new Map([...compiled.net.transitions].map((t) => [t.name, t]));
+    expect(byName.get('t.0.nap.wake')!.inhibitors.map((a) => a.place.name)).toEqual(['wf.cancel']);
+    const sweep = byName.get('t.0.nap.cancel')!;
+    expect(sweep.reads.map((a) => a.place.name)).toEqual(['wf.cancel']);
+    expect([...sweep.inputPlaces()].map((p) => p.name)).toEqual(['s.0.nap.in']);
+    expect([...sweep.outputPlaces()].map((p) => p.name)).toEqual(['wf.canceled']);
+  });
+
+  it.each([
+    ['a per-run sleep', { kind: 'sleep', id: 'nap', duration: { perRun: true } }],
+    ['a fixed sleepUntil', { kind: 'sleepUntil', id: 'nap', until: { fixed: EPOCH } }],
+    ['a per-run sleepUntil', { kind: 'sleepUntil', id: 'nap', until: { perRun: true } }],
+  ] as const)('%s waits in the action: its end is routed by resume (inhibited) or cancel-waited (reads)', (_label, entry) => {
+    const compiled = compile(wf(entry));
+    const byName = new Map([...compiled.net.transitions].map((t) => [t.name, t]));
+    const names = (ps: Iterable<{ name: string }>) => [...ps].map((p) => p.name).sort();
+
+    // The wake only waits: it writes `waited` or, on a throwing wait fn, the failure — never a
+    // canceled outcome, and it reads no flag to choose one.
+    expect(names(byName.get('t.0.nap.wake')!.outputPlaces())).toEqual(['s.0.nap.waited', 'wf.settle.failed']);
+    const resume = byName.get('t.0.nap.resume')!;
+    expect(resume.inhibitors.map((a) => a.place.name)).toEqual(['wf.cancel']);
+    expect(names(resume.inputPlaces())).toEqual(['s.0.nap.waited']);
+    expect(names(resume.outputPlaces())).toEqual(['wf.settle.done']);
+    const cancelWaited = byName.get('t.0.nap.cancel-waited')!;
+    expect(cancelWaited.reads.map((a) => a.place.name)).toEqual(['wf.cancel']);
+    expect(names(cancelWaited.inputPlaces())).toEqual(['s.0.nap.waited']);
+    expect(names(cancelWaited.outputPlaces())).toEqual(['wf.canceled']);
+  });
+
+  it('a fixed sleep is a timed wake alone: no waited place, no resume', () => {
+    const compiled = compile(wf({ kind: 'sleep', id: 'nap', duration: { fixed: 1_000 } }));
+    const own = [...compiled.net.transitions].map((t) => t.name).filter((n) => n.startsWith('t.0.'));
+    expect(own.sort()).toEqual(['t.0.nap.cancel', 't.0.nap.wake']);
+    expect([...compiled.net.transitions].find((t) => t.name === 't.0.nap.wake')!.timing).toEqual({
+      type: 'delayed',
+      afterMs: 1_000,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+
+/** Rebuilt without its inhibitor arcs — the lead's pattern, every other arc kept. */
+function withoutInhibitors(t: Transition): Transition {
+  const b = Transition.builder(t.name)
+    .inputs(...t.inputSpecs)
+    .outputs(t.outputSpec!)
+    .action(t.action)
+    .timing(t.timing)
+    .priority(t.priority);
+  for (const arc of t.reads) b.read(arc.place);
+  for (const arc of t.resets) b.reset(arc.place);
+  return b.build();
+}
+
+/** `inner`, with the inhibitors of every transition whose name ends in `suffix` stripped. */
+function stripping(inner: Gadget, suffix: string): Gadget {
+  return (entry, next, ctx) => {
+    const r = inner(entry, next, ctx);
+    return { ...r, transitions: r.transitions.map((t) => (t.name.endsWith(suffix) ? withoutInhibitors(t) : t)) };
+  };
+}
+
+/**
+ * Every inhibitor the leaf gadgets add on `wf.cancel` is load-bearing, and no quiescence proof can
+ * see one go — the extra work it lets start still drains to exactly one terminal. The structural
+ * check sees it exactly, by name; `verifyWorkflow` refuses the net before proving anything.
+ */
+describe('cancelStructureViolations flags every leaf inhibitor stripped', () => {
+  const perRunSleep: EntryDescription = { kind: 'sleep', id: 'nap', duration: { perRun: true } };
+  const fixedSleep: EntryDescription = { kind: 'sleep', id: 'nap', duration: { fixed: 1_000 } };
+  const fixedUntil: EntryDescription = { kind: 'sleepUntil', id: 'nap', until: { fixed: EPOCH } };
+  const perRunUntil: EntryDescription = { kind: 'sleepUntil', id: 'nap', until: { perRun: true } };
+
+  it('the intact leaf nets are sound: no violation for any leaf form', () => {
+    for (const entries of [
+      [step('a'), step('b', { retries: 2, retryDelayMs: 5 })],
+      [step('a'), fixedSleep, step('b')],
+      [step('a'), perRunSleep, fixedUntil, perRunUntil, step('b')],
+    ]) {
+      expect(cancelStructureViolations(compile(wf(...entries)))).toEqual([]);
+    }
+  });
+
+  it.each([
+    [
+      "the step's first attempt",
+      [step('a', { retries: 1 }), step('b')],
+      { step: stripping(stepGadget, '.run') },
+      [
+        "'t.0.a.run' competes with sweep 't.0.a.cancel' for [s.0.a.in] without an inhibitor on 'wf.cancel'",
+        "'t.1.b.run' competes with sweep 't.1.b.cancel' for [s.1.b.in] without an inhibitor on 'wf.cancel'",
+      ],
+    ],
+    [
+      "a fixed sleep's wake",
+      [fixedSleep],
+      { sleep: stripping(sleepGadget, '.wake') },
+      ["'t.0.nap.wake' competes with sweep 't.0.nap.cancel' for [s.0.nap.in] without an inhibitor on 'wf.cancel'"],
+    ],
+    [
+      "a per-run sleep's wake",
+      [perRunSleep],
+      { sleep: stripping(sleepGadget, '.wake') },
+      ["'t.0.nap.wake' competes with sweep 't.0.nap.cancel' for [s.0.nap.in] without an inhibitor on 'wf.cancel'"],
+    ],
+    [
+      "a per-run sleep's resume",
+      [perRunSleep],
+      { sleep: stripping(sleepGadget, '.resume') },
+      ["'t.0.nap.resume' competes with sweep 't.0.nap.cancel-waited' for [s.0.nap.waited] without an inhibitor on 'wf.cancel'"],
+    ],
+    [
+      "a fixed sleepUntil's resume",
+      [fixedUntil],
+      { sleepUntil: stripping(sleepGadget, '.resume') },
+      ["'t.0.nap.resume' competes with sweep 't.0.nap.cancel-waited' for [s.0.nap.waited] without an inhibitor on 'wf.cancel'"],
+    ],
+    [
+      "a per-run sleepUntil's wake",
+      [perRunUntil],
+      { sleepUntil: stripping(sleepGadget, '.wake') },
+      ["'t.0.nap.wake' competes with sweep 't.0.nap.cancel' for [s.0.nap.in] without an inhibitor on 'wf.cancel'"],
+    ],
+  ] as const)('%s', async (_label, entries, gadgets, expected) => {
+    const mutant = compile(wf(...entries), { gadgets });
+    // The mutant really lost an arc: same transitions, one inhibitor fewer per stripped name.
+    const intact = compile(wf(...entries));
+    const count = (c: typeof intact) => [...c.net.transitions].reduce((n, t) => n + t.inhibitors.length, 0);
+    expect(count(mutant)).toBe(count(intact) - expected.length);
+
+    expect([...cancelStructureViolations(mutant)].sort()).toEqual([...expected].sort());
+    await expect(verifyWorkflow(mutant)).rejects.toThrow(/cancellation structure is unsound/);
+  });
+});
+
+describe('the sweep carries the foreach index onto the canceled origin', () => {
+  it('a pre-aborted run sweeps a stamped step with its foreachIndex', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const runner = new RecordingRunner();
+    const compiled = compile(wf(step('a')), { gadgets: { step: stamping('a', { foreachIndex: 5 }) } });
+
+    const { outcome, stepResults } = await runWorkflowDetailed(compiled, 'x', { runner, signal: ac.signal });
+
+    // The sweep — not the settle stage: nothing ran and nothing was recorded.
+    expect(runner.calls).toEqual([]);
+    expect(stepResults.size).toBe(0);
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'a', path: [0], foreachIndex: 5 } });
   });
 });

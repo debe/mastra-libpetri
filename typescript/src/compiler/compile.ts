@@ -1,8 +1,12 @@
 import { createHash } from 'node:crypto';
-import { PetriNet, place, type Place, type Transition } from 'libpetri';
+import { PetriNet, Transition, one, outPlace, place, type Place } from 'libpetri';
 import {
   NameVocabulary,
   WF_BAILED,
+  T_CANCEL_ARRIVE,
+  WF_CANCEL,
+  WF_CANCEL_REQUEST,
+  WF_CANCELED,
   WF_DONE,
   WF_FAILED,
   WF_PAUSED,
@@ -14,9 +18,10 @@ import { parallelGadget } from './gadgets/parallel.js';
 import { branchGadget } from './gadgets/branch.js';
 import { loopGadget } from './gadgets/loop.js';
 import { foreachGadget } from './gadgets/foreach.js';
-import type { Gadget, GadgetContext, GadgetResult } from './gadgets/types.js';
+import type { Gadget, GadgetContext, GadgetResult, NestedOptions } from './gadgets/types.js';
 import type {
   BailToken,
+  CanceledToken,
   CompiledWorkflow,
   EntryDescription,
   Exits,
@@ -38,10 +43,13 @@ import type {
  * makes a transition fire with its place empty, fail synchronously and re-mark itself dirty
  * forever: a spin `run(timeout, 'close')` cannot interrupt, because the loop never yields. On an
  * inhibitor it is quieter and worse — the inhibitor is ignored and the run gives a wrong answer.
- * Root-caused and fixed upstream (`Int8Array` -> `Int32Array`, TypeScript only; Java and Rust
- * were never affected). Place ids, not the place count, trigger it, but a net of at most 4096
- * places has every id below 4096, so this bound excludes both failures exactly. Lift it once the
- * package depends on a libpetri release carrying the fix.
+ * Root-caused upstream (`Int8Array` -> `Int32Array`, TypeScript only; Java uses `int[]`). Place
+ * ids, not the place count, trigger it, but a net of at most 4096 places has every id below 4096,
+ * so this bound excludes both failures exactly.
+ *
+ * **libpetri 6.1.0 does NOT carry the fix** — its `dist/index.js` still allocates
+ * `needsSingleWordIndex` as an `Int8Array`. Lift this only after checking that line in the
+ * release the package depends on, not on seeing a version number.
  */
 export const MAX_NET_PLACES = 4096;
 
@@ -94,16 +102,77 @@ export function compile(description: WorkflowDescription, options: CompileOption
     bailed: place<BailToken>(names.reserve(WF_BAILED, 'workflow early-exit terminal')),
     suspended: place<SuspendToken>(names.reserve(WF_SUSPENDED, 'workflow suspend terminal')),
     paused: place<PauseToken>(names.reserve(WF_PAUSED, 'workflow pause terminal')),
+    canceled: place<CanceledToken>(names.reserve(WF_CANCELED, 'workflow cancel terminal')),
   };
-  const topLevelExits: Exits = {
-    failed: terminals.failed,
-    bailed: terminals.bailed,
-    suspended: terminals.suspended,
-    paused: terminals.paused,
-  };
+  const cancel = place<null>(names.reserve(WF_CANCEL, 'cancellation signal'));
+  const cancelRequest = place<null>(names.reserve(WF_CANCEL_REQUEST, 'cancellation arrival'));
 
   const extraPlaces: Place<unknown>[] = [];
   const transitions: Transition[] = [];
+
+  // **The arrival is part of the net.** Registering `wf.cancel` itself as an environment place
+  // would be the direct model, but libpetri routes any net with an environment place away from
+  // enumeration to SMT — measured at 0 of 103 cancellation proofs enumerated, up to 411s each,
+  // and `unknown` on mutants a closed proof refutes in 7ms. So a proof seeds `wf.cancel.request`
+  // and this immediate transition, at default priority, moves it on: the net stays closed, and
+  // because `arrive` is enabled until it fires and nothing ever consumes `wf.cancel`, the verifier
+  // explores exactly one arrival at every reachable point. At runtime the kernel injects into
+  // `wf.cancel` itself — the same event, without this hop. One net serves both ([ADR 0004]).
+  transitions.push(
+    Transition.builder(names.reserve(T_CANCEL_ARRIVE, 'cancellation arrival transition'))
+      .inputs(one(cancelRequest))
+      .outputs(outPlace(cancel))
+      .action(async (tctx) => {
+        tctx.input(cancelRequest);
+        tctx.output(cancel, null);
+      })
+      .build(),
+  );
+
+  // **The settle stage — Mastra's after-entry abort check.** Mastra re-stamps *any* top-level
+  // entry's result as `canceled` when the signal fired while the entry ran, whatever that result
+  // was (`handlers/entry.ts:815-817`); the step's own record keeps the real outcome, stored just
+  // before. So a top-level outcome does not reach its terminal directly: it settles first, and a
+  // pair of structurally exclusive transitions — one inhibited by the signal, one reading it —
+  // decides between its terminal and `wf.canceled`. A success that is not the last entry needs no
+  // settle place: it lands in the next entry's input, whose sweep is the same check.
+  const settleOf = <T>(outcome: string, terminal: Place<T>, origin: (value: T) => CanceledToken): Place<T> => {
+    const settle = place<T>(names.settlePlace(outcome));
+    transitions.push(
+      Transition.builder(names.settleTransition(outcome, false))
+        .inputs(one(settle))
+        .inhibitor(cancel)
+        .outputs(outPlace(terminal))
+        .action(async (tctx) => {
+          tctx.output(terminal, tctx.input(settle));
+        })
+        .build(),
+      Transition.builder(names.settleTransition(outcome, true))
+        .inputs(one(settle))
+        .read(cancel)
+        .outputs(outPlace(terminals.canceled))
+        .action(async (tctx) => {
+          tctx.output(terminals.canceled, origin(tctx.input(settle)));
+        })
+        .build(),
+    );
+    return settle;
+  };
+  const originOf = (t: { stepId: string; path: EntryPath; foreachIndex?: number }): CanceledToken => ({
+    origin: t.foreachIndex === undefined
+      ? { stepId: t.stepId, path: t.path }
+      : { stepId: t.stepId, path: t.path, foreachIndex: t.foreachIndex },
+  });
+
+  const topLevelExits: Exits = {
+    failed: settleOf('failed', terminals.failed, originOf),
+    bailed: settleOf('bailed', terminals.bailed, originOf),
+    suspended: settleOf('suspended', terminals.suspended, originOf),
+    paused: settleOf('paused', terminals.paused, originOf),
+    // Already canceled: nothing left to decide.
+    canceled: terminals.canceled,
+  };
+  const settleDone = settleOf('done', terminals.done, () => ({}));
 
   const emit = (
     entry: EntryDescription,
@@ -111,18 +180,22 @@ export function compile(description: WorkflowDescription, options: CompileOption
     next: Place<FlowToken>,
     exits: Exits,
     nextIsResult: boolean,
+    nested: NestedOptions,
   ): GadgetResult => {
     const gadget = gadgets[entry.kind];
     if (gadget === undefined) throw new Error(`no gadget registered for '${entry.kind}'`);
 
     const ctx: GadgetContext = {
       path,
+      viewPath: nested.viewPath ?? path,
+      cancel: nested.cancel,
       names,
       exits,
       nextIsResult,
-      // An arm's `next` is always a combinator-internal place, never the run's result.
-      emitNested: (step: StepDescription, childPath, childNext, childExits) =>
-        emit(step, childPath, childNext, childExits, false),
+      // An arm's `next` is always a combinator-internal place, never the run's result, and it is
+      // not gated unless the combinator says so: Mastra checks abort where it checks, not per step.
+      emitNested: (step: StepDescription, childPath, childNext, childExits, options = {}) =>
+        emit(step, childPath, childNext, childExits, false, options),
     };
     const result = gadget(entry, next, ctx);
 
@@ -135,11 +208,12 @@ export function compile(description: WorkflowDescription, options: CompileOption
     return result;
   };
 
-  // Right to left: entry i produces into entry i+1's place, so that place must exist first.
+  // Right to left: entry i produces into entry i+1's place, so that place must exist first. Every
+  // top-level entry is gated: Mastra checks its signal before each one (`default.ts:815`).
   const last = description.entries.length - 1;
-  let next: Place<FlowToken> = terminals.done;
+  let next: Place<FlowToken> = settleDone;
   for (let i = last; i >= 0; i--) {
-    next = emit(description.entries[i]!, [i], next, topLevelExits, i === last).inPlace;
+    next = emit(description.entries[i]!, [i], next, topLevelExits, i === last, { cancel }).inPlace;
   }
 
   const net = PetriNet.builder(description.id)
@@ -149,6 +223,9 @@ export function compile(description: WorkflowDescription, options: CompileOption
       terminals.bailed,
       terminals.suspended,
       terminals.paused,
+      terminals.canceled,
+      cancel,
+      cancelRequest,
       ...extraPlaces,
     )
     .transitions(...transitions)
@@ -166,6 +243,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
     netMap: { transitionToEntry, placeToEntry },
     entryPlace: next,
     terminals,
+    cancel,
+    cancelRequest,
     structuralHash: structuralHash(description, names.names()),
   };
 }
@@ -196,7 +275,7 @@ function structuralHash(description: WorkflowDescription, names: readonly string
     }
   };
   return createHash('sha256')
-    .update(JSON.stringify({ v: 3, id: description.id, shape: description.entries.map(shape), names }))
+    .update(JSON.stringify({ v: 4, id: description.id, shape: description.entries.map(shape), names }))
     .digest('hex')
     .slice(0, 16);
 }

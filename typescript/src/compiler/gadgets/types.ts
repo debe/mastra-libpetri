@@ -24,7 +24,27 @@ export interface GadgetResult {
  * through the run scope (`../scope.ts`), which is what lets one compiled net serve many runs.
  */
 export interface GadgetContext {
+  /** The positional path this entry's places and transitions are **named** by. */
   readonly path: EntryPath;
+  /**
+   * Mastra's `executionPath` for this entry — what the runner and every outcome token see. Equal
+   * to `path` except where Mastra runs several net positions at one path: every `.foreach()` item
+   * runs at the foreach's own path, however many lanes the net gives it.
+   */
+  readonly viewPath: EntryPath;
+  /**
+   * The cancellation signal, when this entry must honour it — `undefined` when Mastra would not
+   * check its abort signal here.
+   *
+   * Mastra checks in exactly three places: before each top-level entry (`default.ts:815`),
+   * between loop iterations (`handlers/control-flow.ts:742,807,889`) and before each foreach
+   * dispatch (`:1160`). A step never checks before it runs, so once a `.parallel()` or `.branch()`
+   * has started, every arm runs. A gadget given a signal puts an **inhibitor arc** on it on every
+   * transition that starts new work, and a **sweep** — a transition that reads it and consumes
+   * the waiting token into `exits.canceled` — on every place where work waits to start. Never an
+   * action that checks a flag ([ADR 0003], CLAUDE.md: cancellation is structural).
+   */
+  readonly cancel: Place<null> | undefined;
   readonly names: NameVocabulary;
   /**
    * Where this entry's non-success outcomes go. At the top level these are the workflow's
@@ -54,7 +74,18 @@ export interface GadgetContext {
     path: EntryPath,
     next: Place<FlowToken>,
     exits: Exits,
+    options?: NestedOptions,
   ) => GadgetResult;
+}
+
+/**
+ * How a nested step differs from its naming path. Both default the conservative way: the view
+ * path to the naming path, and the cancel signal to **none** — a combinator that wants its child
+ * gated must say so, because Mastra gates only where it checks.
+ */
+export interface NestedOptions {
+  readonly viewPath?: EntryPath;
+  readonly cancel?: Place<null>;
 }
 
 /**

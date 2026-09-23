@@ -43,6 +43,16 @@ export const WF_FAILED = 'wf.failed';
 export const WF_BAILED = 'wf.bailed';
 export const WF_SUSPENDED = 'wf.suspended';
 export const WF_PAUSED = 'wf.paused';
+export const WF_CANCELED = 'wf.canceled';
+/**
+ * The cancellation signal, an environment place. Not a terminal: it stays marked once injected,
+ * and the terminal a canceled run reaches is `wf.canceled`.
+ */
+export const WF_CANCEL = 'wf.cancel';
+/** Where a cancellation arrives: the environment place at runtime, seeded for verification. */
+export const WF_CANCEL_REQUEST = 'wf.cancel.request';
+/** The transition that moves an arrived cancellation to the signal. */
+export const T_CANCEL_ARRIVE = 't.cancel.arrive';
 
 export class NameVocabulary {
   readonly #seen = new Map<string, string>();
@@ -75,6 +85,22 @@ export class NameVocabulary {
     return this.#mint(
       `t.${pathSegment(path)}.${slug(stepId)}.${role}`,
       `${role} of entry ${pathSegment(path)}`,
+    );
+  }
+
+  /**
+   * A top-level place a run's outcome settles in before it becomes a terminal — where Mastra's
+   * after-entry abort check is modelled (`handlers/entry.ts:815-817`).
+   */
+  settlePlace(outcome: string): string {
+    return this.#mint(`wf.settle.${outcome}`, `settle place for ${outcome}`);
+  }
+
+  /** The transitions that move a settled outcome to its terminal, or to `wf.canceled`. */
+  settleTransition(outcome: string, canceled: boolean): string {
+    return this.#mint(
+      `t.settle.${outcome}${canceled ? '.canceled' : ''}`,
+      `${canceled ? 'cancel-' : ''}settle of ${outcome}`,
     );
   }
 

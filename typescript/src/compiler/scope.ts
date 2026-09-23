@@ -1,6 +1,6 @@
 import type { TransitionContext } from 'libpetri';
 import type { EntryPath } from './names.js';
-import type { RunView, StepOutcome, StepRunner } from './types.js';
+import type { RunView, StepRecord, StepRunner } from './types.js';
 
 /**
  * The key under which the kernel hands each firing its run scope, through libpetri's
@@ -20,15 +20,21 @@ export const RUN_SCOPE_KEY = 'mastra-libpetri/run-scope';
 export interface RunScope {
   readonly runner: StepRunner;
   readonly initData: unknown;
-  getStepResult(stepId: string): StepOutcome | undefined;
-  /** Records a step's latest outcome under its id, as Mastra's `stepResults[id] = result`. */
-  recordStepResult(stepId: string, outcome: StepOutcome): void;
-  /** Epoch milliseconds on the run's clock, for a per-run `.sleepUntil`. */
+  getStepResult(stepId: string): StepRecord | undefined;
+  /** Records a step's latest record under its id, as Mastra's `stepResults[id] = result`. */
+  recordStepResult(stepId: string, record: StepRecord): void;
+  /** Epoch milliseconds on the run's clock — `.sleepUntil`, and every record's timestamps. */
   epochNow(): number;
   /**
-   * Waits `ms` on the run's clock. Used only by a per-run `.sleep` / `.sleepUntil`, whose wait
-   * cannot be a transition timing because libpetri timing belongs to the transition and not to
-   * the token. Every fixed wait is a timed transition instead.
+   * The run's abort signal — never aborted when the run has none. Actions read it only to cut
+   * short work already in flight (an action-side wait, and a Mastra step's own `abortSignal`);
+   * *whether new work starts* is decided by the net's inhibitor arcs, never by this.
+   */
+  readonly signal: AbortSignal;
+  /**
+   * Waits `ms` on the run's clock, resolving early when `signal` aborts — Mastra's
+   * `abortableSleep`. Used by the sleeps that cannot be a transition timing: libpetri timing is
+   * relative to enablement, so only a fixed `.sleep` is one.
    */
   wait(ms: number): Promise<void>;
 }
@@ -51,5 +57,6 @@ export function viewOf(scope: RunScope, path: EntryPath): RunView {
     path,
     initData: scope.initData,
     getStepResult: (stepId) => scope.getStepResult(stepId),
+    abortSignal: scope.signal,
   };
 }

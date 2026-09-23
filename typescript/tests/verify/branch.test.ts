@@ -23,8 +23,15 @@ import type {
   WorkflowDescription,
 } from '../../src/compiler/types.js';
 import { runWorkflow } from '../../src/engine/index.js';
-import { describeReport, verifyWorkflow, type PropertyReport } from '../../src/verify/index.js';
+import {
+  cancelStructureViolations,
+  describeReport,
+  verifyWorkflow,
+  type PropertyReport,
+  type Segment,
+} from '../../src/verify/index.js';
 import { RecordingRunner } from '../fixtures/runner.js';
+import { ManualClock } from '../support/manual-clock.js';
 
 const step = (id: string, extra: Omit<StepDescription, 'kind' | 'id'> = {}): StepDescription => ({
   kind: 'step',
@@ -35,20 +42,47 @@ const branch = (id: string, ...arms: StepDescription[]): EntryDescription => ({ 
 const workflow = (...entries: EntryDescription[]): WorkflowDescription => ({ id: 'triage', entries });
 const arms = (k: number): StepDescription[] => Array.from({ length: k }, (_, i) => step(`arm${i}`));
 
-/** Both properties, `proven` asserted explicitly: `isViolated()` is false on `unknown` too. */
-function expectProven(reports: readonly PropertyReport[]): void {
-  expect(reports.map((r) => r.property)).toEqual(['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal']);
+/** Every property of both segments `verifyWorkflow` proves by default, in its order. */
+const EVERY_REPORT = [
+  'closed/deadlockFree',
+  'closed/terminatesAtSink',
+  'closed/exactlyOneTerminal',
+  'closed/neverCanceled',
+  'cancel/deadlockFree',
+  'cancel/terminatesAtSink',
+  'cancel/exactlyOneTerminal',
+];
+
+/**
+ * Proves a compiled net through `verifyWorkflow`'s default — the structural cancel check, then
+ * both segments on the same closed net: `closed` (no cancel ever arrives, so `wf.canceled` is
+ * never marked either) and `cancel` (one cancel request seeded, and its arrival free to fire at
+ * every reachable point). Every report `proven`, asserted explicitly: `isViolated()` is false on
+ * `unknown` too.
+ */
+async function expectProvenBoth(compiled: CompiledWorkflow, timeoutMs = 120_000): Promise<readonly PropertyReport[]> {
+  const reports = await verifyWorkflow(compiled, { timeoutMs });
+  expect(reports.map((r) => `${r.segment}/${r.property}`)).toEqual(EVERY_REPORT);
   for (const report of reports) expect(report.result.verdict.type, describeReport(report)).toBe('proven');
+  return reports;
 }
 
-const verdictOf = (reports: readonly PropertyReport[], property: string): string =>
-  reports.find((r) => r.property === property)!.result.verdict.type;
+const verdictOf = (reports: readonly PropertyReport[], segment: Segment, property: string): string => {
+  const report = reports.find((r) => r.segment === segment && r.property === property);
+  if (report === undefined) throw new Error(`no ${segment}/${property} report`);
+  return report.result.verdict.type;
+};
+
+const inSegment = (reports: readonly PropertyReport[], segment: Segment): readonly PropertyReport[] =>
+  reports.filter((r) => r.segment === segment);
 
 /**
  * Every proof below is over the net `compile()` builds, from one token in the entry place, with
- * all five workflow terminals declared as sinks (`verifyWorkflow`). Verification is value-blind,
- * so each gate's run *and* skip legs, and each arm's five outcomes, are all explored — the proofs
- * cover every subset of truthy arms and every mix of arm outcomes.
+ * all six workflow terminals and the cancel place declared as sinks (`verifyWorkflow`), proved in
+ * both segments: `closed`, and `cancel` with one request seeded whose arrival may fire at every
+ * reachable point. Verification is value-blind, so each gate's run *and* skip legs, and each
+ * arm's five outcomes, are all explored — the proofs cover every subset of truthy arms, every mix
+ * of arm outcomes and, under cancel, every point at which the abort can land.
  */
 const shapes: ReadonlyArray<readonly [string, WorkflowDescription]> = [
   ['one arm, last entry', workflow(branch('route', ...arms(1)))],
@@ -58,6 +92,7 @@ const shapes: ReadonlyArray<readonly [string, WorkflowDescription]> = [
   ['two arms, middle entry', workflow(step('validate'), branch('route', ...arms(2)), step('audit'))],
   ['two branches in sequence', workflow(branch('first', ...arms(2)), branch('second', step('x'), step('y')))],
   ['empty branch, middle entry', workflow(step('validate'), branch('route'), step('audit'))],
+  ['empty branch, last entry', workflow(branch('route'))],
   [
     // A delayed retry makes the net timed, which rules out the enumeration route ([VER-017] is
     // untimed-only) and forces the SMT pipeline, so both routes are exercised.
@@ -68,16 +103,18 @@ const shapes: ReadonlyArray<readonly [string, WorkflowDescription]> = [
 
 describe('compiled branch, proved', () => {
   for (const [label, description] of shapes) {
-    it(`is deadlock-free and terminates at a declared sink: ${label}`, async () => {
-      expectProven(await verifyWorkflow(compile(description), { timeoutMs: 120_000 }));
-    }, 300_000);
+    it(`every property, both segments: ${label}`, async () => {
+      await expectProvenBoth(compile(description));
+    }, 600_000);
   }
 
-  it('takes the SMT route for the timed shape', async () => {
-    const reports = await verifyWorkflow(compile(shapes[shapes.length - 1]![1]), { timeoutMs: 120_000 });
-    expectProven(reports);
-    for (const report of reports) expect(report.result.route).toBe('smt');
-  }, 300_000);
+  it('takes the SMT route for the timed shape in both segments, and enumerates the untimed one', async () => {
+    const timed = await expectProvenBoth(compile(shapes[shapes.length - 1]![1]));
+    for (const report of timed) expect(report.result.route, describeReport(report)).toBe('smt');
+    // The cancel segment of an untimed block is a closed net too, so it enumerates.
+    const untimed = await expectProvenBoth(compile(shapes[1]![1]));
+    for (const report of untimed) expect(report.result.route, describeReport(report)).toBe('enumeration');
+  }, 600_000);
 });
 
 // ===================== scaling in the number of arms =====================
@@ -87,8 +124,8 @@ interface SizeRow {
   readonly transitions: number;
   readonly branches: number;
   readonly places: number;
-  readonly deadlockFree: string;
-  readonly terminatesAtSink: string;
+  readonly closed: string;
+  readonly cancel: string;
 }
 const sizeRows: SizeRow[] = [];
 
@@ -100,31 +137,31 @@ const sizeRows: SizeRow[] = [];
  */
 describe('compiled branch, scaling in the number of arms', () => {
   for (const k of [1, 2, 3, 4, 5, 6]) {
-    it(`proves both properties with ${k} arm(s) and counts the net`, async () => {
+    it(`proves every property of both segments with ${k} arm(s), and counts the net`, async () => {
       const compiled = compile(workflow(branch('route', ...arms(k))));
       const transitions = [...compiled.net.transitions];
       const branches = transitions.reduce((sum, t) => sum + enumerateBranches(t.outputSpec!).length, 0);
 
-      const reports = await verifyWorkflow(compiled, { timeoutMs: 240_000 });
+      const reports = await expectProvenBoth(compiled, 600_000);
 
-      expectProven(reports);
-      // 2k + 8 transitions of the block's own, one per arm; decide 2 branches, each gate 2, each
-      // arm 5, every collect and join 1.
-      expect(transitions).toHaveLength(3 * k + 8);
-      expect(branches).toBe(8 * k + 9);
-      const cell = (p: string) => {
-        const r = reports.find((x) => x.property === p)!.result;
-        return `${r.verdict.type} via ${r.route} in ${Math.round(r.elapsedMs)}ms`;
+      // Block: decide, its sweep, gate-i and collect-i per arm, four exit collects, three joins —
+      // 2k + 9; one per arm; ten for the settle stage and one for the cancel arrival. Branches:
+      // decide 2, each gate 2, each arm 5, every other transition 1.
+      expect(transitions).toHaveLength(3 * k + 9 + 11);
+      expect(branches).toBe(8 * k + 10 + 11);
+      const cell = (segment: Segment) => {
+        const rs = inSegment(reports, segment);
+        return `${[...new Set(rs.map((r) => r.result.route))].join('/')} ${rs.map((r) => Math.round(r.result.elapsedMs)).join('+')}ms`;
       };
       sizeRows.push({
         arms: k,
         transitions: transitions.length,
         branches,
         places: compiled.net.places.size,
-        deadlockFree: cell('deadlockFree'),
-        terminatesAtSink: cell('terminatesAtSink'),
+        closed: cell('closed'),
+        cancel: cell('cancel'),
       });
-    }, 600_000);
+    }, 1_800_000);
   }
 
   afterAll(() => {
@@ -194,42 +231,43 @@ function rebuilt(t: Transition, change: Change): Transition {
 
 const twoArms = workflow(branch('route', step('a'), step('b')));
 
+/** A join mutant is a closed-segment defect: it shows without any cancel arriving. */
 async function verifyMutant(gadget: Gadget): Promise<readonly PropertyReport[]> {
-  return verifyWorkflow(compile(twoArms, { gadgets: { branch: gadget } }), { timeoutMs: 120_000 });
+  return verifyWorkflow(compile(twoArms, { gadgets: { branch: gadget } }), { timeoutMs: 120_000, segments: ['closed'] });
 }
 
 describe('compiled branch, non-vacuity', () => {
-  it('the unmutated two-arm block is the baseline: both properties proven', async () => {
-    expectProven(await verifyWorkflow(compile(twoArms), { timeoutMs: 120_000 }));
-  });
+  it('the unmutated two-arm block is the baseline: every property of both segments proven', async () => {
+    await expectProvenBoth(compile(twoArms));
+  }, 300_000);
 
   it("join-ok's inhibitor on the failure marker: without it a failed block can succeed and strand the marker", async () => {
     const reports = await verifyMutant(mutating('join-ok', (t) => [rebuilt(t, { dropInhibitor: 'err-seen' })]));
-    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+    expect(verdictOf(reports, 'closed', 'deadlockFree')).toBe('violated');
   });
 
   it("join-ok's inhibitor on the suspension marker: without it a suspended block can succeed", async () => {
     const reports = await verifyMutant(mutating('join-ok', (t) => [rebuilt(t, { dropInhibitor: 'susp-seen' })]));
-    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+    expect(verdictOf(reports, 'closed', 'deadlockFree')).toBe('violated');
   });
 
   it("join-susp's inhibitor on the failure marker: without it failed no longer outranks suspended", async () => {
     const reports = await verifyMutant(mutating('join-susp', (t) => [rebuilt(t, { dropInhibitor: 'err-seen' })]));
-    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+    expect(verdictOf(reports, 'closed', 'deadlockFree')).toBe('violated');
   });
 
   it("join-fail's reset of the suspension marker: without it a failure beside a suspension strands a token", async () => {
     const mutant = mutating('join-fail', (t) => [rebuilt(t, { dropReset: 'susp-seen' })]);
 
     const reports = await verifyMutant(mutant);
-    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+    expect(verdictOf(reports, 'closed', 'deadlockFree')).toBe('violated');
 
     const runner = new RecordingRunner({
-      steps: { a: () => ({ status: 'failed', error: 'down' }), b: () => ({ status: 'suspended', payload: 'wait' }) },
+      steps: { a: () => ({ status: 'failed', error: 'down' }), b: () => ({ status: 'suspended', suspendPayload: 'wait' }) },
       branches: { route: () => [0, 1] },
     });
     const outcome = await runWorkflow(compile(twoArms, { gadgets: { branch: mutant } }), 'x', { runner });
-    expect(outcome).toEqual({ status: 'failed', stepId: 'a', error: 'down', residue: ['s.0.route.susp-seen'] });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'a', path: [0, 0], error: 'down', residue: ['s.0.route.susp-seen'] });
   });
 
   it("join-fail's all() on the failure marker: consuming one leaves the others behind", async () => {
@@ -238,7 +276,7 @@ describe('compiled branch, non-vacuity', () => {
     ]);
 
     const reports = await verifyMutant(mutant);
-    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+    expect(verdictOf(reports, 'closed', 'deadlockFree')).toBe('violated');
 
     const runner = new RecordingRunner({
       steps: { a: () => ({ status: 'failed', error: 'a' }), b: () => ({ status: 'failed', error: 'b' }) },
@@ -254,7 +292,7 @@ describe('compiled branch, non-vacuity', () => {
     ]);
 
     const reports = await verifyMutant(mutant);
-    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+    expect(verdictOf(reports, 'closed', 'deadlockFree')).toBe('violated');
   });
 
   it("collect-err's arrival deposit: without it a failing arm never counts and the join never fires", async () => {
@@ -272,8 +310,8 @@ describe('compiled branch, non-vacuity', () => {
     });
 
     const reports = await verifyMutant(mutant);
-    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
-    expect(verdictOf(reports, 'terminatesAtSink')).toBe('violated');
+    expect(verdictOf(reports, 'closed', 'deadlockFree')).toBe('violated');
+    expect(verdictOf(reports, 'closed', 'terminatesAtSink')).toBe('violated');
 
     const runner = new RecordingRunner({
       steps: { a: () => ({ status: 'failed', error: 'down' }) },
@@ -301,7 +339,7 @@ describe('compiled branch, non-vacuity', () => {
     });
 
     const reports = await verifyMutant(mutant);
-    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+    expect(verdictOf(reports, 'closed', 'deadlockFree')).toBe('violated');
 
     const runner = new RecordingRunner({ branches: { route: () => [0] } });
     const outcome = await runWorkflow(compile(twoArms, { gadgets: { branch: mutant } }), 'x', { runner });
@@ -336,14 +374,229 @@ describe('compiled branch, non-vacuity', () => {
     });
 
     const reports = await verifyMutant(mutant);
-    expect(verdictOf(reports, 'deadlockFree')).toBe('violated');
+    expect(verdictOf(reports, 'closed', 'deadlockFree')).toBe('violated');
+  });
+});
+
+// ===================== non-vacuity of the cancellation safeguards =====================
+
+/** The block without one transition, by role. */
+function dropping(role: string): Gadget {
+  return (entry, next, ctx) => {
+    const result = branchGadget(entry, next, ctx);
+    const transitions = result.transitions.filter((t) => !t.name.endsWith(`.${role}`));
+    expect(result.transitions.length - transitions.length, `drop target '${role}'`).toBe(1);
+    return { ...result, transitions };
+  };
+}
+
+/**
+ * The block with **every** inhibitor on the cancel signal stripped from its own transitions — the
+ * pattern each gadget is held to: whatever the block gates, stripping it must be flagged by the
+ * structural check, naming the transition.
+ */
+const ungatedEverywhere: Gadget = (entry, next, ctx) => {
+  const result = branchGadget(entry, next, ctx);
+  const cancel = ctx.cancel;
+  if (cancel === undefined) return result;
+  const transitions = result.transitions.map((t) =>
+    t.inhibitors.some((arc) => arc.place.name === cancel.name) ? rebuilt(t, { dropInhibitor: 'cancel' }) : t,
+  );
+  return { ...result, transitions };
+};
+
+/**
+ * The gated-arms mutant: every arm emitted **with** the cancel signal, so each arm's first attempt
+ * is inhibited by it and gets a sweep of its own. That is a check Mastra does not make — once the
+ * conditions are evaluated every truthy arm runs (`handlers/control-flow.ts:497-593`, no abort
+ * check between the filter and `Promise.all`).
+ */
+const gatedArms: Gadget = (entry, next, ctx) =>
+  branchGadget(entry, next, {
+    ...ctx,
+    emitNested: (s, path, armNext, exits, options) =>
+      ctx.emitNested(s, path, armNext, exits, { ...options, ...(ctx.cancel === undefined ? {} : { cancel: ctx.cancel }) }),
+  });
+
+const verdicts = (reports: readonly PropertyReport[]): Record<string, string> =>
+  Object.fromEntries(reports.map((r) => [`${r.segment}/${r.property}`, r.result.verdict.type]));
+
+/**
+ * Each cancellation safeguard the block adds, removed in turn through the `gadgets` override,
+ * with what catches its removal: a proof, the structural check, or only a run.
+ */
+describe('compiled branch, cancellation safeguards are load-bearing', () => {
+  const prepThen = (b: EntryDescription) => workflow(step('prep'), b);
+
+  for (const [label, description, blockAfterPrep] of [
+    ['two arms', twoArms, branch('route', step('a'), step('b'))],
+    ['empty block', workflow(branch('route'), step('audit')), branch('route')],
+  ] as const) {
+    it(`the sweep: without it a cancel strands the waiting input (${label})`, async () => {
+      const mutant = compile(description, { gadgets: { branch: dropping('cancel') } });
+
+      // Not a structural violation — the check is about a start that *competes* with a sweep, and
+      // there is no sweep left. The cancel segment is what refutes it.
+      expect(cancelStructureViolations(mutant)).toEqual([]);
+      const reports = await verifyWorkflow(mutant, { timeoutMs: 120_000 });
+      expect(verdicts(reports), reports.map(describeReport).join('; ')).toMatchObject({
+        'closed/deadlockFree': 'proven',
+        'closed/terminatesAtSink': 'proven',
+        'closed/exactlyOneTerminal': 'proven',
+        'closed/neverCanceled': 'proven',
+        'cancel/deadlockFree': 'violated',
+        'cancel/exactlyOneTerminal': 'violated',
+      });
+
+      // And in a run: aborted by the entry before the block, the input waits forever behind the
+      // inhibitor, no terminal is marked, and the run ends only at the harness timeout. (Aborted
+      // mid-run rather than before it: a pre-aborted run currently races the arrival against the
+      // first entry's start — see the kernel note in the compiler tests.)
+      const run = (compiled: CompiledWorkflow) => {
+        const ac = new AbortController();
+        const runner = new RecordingRunner({
+          steps: { prep: (x) => { ac.abort(); return { status: 'success', output: x }; } },
+          branches: { route: () => [0] },
+        });
+        return { runner, done: runWorkflow(compiled, 'x', { runner, signal: ac.signal, timeoutMs: 300 }) };
+      };
+      const real = run(compile(prepThen(blockAfterPrep)));
+      expect(await real.done).toEqual({ status: 'canceled', origin: { stepId: 'route', path: [1] } });
+      const swept = run(compile(prepThen(blockAfterPrep), { gadgets: { branch: dropping('cancel') } }));
+      await expect(swept.done).rejects.toThrow();
+      expect(swept.runner.calls).toEqual(['prep']);
+    }, 300_000);
+  }
+
+  for (const [label, description, role, expectedCalls] of [
+    ['decide', prepThen(branch('route', step('a'), step('b'))), 'decide', ['prep', 'a']],
+    ['pass (empty block)', workflow(step('prep'), branch('route'), step('audit')), 'pass', ['prep']],
+  ] as const) {
+    it(`${label}'s inhibitor: without it the block starts after the abort — flagged structurally, flipped in a run`, async () => {
+      const ungated: Gadget = mutating(role, (t) => [rebuilt(t, { dropInhibitor: 'cancel' })]);
+      const mutant = compile(description, { gadgets: { branch: ungated } });
+
+      // No quiescence property can see this — an ungated start still ends in exactly one terminal,
+      // re-stamped canceled after the block — so the structural check is what refuses it, and
+      // `verifyWorkflow` refuses to prove it at all.
+      const violations = cancelStructureViolations(mutant);
+      expect(violations).toEqual([
+        `'t.1.route.${role}' competes with sweep 't.1.route.cancel' for [s.1.route.in] without an inhibitor on 'wf.cancel'`,
+      ]);
+      await expect(verifyWorkflow(mutant, { timeoutMs: 1_000 })).rejects.toThrow(/t\.1\.route\.\w+' competes with sweep/);
+      expect(cancelStructureViolations(compile(description))).toEqual([]);
+
+      const runOnce = async (compiled: CompiledWorkflow) => {
+        const ac = new AbortController();
+        const runner = new RecordingRunner({
+          steps: { prep: (x) => { ac.abort(); return { status: 'success', output: x }; } },
+          branches: { route: () => [0] },
+        });
+        const outcome = await runWorkflow(compiled, 'x', { runner, signal: ac.signal, clock: new ManualClock(), timeoutMs: 5_000 });
+        return { outcome, calls: runner.calls };
+      };
+
+      // The real block stops at its own check; the mutant starts and runs what it selected.
+      expect(await runOnce(compile(description))).toEqual({
+        outcome: { status: 'canceled', origin: { stepId: 'route', path: [1] } },
+        calls: ['prep'],
+      });
+      const flipped = await runOnce(mutant);
+      expect(flipped.calls).toEqual(expectedCalls);
+      expect(flipped.outcome).not.toEqual({ status: 'canceled', origin: { stepId: 'route', path: [1] } });
+    }, 600_000);
+  }
+
+  it('every cancel inhibitor the block adds is structurally load-bearing: stripped, each is named', () => {
+    // The block gates exactly its start: `decide` (or `pass` when it has no arms). The join's
+    // inhibitors are on its own markers, not on the signal, and the arms are ungated by design.
+    for (const [description, expected] of [
+      [twoArms, ['t.0.route.decide']],
+      [prepThen(branch('route', step('a'), step('b'), step('c'))), ['t.1.route.decide']],
+      [workflow(branch('route'), step('audit')), ['t.0.route.pass']],
+    ] as const) {
+      const real = compile(description);
+      const gatedByBlock = [...real.net.transitions]
+        .filter((t) => /^t\.\d+\.route\./.test(t.name) && t.inhibitors.some((arc) => arc.place.name === real.cancel.name))
+        .map((t) => t.name);
+      expect(gatedByBlock).toEqual(expected);
+
+      const stripped = cancelStructureViolations(compile(description, { gadgets: { branch: ungatedEverywhere } }));
+      expect(stripped).toHaveLength(expected.length);
+      for (const name of expected) expect(stripped.some((line) => line.startsWith(`'${name}' competes with sweep`)), name).toBe(true);
+    }
+  });
+
+  describe('the gated-arms mutant (arms given the cancel signal)', () => {
+    const middle = workflow(step('prep'), branch('route', step('a'), step('b')), step('audit'));
+    const last = workflow(branch('route', step('a'), step('b')));
+
+    /** A condition that aborts the run and then selects both arms — Mastra's `abort()` in a condition. */
+    const abortingCondition = async (compiled: CompiledWorkflow) => {
+      const ac = new AbortController();
+      const runner = new RecordingRunner({ branches: { route: () => { ac.abort(); return [0, 1]; } } });
+      const report = await runWorkflow(compiled, 'x', { runner, signal: ac.signal, clock: new ManualClock(), timeoutMs: 5_000 });
+      return { outcome: report, calls: [...runner.calls].sort() };
+    };
+
+    it('passes the structural check: gating the arms adds inhibitors, it removes none', () => {
+      for (const description of [middle, last, twoArms]) {
+        const mutant = compile(description, { gadgets: { branch: gatedArms } });
+        // The mutant really is gated: each arm's first attempt now carries the inhibitor.
+        const gatedArmStarts = [...mutant.net.transitions].filter(
+          (t) => /^t\.\d+-\d\./.test(t.name) && t.inhibitors.some((arc) => arc.place.name === mutant.cancel.name),
+        );
+        expect(gatedArmStarts.length).toBeGreaterThanOrEqual(2);
+        expect(cancelStructureViolations(mutant)).toEqual([]);
+      }
+    });
+
+    it('flips the run in which a condition aborts, as a middle and as a last entry', async () => {
+      const realMiddle = await abortingCondition(compile(middle));
+      expect(realMiddle).toEqual({
+        outcome: { status: 'canceled', origin: { stepId: 'audit', path: [2] } },
+        calls: ['a', 'b', 'prep'],
+      });
+      const realLast = await abortingCondition(compile(last));
+      expect(realLast).toEqual({ outcome: { status: 'canceled' }, calls: ['a', 'b'] });
+
+      // The mutant sweeps both arms: neither runs, and the swept arms never arrive at the join.
+      const mutantMiddle = await abortingCondition(compile(middle, { gadgets: { branch: gatedArms } }));
+      expect(mutantMiddle.calls).toEqual(['prep']);
+      expect(mutantMiddle.outcome).not.toEqual(realMiddle.outcome);
+      const mutantLast = await abortingCondition(compile(last, { gadgets: { branch: gatedArms } }));
+      expect(mutantLast.calls).toEqual([]);
+      expect(mutantLast.outcome).not.toEqual(realLast.outcome);
+    });
+
+    it('is refuted by the cancel segment, and invisible to the closed one', async () => {
+      // A swept arm writes the enclosing `canceled` exit and never reaches `arrived`: two
+      // terminals (or one beside a stuck join) at quiescence. With no cancel arriving, the gate
+      // never matters, so every closed report stays proven.
+      // Measured last phase at 152s-243s via SMT, `unknown` on some properties; the cancel segment
+      // now enumerates and refutes it in milliseconds, so the proof is a flip of its own.
+      for (const description of [twoArms, middle]) {
+        const reports = await verifyWorkflow(compile(description, { gadgets: { branch: gatedArms } }), { timeoutMs: 120_000 });
+        expect(verdicts(reports), reports.map(describeReport).join('; ')).toEqual({
+          'closed/deadlockFree': 'proven',
+          'closed/terminatesAtSink': 'proven',
+          'closed/exactlyOneTerminal': 'proven',
+          'closed/neverCanceled': 'proven',
+          'cancel/deadlockFree': 'violated',
+          // A marked `wf.cancel` is a sink, so a stuck join beside it still "terminates at a sink".
+          'cancel/terminatesAtSink': 'proven',
+          'cancel/exactlyOneTerminal': 'violated',
+        });
+        for (const r of reports) expect(r.result.route, describeReport(r)).toBe('enumeration');
+      }
+    }, 300_000);
   });
 });
 
 describe('compiled branch, a compiled net serves any runner', () => {
   it('verifies the same net it runs: one CompiledWorkflow, proved and then executed', async () => {
     const compiled: CompiledWorkflow = compile(workflow(step('validate'), branch('route', ...arms(3)), step('audit')));
-    expectProven(await verifyWorkflow(compiled, { timeoutMs: 120_000 }));
+    await expectProvenBoth(compiled);
 
     const runner = new RecordingRunner({ branches: { route: () => [0, 2] } });
     const outcome = await runWorkflow(compiled, 'in', { runner });

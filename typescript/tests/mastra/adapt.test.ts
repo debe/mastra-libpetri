@@ -1,16 +1,40 @@
 import { describe, expect, it } from 'vitest';
-import { place } from 'libpetri';
-import type { StepFlowEntry as MastraStepFlowEntry } from '@mastra/core/workflows';
+import { place, Transition } from 'libpetri';
+import type {
+  SerializedStepResult,
+  StepFlowEntry as MastraStepFlowEntry,
+  StepResult as MastraStepResult,
+} from '@mastra/core/workflows';
 import {
   adaptExecutionGraph,
   adaptStepFlow,
+  getStepResultView,
+  toMastraStepResult,
   UnsupportedWorkflowError,
 } from '../../src/mastra/index.js';
-import type { AdaptOptions, ExecutionGraph, SingleStepEntry, StepFlowEntry } from '../../src/mastra/index.js';
-import { compile, MAX_FOREACH_LANES, MAX_ITERATION_BOUND, MAX_RETRIES, MAX_WAIT_MS, stepGadget } from '../../src/compiler/index.js';
+import type {
+  AdaptOptions,
+  ExecutionGraph,
+  OutcomeStepResult,
+  SingleStepEntry,
+  StepBailed,
+  StepCanceled,
+  StepFlowEntry,
+  StepResult,
+  StoredStepResult,
+} from '../../src/mastra/index.js';
+import {
+  compile,
+  MAX_FOREACH_LANES,
+  MAX_ITERATION_BOUND,
+  MAX_RETRIES,
+  MAX_WAIT_MS,
+  sleepGadget,
+  stepGadget,
+} from '../../src/compiler/index.js';
 import type { FailureToken, Gadget, StepSource } from '../../src/compiler/index.js';
 import { runWorkflow, runWorkflowDetailed } from '../../src/engine/index.js';
-import { describeReport, verifyWorkflow } from '../../src/verify/index.js';
+import { cancelStructureViolations, describeReport, verifyWorkflow } from '../../src/verify/index.js';
 import { RecordingRunner } from '../fixtures/runner.js';
 import { ManualClock } from '../support/manual-clock.js';
 
@@ -36,12 +60,36 @@ const only = (entry: StepFlowEntry, options: Omit<AdaptOptions, 'workflowId'> = 
  */
 type MirrorsMastra = MastraStepFlowEntry extends StepFlowEntry ? true : false;
 
+/**
+ * `StepResult` must hold in **both** directions: what Mastra stores must be readable by
+ * `fromMastraStepResult`, and what `toMastraStepResult` produces must be something Mastra's
+ * `stepResults` accepts. `'bailed'` and `'canceled'` are left out of the second check because
+ * Mastra's union declares neither — it records both anyway (`handlers/step.ts:524`;
+ * `handlers/control-flow.ts:752,1164-1169`, cast through `as unknown as StepResult`), which is why
+ * the mirror has them.
+ */
+type ReadsMastraResults = MastraStepResult<any, any, any, any> extends StepResult ? true : false;
+type ReadsStoredResults = SerializedStepResult<any, any, any, any> extends StoredStepResult ? true : false;
+type WritesMastraResults = Exclude<OutcomeStepResult, StepBailed | StepCanceled> extends MastraStepResult<any, any, any, any>
+  ? true
+  : false;
+type MirrorsEveryStatus = MastraStepResult<any, any, any, any>['status'] extends StepResult['status']
+  ? StepResult['status'] extends MastraStepResult<any, any, any, any>['status']
+    ? true
+    : false
+  : false;
+
 describe('the structural mirror', () => {
   it("accepts every shape Mastra's own StepFlowEntry can take", () => {
     // If Mastra widens `StepFlowEntry`, this stops type-checking — `npm run check` fails
     // before any test runs, which is the point.
     const mirrored: MirrorsMastra = true;
     expect(mirrored).toBe(true);
+  });
+
+  it("reads and writes Mastra's StepResult, and knows exactly its statuses", () => {
+    const checks: [ReadsMastraResults, ReadsStoredResults, WritesMastraResults, MirrorsEveryStatus] = [true, true, true, true];
+    expect(checks).toEqual([true, true, true, true]);
   });
 });
 
@@ -686,7 +734,7 @@ describe('end to end: adapt, compile, run', () => {
     });
 
     expect(runner.calls).toEqual(['validate', 'charge']);
-    expect(outcome).toEqual({ status: 'failed', stepId: 'charge', error: 'card declined' });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'charge', path: [1], error: 'card declined' });
   });
 
   it('runs a nested workflow as one step the runner knows is a workflow, and reports its pause', async () => {
@@ -742,7 +790,7 @@ describe('end to end: adapt, compile, run', () => {
     const outcome = await runWorkflow(compile(description), 'order', { runner });
 
     expect(runner.attempts).toEqual([{ stepId: 'charge', attempt: 0 }]);
-    expect(outcome).toEqual({ status: 'failed', stepId: 'charge', error: 'declined' });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'charge', path: [0], error: 'declined' });
   });
 
   it("retries a tool entry by its own options.retries and reports the last attempt's error", async () => {
@@ -757,7 +805,7 @@ describe('end to end: adapt, compile, run', () => {
       { stepId: 'notify', attempt: 0 },
       { stepId: 'notify', attempt: 1 },
     ]);
-    expect(outcome).toEqual({ status: 'failed', stepId: 'notify', error: 'timeout 1' });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'notify', path: [0], error: 'timeout 1' });
   });
 
   it('stops retrying at a non-retryable failure', async () => {
@@ -769,7 +817,7 @@ describe('end to end: adapt, compile, run', () => {
     const outcome = await runWorkflow(compile(description), 'order', { runner });
 
     expect(runner.attempts).toEqual([{ stepId: 'charge', attempt: 0 }]);
-    expect(outcome).toEqual({ status: 'failed', stepId: 'charge', error: 'fraud' });
+    expect(outcome).toEqual({ status: 'failed', stepId: 'charge', path: [0], error: 'fraud' });
   });
 
   it('retries a tripwire like any failure, then ends the run as a tripwire', async () => {
@@ -782,7 +830,7 @@ describe('end to end: adapt, compile, run', () => {
     const outcome = await runWorkflow(compile(description), 'order', { runner });
 
     expect(runner.attempts).toHaveLength(2);
-    expect(outcome).toEqual({ status: 'tripwire', stepId: 'screen', tripwire: { reason: 'pii' } });
+    expect(outcome).toEqual({ status: 'tripwire', stepId: 'screen', path: [0], tripwire: { reason: 'pii' } });
   });
 
   it("hands a .map() the run's input and any earlier step's result, and retries it by the workflow config", async () => {
@@ -834,8 +882,15 @@ describe('end to end: adapt, compile, run', () => {
 
     expect(report.outcome).toEqual({ status: 'success', output: 'charged+shipped' });
     expect(clock.elapsed()).toBe(60_000);
-    // handlers/entry.ts records the sleep as a success whose output is its input.
-    expect(report.stepResults.get('settle')).toEqual({ status: 'success', output: 'charged' });
+    // handlers/entry.ts records the sleep as a success whose output is its input; it began when
+    // the entry was reached and ended when the wait did, on the run's clock.
+    expect(report.stepResults.get('settle')).toEqual({
+      status: 'success',
+      output: 'charged',
+      payload: 'charged',
+      startedAt: clock.epochNow() - 60_000,
+      endedAt: clock.epochNow(),
+    });
   });
 
   it('sleeps for nothing after normalising a negative duration', async () => {
@@ -895,16 +950,59 @@ describe('end to end: adapt, compile, run', () => {
     const report = await runWorkflowDetailed(compile(adapt([step('__proto__')])), 'order', { runner });
 
     expect(report.outcome).toEqual({ status: 'success', output: 'ok' });
-    expect(report.stepResults.get('__proto__')).toEqual({ status: 'success', output: 'ok' });
+    expect(report.stepResults.get('__proto__')).toMatchObject({ status: 'success', output: 'ok', payload: 'order' });
   });
 });
+
+/** Each property's verdict, by segment and name — asserted whole, so `unknown` can never pass for `proven`. */
+const verdicts = (reports: Awaited<ReturnType<typeof verifyWorkflow>>) =>
+  Object.fromEntries(reports.map((r) => [`${r.segment}/${r.property}`, r.result.verdict.type]));
+const ALL_PROVEN = {
+  'closed/deadlockFree': 'proven',
+  'closed/terminatesAtSink': 'proven',
+  'closed/exactlyOneTerminal': 'proven',
+  'closed/neverCanceled': 'proven',
+  'cancel/deadlockFree': 'proven',
+  'cancel/terminatesAtSink': 'proven',
+  'cancel/exactlyOneTerminal': 'proven',
+};
+const routes = (reports: Awaited<ReturnType<typeof verifyWorkflow>>) => reports.map(describeReport).join('; ');
+
+/**
+ * A copy of the transition without its inhibitor on the cancel place; inputs, output, timing,
+ * priority, action, reads, resets and every other inhibitor kept.
+ */
+function withoutCancelInhibitor(t: Transition, cancelName: string): Transition {
+  const b = Transition.builder(t.name).inputs(...t.inputSpecs).timing(t.timing).priority(t.priority).action(t.action);
+  if (t.outputSpec !== null) b.outputs(t.outputSpec);
+  for (const a of t.inhibitors) if (a.place.name !== cancelName) b.inhibitor(a.place);
+  for (const a of t.resets) b.reset(a.place);
+  for (const a of t.reads) b.read(a.place);
+  return b.build();
+}
+
+/** The real gadget, with the cancel inhibitor stripped from every transition whose name ends in `suffix`. */
+const stripInhibitor = (gadget: Gadget, suffix: string): Gadget => (entry, next, ctx) => {
+  const emitted = gadget(entry, next, ctx);
+  if (ctx.cancel === undefined) return emitted;
+  const cancelName = ctx.cancel.name;
+  return {
+    ...emitted,
+    transitions: emitted.transitions.map((t) => (t.name.endsWith(suffix) ? withoutCancelInhibitor(t, cancelName) : t)),
+  };
+};
 
 /**
  * A leaf-shaped workflow, adapted from Mastra's step flow and compiled with the default gadgets.
  *
- * Property: `deadlockFree` and `terminatesAtSink`, all five workflow terminals declared as sinks.
- * Initial marking: one token in the entry place. Environment mode: none (no environment places).
- * Route: whatever `verifyWorkflow` reports, printed on failure by `describeReport`.
+ * Properties: `deadlockFree`, `terminatesAtSink` and `exactlyOneTerminal` in both segments, and
+ * `neverCanceled` (`placeBound(wf.canceled, 0)`) in the closed one — `verifyWorkflow`'s default.
+ * All six workflow terminals and the cancel place are declared sinks. Initial marking: one token
+ * in the entry place; the `closed` segment leaves the cancel request place empty, the `cancel`
+ * segment seeds it with one token whose arrival may fire at every reachable point. Environment
+ * mode: none — both segments run on the one closed net. Route and time: printed by
+ * `describeReport`, on failure and to the log. Before any proof, `verifyWorkflow` runs the
+ * structural cancel check and throws on a violation.
  */
 describe('an adapted leaf-shaped workflow, proved', () => {
   const flow: StepFlowEntry[] = [
@@ -915,24 +1013,27 @@ describe('an adapted leaf-shaped workflow, proved', () => {
     { type: 'sleep', id: 'settle', duration: 250 },
     { type: 'sleep', id: 'backoff', fn: () => 1 },
     { type: 'sleepUntil', id: 'noop' },
+    { type: 'sleepUntil', id: 'open', date: new Date(0) },
     nested('fulfil'),
     { type: 'tool', id: 'notify', toolId: 'slack' },
   ];
   const options = { retryConfig: { attempts: 1, delay: 100 } };
 
-  it('is deadlock-free and terminates at a declared sink', async () => {
-    const reports = await verifyWorkflow(compile(adapt(flow, options)), { timeoutMs: 60_000 });
+  it('is deadlock-free, terminates at a declared sink and marks exactly one terminal, with and without a cancel', async () => {
+    const compiled = compile(adapt(flow, options));
+    expect(cancelStructureViolations(compiled)).toEqual([]);
 
-    expect(reports.map((r) => r.property)).toEqual(['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal']);
-    for (const report of reports) {
-      expect(report.result.verdict.type, describeReport(report)).toBe('proven');
-    }
+    const reports = await verifyWorkflow(compiled, { timeoutMs: 60_000 });
+    console.log(`[proof] adapted leaf flow: ${routes(reports)}`);
+
+    expect(verdicts(reports), routes(reports)).toEqual(ALL_PROVEN);
   }, 180_000);
 
-  it('is not proved vacuously: a step whose failure is routed nowhere breaks both properties', async () => {
+  it('is not proved vacuously: a step whose failure is routed nowhere breaks the properties that see it', async () => {
     // The safeguard the adapted flow relies on is the leaf routing each outcome to an exit. This
     // copy sends a step's failure to a place of its own that is no terminal; the same flow must
-    // then stop proving, or the proof above says nothing.
+    // then stop proving, or the proof above says nothing. `cancel/terminatesAtSink` is blind by
+    // design — the marked cancel place is a sink — and `neverCanceled` is about another thing.
     const orphaningStep: Gadget = (entry, next, ctx) =>
       stepGadget(entry, next, {
         ...ctx,
@@ -943,8 +1044,336 @@ describe('an adapted leaf-shaped workflow, proved', () => {
       timeoutMs: 60_000,
     });
 
-    for (const report of reports) {
-      expect(report.result.verdict.type, describeReport(report)).toBe('violated');
-    }
+    expect(verdicts(reports), routes(reports)).toEqual({
+      'closed/deadlockFree': 'violated',
+      'closed/terminatesAtSink': 'violated',
+      'closed/exactlyOneTerminal': 'violated',
+      'closed/neverCanceled': 'proven',
+      'cancel/deadlockFree': 'violated',
+      'cancel/terminatesAtSink': 'proven',
+      'cancel/exactlyOneTerminal': 'violated',
+    });
   }, 180_000);
+
+  it('is not proved vacuously under cancellation: without the sweeps, a cancel strands the run', async () => {
+    // The cancel safeguard this flow relies on is the sweep on every place where work waits to
+    // start — a step's input, a sleep's, and a finished action-side wait's. Without them the
+    // closed segment must stay green (a sweep never fires unless a cancel lands) and the cancel
+    // segment must break.
+    const withoutSweep = (gadget: Gadget): Gadget => (entry, next, ctx) => {
+      const emitted = gadget(entry, next, ctx);
+      return { ...emitted, transitions: emitted.transitions.filter((t) => !/\.cancel(-waited)?$/.test(t.name)) };
+    };
+    const compiled = compile(adapt(flow, options), {
+      gadgets: { step: withoutSweep(stepGadget), sleep: withoutSweep(sleepGadget), sleepUntil: withoutSweep(sleepGadget) },
+    });
+
+    const reports = await verifyWorkflow(compiled, { timeoutMs: 60_000 });
+    console.log(`[proof] adapted leaf flow without sweeps: ${routes(reports)}`);
+    expect(verdicts(reports), routes(reports)).toEqual({
+      ...ALL_PROVEN,
+      'cancel/deadlockFree': 'violated',
+      'cancel/exactlyOneTerminal': 'violated',
+    });
+  }, 180_000);
+
+  /**
+   * No proof sees these: a start that lost its inhibitor still drains to exactly one terminal,
+   * because the sweep beside it or the next entry's sweep ends the extra work. The structural
+   * check names every one of them, exactly — and each has a run below that the stripped net
+   * gets wrong.
+   */
+  it.each([
+    ["a step's first attempt", 'step' as const, '.run', ['t.0.validate.run', 't.1.charge.run', 't.2.summarise.run', 't.3.shape.run', 't.8.fulfil.run', 't.9.notify.run']],
+    ["a sleep's wake", 'sleep' as const, '.wake', ['t.4.settle.wake', 't.5.backoff.wake']],
+    ["a sleepUntil's wake", 'sleepUntil' as const, '.wake', ['t.6.noop.wake', 't.7.open.wake']],
+    ["a finished action-side wait's resume", 'sleep' as const, '.resume', ['t.5.backoff.resume']],
+  ])('flags %s without its cancel inhibitor, naming the transition', async (_label, kind, suffix, expected) => {
+    const base = kind === 'step' ? stepGadget : sleepGadget;
+    const compiled = compile(adapt(flow, options), { gadgets: { [kind]: stripInhibitor(base, suffix) } });
+    const violations = cancelStructureViolations(compiled);
+
+    const named = [...new Set(violations.map((v) => /^'([^']+)'/.exec(v)?.[1]))].sort();
+    expect(named, violations.join('\n')).toEqual([...expected].sort());
+    await expect(verifyWorkflow(compiled)).rejects.toThrow(/cancellation structure is unsound/);
+  });
+});
+
+/**
+ * Cancellation through an adapted flow, end to end: `adapt` -> `compile` -> `runWorkflow` with a
+ * signal. Mastra checks its abort signal before each top-level entry (`default.ts:815`) and
+ * re-stamps an entry's result `canceled` after it returns while the step's record keeps its real
+ * outcome (`handlers/entry.ts:810-817`); it never checks inside a step or between retries
+ * (`default.ts:455-460`), and a sleep ends early through `abortableSleep`.
+ */
+describe('an adapted flow, canceled', () => {
+  const flow: StepFlowEntry[] = [
+    step('validate'),
+    step('charge'),
+    { type: 'sleep', id: 'settle', duration: 60_000 },
+    { type: 'sleep', id: 'backoff', fn: () => 0 },
+    { type: 'tool', id: 'ship', toolId: 'courier' },
+  ];
+  const options = { retryConfig: { attempts: 1, delay: 100 } };
+  const compiled = compile(adapt(flow, options));
+  const noWait = { backoff: () => 0 };
+
+  it('runs nothing when the signal is already aborted, and cancels at the first entry', async () => {
+    // default.ts:815 checks before the first entry. Red while the kernel seeds a pre-aborted run's
+    // signal into the cancel *request* place: the first entry's start and the arrival are then
+    // both enabled at once, and the start wins. Seeding `compiled.cancel` itself fixes it.
+    const aborted = new AbortController();
+    aborted.abort();
+    const runner = new RecordingRunner({ waits: noWait });
+
+    const report = await runWorkflowDetailed(compiled, 'order', { runner, signal: aborted.signal });
+
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'validate', path: [0] } });
+    expect(runner.calls).toEqual([]);
+    expect(report.stepResults.size).toBe(0);
+  });
+
+  it('lets the step in flight finish and be recorded, then starts nothing after it', async () => {
+    const controller = new AbortController();
+    const clock = new ManualClock();
+    const runner = new RecordingRunner({
+      steps: {
+        validate: (input) => {
+          controller.abort();
+          return { status: 'success', output: `${input as string}+valid` };
+        },
+      },
+      waits: noWait,
+    });
+
+    const report = await runWorkflowDetailed(compiled, 'order', { runner, clock, signal: controller.signal });
+
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'charge', path: [1] } });
+    expect(runner.calls).toEqual(['validate']);
+    expect([...report.stepResults.keys()]).toEqual(['validate']);
+    // The record keeps its real outcome, and Mastra reads it as the success it was.
+    expect(toMastraStepResult(report.stepResults.get('validate')!)).toEqual({
+      status: 'success',
+      output: 'order+valid',
+      payload: 'order',
+      startedAt: clock.epochNow(),
+      endedAt: clock.epochNow(),
+    });
+  });
+
+  it('keeps retrying a step after the abort, as Mastra never checks between attempts', async () => {
+    const controller = new AbortController();
+    const clock = new ManualClock();
+    const runner = new RecordingRunner({
+      steps: {
+        charge: (_input, call) => {
+          if (call.attempt === 0) {
+            controller.abort();
+            return { status: 'failed', error: 'declined' };
+          }
+          return { status: 'success', output: 'charged' };
+        },
+      },
+      waits: noWait,
+    });
+
+    const report = await runWorkflowDetailed(compiled, 'order', { runner, clock, signal: controller.signal });
+
+    expect(runner.attempts.filter((a) => a.stepId === 'charge').map((a) => a.attempt)).toEqual([0, 1]);
+    expect(clock.elapsed()).toBe(100);
+    expect(report.stepResults.get('charge')).toMatchObject({ status: 'success', output: 'charged' });
+    // The literal sleep after it never starts: the run ends at it, not sixty seconds later.
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'settle', path: [2] } });
+    expect(report.stepResults.has('settle')).toBe(false);
+  });
+
+  it('re-stamps a failure that lands with the abort as canceled, keeping the failure on the record', async () => {
+    const controller = new AbortController();
+    const runner = new RecordingRunner({
+      steps: {
+        validate: () => {
+          controller.abort();
+          return { status: 'failed', error: 'invalid', nonRetryable: true };
+        },
+      },
+      waits: noWait,
+    });
+
+    const report = await runWorkflowDetailed(compiled, 'order', { runner, signal: controller.signal });
+
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'validate', path: [0] } });
+    expect(toMastraStepResult(report.stepResults.get('validate')!)).toMatchObject({
+      status: 'failed',
+      error: expect.objectContaining({ message: 'invalid' }),
+      nonRetryable: true,
+    });
+  });
+
+  it('ends a literal sleep in progress at once', async () => {
+    const controller = new AbortController();
+    const runner = new RecordingRunner({
+      steps: {
+        charge: (input) => {
+          setTimeout(() => controller.abort(), 50);
+          return { status: 'success', output: input };
+        },
+      },
+      waits: noWait,
+    });
+    const started = performance.now();
+
+    const outcome = await runWorkflow(compiled, 'order', { runner, signal: controller.signal, timeoutMs: 10_000 });
+
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'settle', path: [2] } });
+    expect(runner.calls).toEqual(['validate', 'charge']);
+    expect(performance.now() - started).toBeLessThan(2_000);
+  });
+
+  it('ends a per-run sleep in progress early and cancels at the sleep, recording nothing for it', async () => {
+    // handlers/entry.ts:605-609 writes `{status: 'waiting'}` before the wait; :642-643 then takes
+    // the aborted branch — `execResults = { status: 'canceled' }` — and never reaches the success
+    // write at :665. `isSingleStepEntry` excludes a sleep (utils.ts:301), so :812 does not
+    // overwrite it either: a sleep cut short is never a success, and the entry itself is canceled.
+    const controller = new AbortController();
+    const short = compile(adapt([step('quote'), { type: 'sleep', id: 'backoff', fn: () => 0 }, step('ship')]));
+    const runner = new RecordingRunner({
+      waits: {
+        backoff: () => {
+          setTimeout(() => controller.abort(), 50);
+          return 60_000;
+        },
+      },
+    });
+    const started = performance.now();
+
+    const report = await runWorkflowDetailed(short, 'order', { runner, signal: controller.signal, timeoutMs: 10_000 });
+
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'backoff', path: [1] } });
+    expect(runner.calls).toEqual(['quote']);
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(report.stepResults.has('backoff')).toBe(false);
+    expect(getStepResultView({ getStepResult: (id) => report.stepResults.get(id), initData: 'order' })('backoff')).toBeNull();
+    expect([...report.stepResults.keys()]).toEqual(['quote']);
+  });
+
+  it('ends a literal sleepUntil in progress early and cancels at it, recording nothing for it', async () => {
+    // A literal sleepUntil waits in the action, like a per-run one (entry.ts:752-776 is the same
+    // aborted branch as :642 for the sleepUntil path).
+    const controller = new AbortController();
+    const until = compile(adapt([step('quote'), { type: 'sleepUntil', id: 'open', date: new Date(Date.now() + 60_000) }, step('ship')]));
+    const runner = new RecordingRunner({
+      steps: {
+        quote: (input) => {
+          setTimeout(() => controller.abort(), 50);
+          return { status: 'success', output: input };
+        },
+      },
+    });
+    const started = performance.now();
+
+    const report = await runWorkflowDetailed(until, 'order', { runner, signal: controller.signal, timeoutMs: 10_000 });
+
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'open', path: [1] } });
+    expect(runner.calls).toEqual(['quote']);
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(report.stepResults.has('open')).toBe(false);
+  });
+
+  it('never asks for a per-run wait once the abort landed before the sleep', async () => {
+    // default.ts:815 checks before the entry; Mastra never calls the sleep's `fn`.
+    const controller = new AbortController();
+    const waited: string[] = [];
+    const runner = new RecordingRunner({
+      steps: {
+        quote: (input) => {
+          controller.abort();
+          return { status: 'success', output: input };
+        },
+      },
+      waits: { backoff: () => (waited.push('backoff'), 0) },
+    });
+
+    const report = await runWorkflowDetailed(
+      compile(adapt([step('quote'), { type: 'sleep', id: 'backoff', fn: () => 0 }, step('ship')])),
+      'order',
+      { runner, signal: controller.signal },
+    );
+
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'backoff', path: [1] } });
+    expect(waited).toEqual([]);
+    expect([...report.stepResults.keys()]).toEqual(['quote']);
+  });
+
+  /**
+   * The runs the structurally flagged mutants get wrong. A stripped sleep wake asks for the wait
+   * after the abort; a stripped resume records the cut-short sleep as a success and cancels at the
+   * next entry — the defect this adapter's tests once pinned as fidelity. A stripped first-attempt
+   * inhibitor on a step has **no** run that shows it: the sweep beside it takes the token first,
+   * so the structural check above is its only witness.
+   */
+  describe('without the inhibitors the structural check demands', () => {
+    const sleepy = [step('quote'), { type: 'sleep', id: 'backoff', fn: () => 0 }, step('ship')] as const satisfies readonly StepFlowEntry[];
+
+    it('asks for a per-run wait after the abort once the wake is ungated', async () => {
+      const controller = new AbortController();
+      const waited: string[] = [];
+      const runner = new RecordingRunner({
+        steps: { quote: (input) => (controller.abort(), { status: 'success', output: input }) },
+        waits: { backoff: () => (waited.push('backoff'), 0) },
+      });
+      const mutant = compile(adapt(sleepy), { gadgets: { sleep: stripInhibitor(sleepGadget, '.wake') } });
+
+      const report = await runWorkflowDetailed(mutant, 'order', { runner, signal: controller.signal, timeoutMs: 10_000 });
+
+      expect(waited).toEqual(['backoff']);
+      expect(report.outcome.status).toBe('canceled');
+    });
+
+    it('records a cut-short sleep as a success once the resume is ungated', async () => {
+      const controller = new AbortController();
+      const runner = new RecordingRunner({
+        waits: { backoff: () => (setTimeout(() => controller.abort(), 50), 60_000) },
+      });
+      const mutant = compile(adapt(sleepy), { gadgets: { sleep: stripInhibitor(sleepGadget, '.resume') } });
+
+      const report = await runWorkflowDetailed(mutant, 'order', { runner, signal: controller.signal, timeoutMs: 10_000 });
+
+      expect(report.stepResults.get('backoff')).toMatchObject({ status: 'success' });
+      expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'ship', path: [2] } });
+    });
+  });
+
+  it('re-stamps a run whose last step succeeded as canceled, naming no entry', async () => {
+    const controller = new AbortController();
+    const runner = new RecordingRunner({
+      steps: {
+        ship: (input) => {
+          controller.abort();
+          return { status: 'success', output: `${input as string}+shipped` };
+        },
+      },
+      waits: noWait,
+    });
+
+    const report = await runWorkflowDetailed(compile(adapt([step('pack'), { type: 'tool', id: 'ship', toolId: 'courier' }])), 'order', {
+      runner,
+      signal: controller.signal,
+    });
+
+    expect(report.outcome).toEqual({ status: 'canceled' });
+    expect(report.stepResults.get('ship')).toMatchObject({ status: 'success', output: 'order+shipped' });
+  });
+
+  it('runs to success with a signal that never fires, and a late abort changes nothing', async () => {
+    const controller = new AbortController();
+    const clock = new ManualClock();
+    const runner = new RecordingRunner({ waits: noWait });
+
+    const outcome = await runWorkflow(compiled, 'order', { runner, clock, signal: controller.signal });
+    controller.abort();
+
+    expect(outcome).toEqual({ status: 'success', output: 'order' });
+    expect(runner.calls).toEqual(['validate', 'charge', 'ship']);
+    expect(clock.elapsed()).toBe(60_000);
+  });
 });

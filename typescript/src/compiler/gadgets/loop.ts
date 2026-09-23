@@ -1,6 +1,15 @@
 import { Transition, and, one, outPlace, place, xor, type Place } from 'libpetri';
-import { scopeOf, viewOf } from '../scope.js';
-import type { BailToken, Exits, FailureToken, FlowToken, PauseToken, SuspendToken } from '../types.js';
+import { scopeOf, viewOf, type RunScope } from '../scope.js';
+import type {
+  BailToken,
+  CanceledToken,
+  Exits,
+  FailureToken,
+  FlowToken,
+  PauseToken,
+  StepRecord,
+  SuspendToken,
+} from '../types.js';
 import type { Gadget } from './types.js';
 
 /**
@@ -14,10 +23,12 @@ import type { Gadget } from './types.js';
 export const MAX_ITERATION_BOUND = 100_000;
 
 /**
- * Between iterations: the value the next iteration is fed, and how many iterations have run.
+ * Between iterations: the value the next iteration is fed, and Mastra's `iteration` counter — the
+ * number of iterations completed, so the next body run is iteration `iteration + 1`.
  *
- * `iteration` is payload only. It is what the condition is told (`iterationCount`), and no
- * transition is enabled or disabled by it: the bound is the `budget` place, never this number.
+ * `iteration` is payload only. It is what the body's record and the condition are told
+ * (`iterationCount`), and no transition is enabled or disabled by it: the bound is the `budget`
+ * place, never this number.
  */
 interface LoopState {
   readonly data: unknown;
@@ -28,8 +39,8 @@ interface LoopState {
  * The pending marker for the one iteration in flight.
  *
  * The body is a leaf gadget: it consumes a `FlowToken` and produces one, so nothing the loop
- * needs on the far side of the body can travel through it. The iteration number rides here
- * instead, beside the body's token, and every way out of the body consumes it.
+ * needs on the far side of the body can be trusted to travel through it. The iteration number
+ * rides here instead, beside the body's token, and every way out of the body consumes it.
  */
 interface IterationMarker {
   readonly iteration: number;
@@ -40,23 +51,28 @@ interface IterationMarker {
  *
  * **What Mastra does** (`handlers/control-flow.ts`, `executeLoop`):
  *
- * - The first iteration's input is the previous entry's output: `result` starts as
- *   `{ status: 'success', output: loopInput }` (:734), and `loopInput` is `prevOutput` (:730-733).
+ * - **Where it starts.** `iteration` starts at `stepResults[body].metadata.iterationCount - 1`
+ *   when that is truthy, else 0 (:727-728), and the first iteration's input is
+ *   `stepResults[body].payload` when the body already has a record carrying one, else the
+ *   previous entry's output (:729-733). Neither test looks at the record's status or at whether
+ *   this is a resume: **any** record under the body's id with an own `payload` wins — so a loop
+ *   that follows `.then(s)` over the same `s` re-feeds `s`'s *input*, not its output. Reproduced
+ *   as written (`docs/divergences.md` row 27).
  * - Every later iteration is fed the previous iteration's output. The body is called with
- *   `prevOutput: (result as { output: any }).output` (:764), and `result` is reassigned to the
- *   body's own result after each call (:780).
- * - The body runs first; then the condition is evaluated with `inputData: result.output` (:843)
- *   and `iterationCount: iteration + 1` (:847). `iteration` starts at 0 (:728) and is incremented
- *   only after the condition (:883), so the first evaluation sees **1**. That holds for both loop
- *   types: there is one `do { body; condition } while (…)` (:739-901), and the two differ only in
- *   the test at :901, `dowhile ? isTrue : !isTrue`.
+ *   `prevOutput: result.output` (:764), and `result` is reassigned to the body's own result
+ *   (:780).
+ * - The body runs with `iterationCount: iteration + 1` (:771), which the step handler writes as
+ *   `metadata.iterationCount` on the body's record (`handlers/step.ts:177`). The condition is then
+ *   evaluated with `inputData: result.output` (:843) and the same `iterationCount` (:847);
+ *   `iteration` is incremented after it (:883). Both loop types are one
+ *   `do { body; condition } while (…)` (:739-901), differing only in the test at :901.
  * - A non-success body result ends the loop at once, returned as the loop's own result (:791-801).
  * - The loop's result is the last body result (:914), stored under the **body's** step id
- *   (`handlers/entry.ts:810-812`), which is where the next entry reads it
+ *   (`handlers/entry.ts:811-812`), which is where the next entry reads it
  *   (`default.ts:1150-1151`).
- * - The body runs under the loop's own `executionContext`, passed through unchanged (:760), so
- *   its `executionPath` is the loop's path. A `.parallel()` arm, by contrast, gets
- *   `[...executionPath, i]` (:244).
+ * - The body runs under the loop's own `executionContext`, passed unchanged (:760), so its
+ *   `executionPath` — what `handlers/step.ts:180,395` record — is the loop's. A `.parallel()`
+ *   arm, by contrast, gets `[...executionPath, i]` (:244).
  *
  * **The shape.**
  *
@@ -68,67 +84,96 @@ interface IterationMarker {
  *   body-X + running ─leave-X (reset budget)─▶ X        for X in failed, bailed, suspended, paused
  * ```
  *
- * **The body shares the loop's path.** That is what Mastra does (:760), and it is what the runner
- * hands on as the step's `executionPath` and what a suspension records in `suspendedPaths`. The
- * price is that a loop's id defaults to its body's id (the adapter falls back to it, as Mastra
- * keys the result by it), so both would claim `entryIn(path, id)`. The loop therefore never mints
- * `.in`: its input is `loop-in`, and its other roles are disjoint from the leaf's
- * (`in`, `run`, `run-n`, `retry-n`, `attempt-n`). A collision would throw at compile anyway,
- * because `NameVocabulary` refuses to mint one name twice.
+ * **Cancellation: Mastra's four checks, as arcs.** Mastra looks at its abort signal before the
+ * entry (`default.ts:815`), before every body run (:742), after a body *success* (:807) and after
+ * every condition (:889) — never inside the body, and never after a non-success body result,
+ * which returns before :807 and is re-stamped `canceled` by the settle stage like any top-level
+ * outcome (`handlers/entry.ts:815-817`). Given `ctx.cancel`, each check is a pair — the
+ * transition that would continue is **inhibited** by the signal, and a **sweep** that reads it
+ * consumes the waiting token into `exits.canceled`. The pair is what `cancelStructureViolations`
+ * checks: each inhibited transition needs every input its sweep consumes, so stripping one of the
+ * five inhibitors is refused before any proof runs.
+ *
+ * | Mastra's check          | waits in    | inhibited      | sweep            | also clears      |
+ * |-------------------------|-------------|----------------|------------------|------------------|
+ * | `default.ts:815`        | `loop-in`   | `start`        | `cancel-in`      | —                |
+ * | :742 (and :889→repeat)  | `ready`     | `enter`, `exhaust` | `cancel-ready` | `budget` (reset) |
+ * | :807                    | `produced`  | `check`        | `cancel-produced`| `running`, `budget` |
+ * | :889 → exit             | `exiting`   | `finish`       | `cancel-exiting` | `budget` (reset) |
+ *
+ * `exhaust` is inhibited too because Mastra has no bound: its :889 check always comes before the
+ * next iteration, so a cancel must win over our bound. The body is emitted **without** the
+ * signal, so a body run that `enter` has started always runs — retries included, as
+ * `executeStepWithRetry` never checks (`default.ts:455-460`). A canceled loop carries no output:
+ * Mastra returns a bare `{ status: 'canceled' }` (:752, :817, :899).
+ *
+ * **The canceled record.** `handlers/entry.ts:810-812` then stores that bare result under the
+ * body's id — `stepResults[getSingleStepEntryId(entry.step)] = execResults`, before the :815
+ * re-stamp — **replacing** the last iteration's record: no `payload`, no timestamps, no
+ * `metadata`. So `cancel-ready`, `cancel-produced` and `cancel-exiting` each write exactly
+ * `{ status: 'canceled' }` under the body's id. `cancel-in` writes nothing: `default.ts:815`
+ * returns before the entry runs, so `entry.ts` never stores a result. The record is written by the
+ * sweep — the net has already decided the cancellation; the action only records it.
+ *
+ * **Every origin names the body.** The loop's own failure and its cancellation report
+ * `stepId: body.id`, which is where Mastra keeps the loop's result — a named loop's own id has no
+ * record, so an outcome naming it would name nothing the codec can find. The condition is still
+ * asked by the loop's id, which is what the runner keys it by.
+ *
+ * **The body shares the loop's path.** The runner hands it on as the step's `executionPath`, and a
+ * suspension records it in `suspendedPaths`. The price is that a loop's id defaults to its body's
+ * id (the adapter falls back to it, as Mastra keys the result by it), so both would claim
+ * `entryIn(path, id)`. The loop therefore never mints `.in`: its input is `loop-in`, and its other
+ * roles are disjoint from the leaf's (`in`, `run`, `run-n`, `retry-n`, `attempt-n`, `cancel`). A
+ * collision would throw at compile anyway, because `NameVocabulary` refuses to mint one name twice.
  *
  * **The iteration allowance is a place.** `budget` is seeded with `iterationBound` unit tokens by
  * `start` and spent one per iteration by `enter`. `enter` needs a token and `exhaust` is
- * inhibited by one, so every marking with a token in `ready` enables exactly one of them. The
- * exclusion is that inhibitor arc, not the priorities, which are the budget idiom written out and
- * which no analysis sees by default. `tests/verify/loop.test.ts` removes the inhibitor and gets
- * `deadlockFree` violated while the run itself still passes — the proof rests on the arc.
+ * inhibited by one, so every marking with a token in `ready` and no signal enables exactly one of
+ * them. The exclusion is that inhibitor arc, not the priorities, which no analysis sees.
  *
  * **Exceeding the bound fails the run.** Mastra's loop has no bound (:739, :901); ours exists so
- * that termination can be proved (`docs/divergences.md` row 13). Exiting normally at the bound
+ * that termination can be guaranteed (`docs/divergences.md` row 13). Exiting normally at the bound
  * would hand a truncated result downstream with nothing to tell it from a settled condition, so
- * `exhaust` fails the run with an error naming the bound. It goes straight to `exits.failed`
- * with nothing to clean up: the inhibitor means `budget` is empty, and `check` already took
- * `running`.
+ * `exhaust` fails the run with an error naming the bound. The bound counts body runs of **this**
+ * entry; a loop re-entered from a record continues Mastra's `iterationCount` but gets a fresh
+ * allowance.
  *
- * **Every other exit cleans up the allowance.** A loop that leaves with allowance to spare holds
- * leftover `budget` tokens, so `finish`, `abort` and the four `leave-*` transitions each carry a
- * reset arc on `budget`. The reset cannot sit on `check`, which also fires on the repeat branch
- * and would wipe the allowance the next iteration is about to spend — hence the `exiting` and
- * `failing` hops. `running` is never reset: it is consumed with `one()` on every path, because
- * it holds exactly one token whenever the body does, so the marker stays a conservation law
- * (`running` = the body's token count) rather than something a reset erases.
+ * **Every other exit cleans up the allowance.** `finish`, `abort`, every `leave-*` and the three
+ * sweeps after `start` carry a reset arc on `budget`. The reset cannot sit on `check`, which also
+ * fires on the repeat branch — hence the `exiting` and `failing` hops. `running` is never reset:
+ * it is consumed with `one()` on every path, so it stays a conservation law (`running` = the
+ * body's token count). `start` carries no reset: a loop is entered once per run (it cannot sit
+ * inside another combinator, and the top-level chain has no back-edge), so there is never a stale
+ * allowance to clear.
  *
- * **`start` carries no reset.** A loop entry is entered once per run: it cannot sit inside
- * another combinator (`types.ts`, `StepDescription`), and the top-level chain has no back-edge,
- * so there is never a stale allowance to clear and every exit clears its own anyway. The reset
- * the budget idiom puts on `start` would be unobservable here, and under a concurrent re-entry
- * it would wipe a live allowance.
+ * **Where the allowance has to be seeded for a proof to mean anything.** [IO-016]: every
+ * branch-enumerating analysis models one token per place a branch names. `start` writes
+ * `iterationBound` tokens into a place its branch names once, so a query seeded at the entry place
+ * sees an allowance of **one** at any bound. From the entry place the proof covers the topology;
+ * seeding `ready` and `budget` directly — the post-`start` marking — proves the cycle at genuine
+ * allowances (`tests/verify/loop.test.ts`). What stays unproven is `start`'s deposit count, which
+ * the executor tests pin.
  *
- * **Where the allowance has to be seeded for a proof to mean anything — read this before quoting
- * a bound.** [IO-016]: every branch-enumerating analysis models one token per place a branch
- * names, whatever the action wrote. `start` writes `iterationBound` tokens into a place its
- * branch names once — that conforms to [IO-015], and the executor reports it as the [IO-016] AC4
- * warning — but a query seeded at the workflow's entry place sees an allowance of **one** at any
- * bound. So from the entry place, the proof covers the topology (every transition and branch is
- * reachable at an allowance of one) and not the cycle running more than once, nor leaving with
- * allowance to spare, which is exactly what the exit resets are for. Seeding `ready` and `budget`
- * directly is the post-`start` marking, and `tests/verify/loop.test.ts` proves the cycle there at
- * genuine allowances. What stays unproven is one action's deposit count — that `start` writes
- * `iterationBound` tokens — which the executor tests pin.
+ * **Declaration order.** The sweeps are declared after the transitions they race when an
+ * inhibitor is missing, so the executor's tie-break (declaration order, [EXEC-002]) picks the
+ * *wrong* one in a mutant. That is what lets a test show each inhibitor is load-bearing at run
+ * time; with the inhibitors in place the order decides nothing.
  *
- * **Sequential by construction.** One flow token circulates: `start` emits one `ready`, `enter`
- * turns it into one `body.in` plus one `running`, and `check` consumes both halves.
+ * **[TIME-012] applies and is harmless.** Every reset on `budget` restarts the clocks of `enter`
+ * and `exhaust`. Both are immediate, so a restart changes nothing.
  *
- * **[TIME-012] applies and is harmless.** The reset arcs on `budget` restart the clocks of
- * `enter` (input) and `exhaust` (inhibitor). Both are immediate, `[0, inf)`, so a restart changes
- * nothing. Giving either a timing without revisiting this would reintroduce the trap.
+ * **What the step results hold.** The body's leaf records every iteration under the body's id,
+ * with `metadata.iterationCount`, as Mastra's `Object.assign(stepResults, …)` (:779) does, so the
+ * condition and the next entry see the latest iteration. When the loop fails on its own account
+ * (bound exceeded, a throwing condition, a runner that cannot evaluate conditions), it records
+ * that failure under the body's id, because that is where Mastra writes a loop's result; when it
+ * is canceled after `start`, the bare canceled record above.
  *
- * **What the step results hold.** The body's leaf records every iteration's final outcome under
- * the body's id, and Mastra writes each iteration there too (`Object.assign(stepResults, …)`,
- * :779), so the next entry — and the condition, which runs after that write — see the latest
- * iteration. When the loop fails on its own account (bound exceeded, a throwing condition, a
- * runner that cannot evaluate conditions), it records that failure under the body's id as well,
- * because that is where Mastra writes a loop's result (`handlers/entry.ts:811`).
+ * **Re-entry reads whatever is there, `canceled` included.** `start` applies :727-734 to any
+ * record, as Mastra does — it never looks at the status. A bare canceled record has no own
+ * `payload` and no `iterationCount`, so a loop re-entered from one starts from the previous
+ * entry's output at iteration 0, exactly as Mastra's would.
  */
 export const loopGadget: Gadget = (entry, next, ctx) => {
   if (entry.kind !== 'loop') throw new Error(`loopGadget received a '${entry.kind}' entry`);
@@ -146,7 +191,7 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
     throw new Error(`loop '${entry.id}' has an unknown loopType '${String(loopType)}'`);
   }
 
-  const { names, path, exits } = ctx;
+  const { names, path, viewPath, exits, cancel } = ctx;
   const own = <T>(role: string): Place<T> => place<T>(names.entryPlace(path, entry.id, role));
   const named = (role: string) => names.entryTransition(path, entry.id, role);
 
@@ -161,18 +206,47 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
   const exiting = own<FlowToken>('exiting');
   /** The condition threw. `check` has already taken `running`. */
   const failing = own<FailureToken>('failing');
-  /** The body's own non-success outcomes, each held until the marker and allowance are cleared. */
+  /**
+   * The body's own non-success outcomes, each held until the marker and allowance are cleared.
+   *
+   * `canceled` is the loop's own exit, passed straight through, because nothing writes it: the
+   * body is emitted without the signal, and a leaf writes `canceled` only from the sweep it gets
+   * with one. Giving the body the signal would strand `running` and the allowance beside
+   * `wf.canceled` — which `exactlyOneTerminal` under `cancel: true` reports — so a holding place
+   * and a `leave-canceled` here would be structure no run or proof can reach.
+   */
   const bodyExits: Exits = {
     failed: own<FailureToken>('body-failed'),
     bailed: own<BailToken>('body-bailed'),
     suspended: own<SuspendToken>('body-suspended'),
     paused: own<PauseToken>('body-paused'),
+    canceled: exits.canceled,
   };
 
-  // Same path as the loop: see "The body shares the loop's path" above.
-  const bodyIn = ctx.emitNested(body, path, produced, bodyExits).inPlace;
+  // The loop's view path, and no signal: Mastra passes its `executionContext` unchanged (:760) and
+  // never checks inside a body run.
+  const bodyIn = ctx.emitNested(body, path, produced, bodyExits, { viewPath }).inPlace;
 
-  const loopFailure = (error: unknown): FailureToken => ({ stepId: entry.id, error });
+  // Named by the body: that is where the loop's result lives (`handlers/entry.ts:810-812`).
+  const loopFailure = (error: unknown): FailureToken => ({ stepId: body.id, path: viewPath, error });
+  const canceled: CanceledToken = { origin: { stepId: body.id, path: viewPath } };
+  /**
+   * Mastra's bare canceled result, replacing the last iteration's record (`handlers/entry.ts:811`).
+   * Nothing else — no payload, no timestamps, no metadata — because Mastra's has nothing else.
+   */
+  const recordCanceled = (scope: RunScope): void => scope.recordStepResult(body.id, { status: 'canceled' });
+
+  /** The loop's own failure, recorded where Mastra keeps a loop's result. */
+  const recordFailure = (scope: RunScope, error: unknown, payload: unknown, iteration: number): void => {
+    const record: StepRecord = {
+      status: 'failed',
+      error,
+      payload,
+      endedAt: scope.epochNow(),
+      ...(iteration > 0 ? { metadata: { iterationCount: iteration } } : {}),
+    };
+    scope.recordStepResult(body.id, record);
+  };
 
   // Decide, then emit ([EXEC-031]). A runner that cannot evaluate conditions is found here,
   // before the body runs, so no step's side effect executes for a loop that could never decide
@@ -183,6 +257,14 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
     .action(async (c) => {
       const incoming = c.input(inPlace);
       const scope = scopeOf(c);
+
+      // Re-entry from a record (:727-734): any record under the body's id with an own `payload`,
+      // whatever its status — `canceled` included — and whether or not this is a resume.
+      const previous = scope.getStepResult(body.id);
+      const prevCount = previous?.metadata?.iterationCount;
+      const iteration = prevCount ? prevCount - 1 : 0;
+      const data = previous !== undefined && Object.hasOwn(previous, 'payload') ? previous.payload : incoming.data;
+
       // Probed inside a `try`: reading the capability can itself throw (a getter), and a throw
       // here would lose the consumed input and strand the run without naming a place.
       let capable = false;
@@ -199,14 +281,13 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
             `loop '${entry.id}' needs StepRunner.evaluateLoopCondition, which this run's runner ` +
               'does not implement; failing before the body runs',
           );
-        scope.recordStepResult(body.id, { status: 'failed', error });
+        recordFailure(scope, error, data, 0);
         c.output(exits.failed, loopFailure(error));
         return;
       }
-      c.output(ready, { data: incoming.data, iteration: 0 });
+      c.output(ready, { data, iteration });
       for (let i = 0; i < bound; i++) c.output(budget, null);
-    })
-    .build();
+    });
 
   const enter = Transition.builder(named('enter'))
     .inputs(one(ready), one(budget))
@@ -214,10 +295,11 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
     .outputs(and(outPlace(bodyIn), outPlace(running)))
     .action(async (c) => {
       const state = c.input(ready);
-      c.output(bodyIn, { data: state.data });
-      c.output(running, { iteration: state.iteration + 1 });
-    })
-    .build();
+      const iteration = state.iteration + 1;
+      // `iteration` on the flow token is what the leaf stamps as `metadata.iterationCount`.
+      c.output(bodyIn, { data: state.data, iteration });
+      c.output(running, { iteration });
+    });
 
   const exhaust = Transition.builder(named('exhaust'))
     .inputs(one(ready))
@@ -229,13 +311,14 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
       const scope = scopeOf(c);
       const error = new Error(
         `loop '${entry.id}' reached its iterationBound of ${bound} and the ${loopType} condition ` +
-          `still asked for another iteration (${state.iteration} ran). The bound is this ` +
-          "engine's, not Mastra's, whose loop has none.",
+          `still asked for another iteration (iterationCount ${state.iteration}). The bound is ` +
+          "this engine's, not Mastra's, whose loop has none.",
       );
-      scope.recordStepResult(body.id, { status: 'failed', error });
+      // The payload of the iteration that last ran, which is what Mastra's last body result holds.
+      const last = scope.getStepResult(body.id);
+      recordFailure(scope, error, last === undefined ? state.data : last.payload, state.iteration);
       c.output(exits.failed, loopFailure(error));
-    })
-    .build();
+    });
 
   const check = Transition.builder(named('check'))
     .inputs(one(produced), one(running))
@@ -253,7 +336,7 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
         if (evaluate === undefined) {
           throw new Error(`loop '${entry.id}' needs StepRunner.evaluateLoopCondition`);
         }
-        const held = await evaluate.call(scope.runner, entry.id, output.data, marker.iteration, viewOf(scope, path));
+        const held = await evaluate.call(scope.runner, entry.id, output.data, marker.iteration, viewOf(scope, viewPath));
         // Truthiness, as `while (dowhile ? isTrue : !isTrue)` reads it (:901).
         decision = (loopType === 'dowhile' ? Boolean(held) : !held) ? { kind: 'repeat' } : { kind: 'exit' };
       } catch (error) {
@@ -268,15 +351,17 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
           c.output(ready, { data: output.data, iteration: marker.iteration });
           return;
         case 'exit':
-          c.output(exiting, output);
+          // The iteration stops here: the next entry is not an iteration of this loop.
+          c.output(exiting, { data: output.data });
           return;
-        case 'failed':
-          scope.recordStepResult(body.id, { status: 'failed', error: decision.error });
+        case 'failed': {
+          const last = scope.getStepResult(body.id);
+          recordFailure(scope, decision.error, last === undefined ? output.data : last.payload, marker.iteration);
           c.output(failing, loopFailure(decision.error));
           return;
+        }
       }
-    })
-    .build();
+    });
 
   const finish = Transition.builder(named('finish'))
     .inputs(one(exiting))
@@ -284,8 +369,7 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
     .outputs(outPlace(next))
     .action(async (c) => {
       c.output(next, c.input(exiting));
-    })
-    .build();
+    });
 
   const abort = Transition.builder(named('abort'))
     .inputs(one(failing))
@@ -298,6 +382,7 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
 
   // Any non-success iteration ends the loop with that result (:791-801). The body's leaf has
   // already recorded it under the body's id, which is also where Mastra keeps the loop's result.
+  // Not gated: that return precedes the :807 check, and the settle stage re-stamps it on cancel.
   const leave = <T>(role: string, from: Place<T>, to: Place<T>) =>
     Transition.builder(named(`leave-${role}`))
       .inputs(one(from), one(running))
@@ -308,19 +393,88 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
       })
       .build();
 
-  return {
-    inPlace,
-    transitions: [
-      start,
-      enter,
-      exhaust,
-      check,
-      finish,
-      abort,
-      leave('failed', bodyExits.failed, exits.failed),
-      leave('bailed', bodyExits.bailed, exits.bailed),
-      leave('suspended', bodyExits.suspended, exits.suspended),
-      leave('paused', bodyExits.paused, exits.paused),
-    ],
-  };
+  const transitions: Transition[] = [];
+  const sweeps: Transition[] = [];
+  if (cancel !== undefined) {
+    start.inhibitor(cancel);
+    enter.inhibitor(cancel);
+    exhaust.inhibitor(cancel);
+    check.inhibitor(cancel);
+    finish.inhibitor(cancel);
+
+    // Before the entry (`default.ts:815`): nothing has started, nothing is recorded — Mastra returns
+    // before `entry.ts` stores a result.
+    sweeps.push(
+      Transition.builder(named('cancel-in'))
+        .inputs(one(inPlace))
+        .read(cancel)
+        .outputs(outPlace(exits.canceled))
+        .action(async (c) => {
+          c.input(inPlace);
+          c.output(exits.canceled, canceled);
+        })
+        .build(),
+    );
+    // Before a body run (:742), which is also where a repeat decided under cancel lands (:889).
+    // Each sweep after `start` records the bare canceled result, as `entry.ts:811` stores it.
+    sweeps.push(
+      Transition.builder(named('cancel-ready'))
+        .inputs(one(ready))
+        .read(cancel)
+        .reset(budget)
+        .outputs(outPlace(exits.canceled))
+        .action(async (c) => {
+          c.input(ready);
+          recordCanceled(scopeOf(c));
+          c.output(exits.canceled, canceled);
+        })
+        .build(),
+    );
+    // After a body success, before the condition (:807): the condition is never asked.
+    sweeps.push(
+      Transition.builder(named('cancel-produced'))
+        .inputs(one(produced), one(running))
+        .read(cancel)
+        .reset(budget)
+        .outputs(outPlace(exits.canceled))
+        .action(async (c) => {
+          c.input(produced);
+          c.input(running);
+          recordCanceled(scopeOf(c));
+          c.output(exits.canceled, canceled);
+        })
+        .build(),
+    );
+    // After a condition that said stop (:889): the loop's success is not handed on.
+    sweeps.push(
+      Transition.builder(named('cancel-exiting'))
+        .inputs(one(exiting))
+        .read(cancel)
+        .reset(budget)
+        .outputs(outPlace(exits.canceled))
+        .action(async (c) => {
+          c.input(exiting);
+          recordCanceled(scopeOf(c));
+          c.output(exits.canceled, canceled);
+        })
+        .build(),
+    );
+  }
+
+  transitions.push(
+    start.build(),
+    enter.build(),
+    exhaust.build(),
+    check.build(),
+    finish.build(),
+    abort,
+    leave('failed', bodyExits.failed, exits.failed),
+    leave('bailed', bodyExits.bailed, exits.bailed),
+    leave('suspended', bodyExits.suspended, exits.suspended),
+    leave('paused', bodyExits.paused, exits.paused),
+    // Declared last: see "Declaration order" above.
+    ...sweeps,
+  );
+
+  return { inPlace, transitions };
 };
