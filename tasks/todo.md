@@ -2,11 +2,11 @@
 
 ## M0 — Repository
 - [x] Scaffold from n8n-libpetri conventions, TypeScript package skeleton, CI
-- [x] `libpetri` linked as `file:../../libpetri/typescript`, because the engine calls surface
-      that is committed but unreleased ([TIME-015] injectable clock, the [MOD-031] place-alias
-      fix, [NU-011] resume-safe minting) plus [CORE-073]/[ENV-014] snapshot, which is
-      implemented but uncommitted. npm publishes 6.0.0; the floor becomes `^6.1.0` the day it
-      publishes. `scripts/libpetri-pin` records the sibling revision the numbers came from
+- [x] `libpetri` from the registry at `^6.1.0`, published 2026-09-23 as the first release carrying
+      everything the engine calls ([TIME-015], the [MOD-031] fix, [NU-011], [CORE-073]/[ENV-014]).
+      Until then it was linked from the sibling checkout. Switched with every gate re-run
+      against the release: 562 tests across 22 files, `npm run check` and `npm run build` clean.
+      Linking remains, deliberately opt-in, for trying an unreleased fix
 - [x] Gates that fail loudly rather than degrading quietly: `tests/z3-gate.test.ts` (a missing
       solver turns every proof into `unknown` and still reports green) and
       `tests/upstream/libpetri-surface-gate.test.ts` (a missing clock does not throw — the
@@ -297,24 +297,21 @@ bump not yet run):
       The pin moved to `808171c`; the tree is clean and its build fresh, so `--strict`
       certifies it and figures are attributable to a revision for the first time
 
-**Reported this phase, open upstream:**
+**Ahead of the 6.1.0 release** (TS release commit `70e7f38`), none of it depended on:
 
-- [ ] U7 — `PrecompiledNetExecutor` spun synchronously on a 4098-place chain. **Root-caused by
-      the libpetri session:** `PrecompiledNet`'s single-word needs index was an `Int8Array`, so
-      place ids from 4096 up wrapped negative and read as "no needs" — a spin on an input arc, a
-      silently ignored inhibitor on an inhibitor arc. Place ids trigger it, not the count, which
-      is why a 4411-place foreach ran and a 4097-place workflow hung. Fixed (`Int32Array`, with a
-      regression test that fails without it) in libpetri's working tree, uncommitted; confirmed
-      live here: 4098 places in 121ms, 5000 in 163ms. `MAX_NET_PLACES` stays until the package
-      depends on a release carrying it
-- [x] U8 — answered: depositing several tokens into one place an `and` names once is
-      **specified**, not an accident. [IO-015] validates the set of places ("names places, not
-      counts"), and [IO-016 AC4] deposits regardless and reports it as one WARN log event per
-      transition per execution; tightening it would be a breaking spec change. So the loop
-      gadget stands on specified behaviour — and emits that WARN on every run, which M5's event
-      mapping must expect. The spec's advice for a net meant to be proven is to express the
-      multiplicity in topology, which is the route to proving the loop allowance from the entry
-      marking rather than from the post-start one
+- [ ] U7 — the `PrecompiledNet` word-index fix (`Int8Array` -> `Int32Array`): place ids from
+      4096 up wrapped negative, a synchronous spin on an input arc and a silently ignored
+      inhibitor. Found for us, fixed in libpetri's working tree, **uncommitted**; confirmed live
+      when linked (4098 places in 121ms). `MAX_NET_PLACES` = 4096 keeps every id below 4096, so
+      it excludes both failures on the release; lift it with the release that carries the fix.
+      Confirmed 2026-09-23 by libpetri-d6: the only uncommitted code in libpetri, TS-only (Java
+      uses `int[]`), no release scheduled; a TS 6.1.1 patch is the natural vehicle, and the
+      libpetri session is raising it with the user
+- [x] U8 — answered: several tokens into one place an `and` names once is **specified**
+      ([IO-015] validates the set of places; [IO-016 AC4] deposits and reports one WARN per
+      transition per execution). The loop gadget stands on specified behaviour
+- `4d7a9d9` — ν-join verification soundness, committed after the release. Not relevant: no
+  compiled net uses `matchSpec` or `freshName`
 
 **Not pursued, deliberately:**
 

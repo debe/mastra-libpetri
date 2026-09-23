@@ -2,7 +2,7 @@
 
 | Script | Role |
 |---|---|
-| `link-libpetri.sh` | Links `typescript/node_modules/libpetri` at a sibling checkout. The default until libpetri 6.1.0 publishes — the engine calls `TIME-015`, the `MOD-031` alias fix and `NU-011`, none of which are in the released 6.0.0. `--check` verifies the link and the pinned revision; `--unlink` restores the registry copy. |
+| `link-libpetri.sh` | Links `typescript/node_modules/libpetri` at a sibling checkout, **on purpose only** — to try a libpetri fix that is not released. The package depends on the released `^6.1.0`. `--check` / `--strict` / `--provenance` report what a linked run actually used; `--unlink` returns to the registry copy. |
 | `libpetri-pin` | The sibling revision measurements were taken against. A figure produced from a different revision is not comparable and is not reported as if it were. |
 | `bootstrap-mastra.sh` | Puts a pinned Mastra tree under the gitignored `.mastra/`. `--dist` (the default) fetches the published `@mastra/core`, verifies it against the pinned sha512, and recovers the **original TypeScript** of the workflow engine from the sourcemaps the package ships — no monorepo clone. `--repo` clones the monorepo, which only conformance needs. `--check` reports what is present. |
 | `mastra-pin` | The two Mastra pins, and why they are separate: the published version the compiler is written against, and the git commit conformance runs against. |

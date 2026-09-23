@@ -23,32 +23,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # libpetri is linked from a sibling checkout until 6.1.0 publishes: the engine calls
-      # TIME-015, the MOD-031 alias fix and NU-011, none of which are in the released 6.0.0.
-      - name: Check out libpetri
-        uses: actions/checkout@v7
-        with:
-          repository: debe/libpetri
-          path: .libpetri-src
-
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
-
-      - name: Build libpetri
-        working-directory: .libpetri-src/typescript
-        run: npm ci && npm run build
-
-      - name: Place libpetri where the file: dependency expects it
-        run: |
-          mkdir -p "${{ github.workspace }}/../libpetri"
-          cp -R "${{ github.workspace }}/.libpetri-src/typescript" "${{ github.workspace }}/../libpetri/typescript"
 
       # The solver is a test input, so its version is pinned and verified on PATH. Without it
       # every proof returns `unknown` and the suite would still report green.
       - uses: ./.github/actions/install-z3
 
-      - run: npm install
+      # libpetri comes from the registry at the version the lockfile pins, so CI tests exactly
+      # what a release consumer gets rather than whatever libpetri's main branch holds today.
+      - run: npm ci
       - run: npm run check
       - run: npm test
       - run: npm run build

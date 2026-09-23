@@ -55,27 +55,33 @@ requirement IDs (`IO-015`, `EXEC-003`, `MOD-031`, `TIME-015`, …).
 
 ### libpetri
 
-Linked from a sibling checkout, not installed from the registry:
-`"libpetri": "file:../../libpetri/typescript"`. The engine calls surface that is committed but
-unreleased — **TIME-015** (injectable clock), the **MOD-031** place-alias fix, **NU-011**
-(resume-safe minting) and **CORE-073**/**ENV-014** snapshot (committed in `78e3b10`). npm
-publishes 6.0.0. The floor becomes `^6.1.0` the day it publishes.
+Installed from the registry: `"libpetri": "^6.1.0"`, the first release carrying everything the
+engine calls — **TIME-015** (injectable clock), the **MOD-031** place-alias fix, **NU-011**
+(resume-safe minting) and **CORE-073**/**ENV-014** snapshot. Figures measured against it are
+reportable.
+
+The sibling checkout is linked only on purpose, to try a fix that is not released yet:
 
 ```bash
+scripts/link-libpetri.sh               # link typescript/node_modules/libpetri at ../libpetri
 scripts/link-libpetri.sh --check       # verify the link; print the provenance line
 scripts/link-libpetri.sh --provenance  # the one line to quote beside any measurement
 scripts/link-libpetri.sh --strict      # as --check, but fail if the sibling tree is dirty
-scripts/link-libpetri.sh --unlink      # restore the registry copy before measuring
+scripts/link-libpetri.sh --unlink      # back to the registry copy
 ```
 
-**A revision identifies the linked tree only when that tree is clean and its build is fresh.**
-The sibling is a peer session's working tree and is often mid-change, and `dist/` — what the
-package actually imports — is gitignored, so neither a matching `HEAD` nor a clean `git status`
-proves what ran. That was a *silent* mis-attribution once, which is why identity is
-content-addressed (`libpetri <rev>[+dirty] dist=<hash>`) and `--strict` also refuses a `dist/`
-older than any source file. Quote the provenance line, not the pin, next to any figure.
+**A figure measured while linked is not comparable with one from a release.** The sibling is a
+peer session's working tree and is often mid-change, and `dist/` — what the package actually
+imports — is gitignored, so neither a matching `HEAD` nor a clean `git status` proves what ran.
+That was a *silent* mis-attribution once, which is why identity is content-addressed
+(`libpetri <rev>[+dirty] dist=<hash>`) and `--strict` also refuses a `dist/` older than any
+source file. Quote the provenance line next to any figure measured linked, and never commit the
+`file:` specifier: `npm install` records it in the lockfile and keeps restoring the link.
 
-`scripts/libpetri-pin` records the sibling revision. `src/internal/libpetri-surface.ts` asserts
+What is ahead of the release is tracked in `tasks/todo.md` Track U. Ask the libpetri sessions
+(`ListAgents`) rather than reconstructing it from git.
+
+`scripts/libpetri-pin` records the sibling revision last linked against. `src/internal/libpetri-surface.ts` asserts
 the surface at entry and `tests/upstream/libpetri-surface-gate.test.ts` gates the build, because
 a missing clock does not throw — the executor silently reads the machine clock, and a run that
 was supposed to be deterministic simply is not.

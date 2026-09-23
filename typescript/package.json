@@ -41,7 +41,7 @@
     "bench": "vitest bench --run"
   },
   "dependencies": {
-    "libpetri": "file:../../libpetri/typescript"
+    "libpetri": "^6.1.0"
   },
   "devDependencies": {
     "@mastra/core": "^1.67.0",
