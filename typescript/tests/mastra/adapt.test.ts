@@ -830,7 +830,8 @@ describe('end to end: adapt, compile, run', () => {
     const outcome = await runWorkflow(compile(description), 'order', { runner });
 
     expect(runner.attempts).toHaveLength(2);
-    expect(outcome).toEqual({ status: 'tripwire', stepId: 'screen', path: [0], tripwire: { reason: 'pii' } });
+    // The failure's own error rides beside the tripwire.
+    expect(outcome).toEqual({ status: 'tripwire', stepId: 'screen', path: [0], tripwire: { reason: 'pii' }, error: 'blocked' });
   });
 
   it("hands a .map() the run's input and any earlier step's result, and retries it by the workflow config", async () => {
@@ -1128,7 +1129,7 @@ describe('an adapted flow, canceled', () => {
 
     const report = await runWorkflowDetailed(compiled, 'order', { runner, signal: aborted.signal });
 
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'validate', path: [0] } });
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'validate', path: [0] }, started: false });
     expect(runner.calls).toEqual([]);
     expect(report.stepResults.size).toBe(0);
   });
@@ -1148,7 +1149,7 @@ describe('an adapted flow, canceled', () => {
 
     const report = await runWorkflowDetailed(compiled, 'order', { runner, clock, signal: controller.signal });
 
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'charge', path: [1] } });
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'charge', path: [1] }, started: false });
     expect(runner.calls).toEqual(['validate']);
     expect([...report.stepResults.keys()]).toEqual(['validate']);
     // The record keeps its real outcome, and Mastra reads it as the success it was.
@@ -1183,7 +1184,7 @@ describe('an adapted flow, canceled', () => {
     expect(clock.elapsed()).toBe(100);
     expect(report.stepResults.get('charge')).toMatchObject({ status: 'success', output: 'charged' });
     // The literal sleep after it never starts: the run ends at it, not sixty seconds later.
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'settle', path: [2] } });
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'settle', path: [2] }, started: false });
     expect(report.stepResults.has('settle')).toBe(false);
   });
 
@@ -1201,7 +1202,7 @@ describe('an adapted flow, canceled', () => {
 
     const report = await runWorkflowDetailed(compiled, 'order', { runner, signal: controller.signal });
 
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'validate', path: [0] } });
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'validate', path: [0] }, started: true });
     expect(toMastraStepResult(report.stepResults.get('validate')!)).toMatchObject({
       status: 'failed',
       error: expect.objectContaining({ message: 'invalid' }),
@@ -1224,12 +1225,12 @@ describe('an adapted flow, canceled', () => {
 
     const outcome = await runWorkflow(compiled, 'order', { runner, signal: controller.signal, timeoutMs: 10_000 });
 
-    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'settle', path: [2] } });
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'settle', path: [2] }, started: true });
     expect(runner.calls).toEqual(['validate', 'charge']);
     expect(performance.now() - started).toBeLessThan(2_000);
   });
 
-  it('ends a per-run sleep in progress early and cancels at the sleep, recording nothing for it', async () => {
+  it('ends a per-run sleep in progress early and cancels at the sleep, keeping only its waiting record', async () => {
     // handlers/entry.ts:605-609 writes `{status: 'waiting'}` before the wait; :642-643 then takes
     // the aborted branch — `execResults = { status: 'canceled' }` — and never reaches the success
     // write at :665. `isSingleStepEntry` excludes a sleep (utils.ts:301), so :812 does not
@@ -1248,15 +1249,21 @@ describe('an adapted flow, canceled', () => {
 
     const report = await runWorkflowDetailed(short, 'order', { runner, signal: controller.signal, timeoutMs: 10_000 });
 
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'backoff', path: [1] } });
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'backoff', path: [1] }, started: true });
     expect(runner.calls).toEqual(['quote']);
     expect(performance.now() - started).toBeLessThan(2_000);
-    expect(report.stepResults.has('backoff')).toBe(false);
+    expect(report.stepResults.get('backoff')).toEqual({ status: 'waiting', payload: 'order', startedAt: expect.any(Number) });
+    // Mastra's accessor answers `null` for anything but a success (`step.ts:179-193`).
     expect(getStepResultView({ getStepResult: (id) => report.stepResults.get(id), initData: 'order' })('backoff')).toBeNull();
-    expect([...report.stepResults.keys()]).toEqual(['quote']);
+    expect([...report.stepResults.keys()]).toEqual(['quote', 'backoff']);
+    expect(toMastraStepResult(report.stepResults.get('backoff')!)).toEqual({
+      status: 'waiting',
+      payload: 'order',
+      startedAt: expect.any(Number),
+    });
   });
 
-  it('ends a literal sleepUntil in progress early and cancels at it, recording nothing for it', async () => {
+  it('ends a literal sleepUntil in progress early and cancels at it, keeping only its waiting record', async () => {
     // A literal sleepUntil waits in the action, like a per-run one (entry.ts:752-776 is the same
     // aborted branch as :642 for the sleepUntil path).
     const controller = new AbortController();
@@ -1273,10 +1280,11 @@ describe('an adapted flow, canceled', () => {
 
     const report = await runWorkflowDetailed(until, 'order', { runner, signal: controller.signal, timeoutMs: 10_000 });
 
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'open', path: [1] } });
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'open', path: [1] }, started: true });
     expect(runner.calls).toEqual(['quote']);
     expect(performance.now() - started).toBeLessThan(2_000);
-    expect(report.stepResults.has('open')).toBe(false);
+    expect(report.stepResults.get('open')).toEqual({ status: 'waiting', payload: 'order', startedAt: expect.any(Number) });
+    expect([...report.stepResults.keys()]).toEqual(['quote', 'open']);
   });
 
   it('never asks for a per-run wait once the abort landed before the sleep', async () => {
@@ -1299,7 +1307,7 @@ describe('an adapted flow, canceled', () => {
       { runner, signal: controller.signal },
     );
 
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'backoff', path: [1] } });
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'backoff', path: [1] }, started: false });
     expect(waited).toEqual([]);
     expect([...report.stepResults.keys()]).toEqual(['quote']);
   });
@@ -1339,7 +1347,7 @@ describe('an adapted flow, canceled', () => {
       const report = await runWorkflowDetailed(mutant, 'order', { runner, signal: controller.signal, timeoutMs: 10_000 });
 
       expect(report.stepResults.get('backoff')).toMatchObject({ status: 'success' });
-      expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'ship', path: [2] } });
+      expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'ship', path: [2] }, started: false });
     });
   });
 
@@ -1360,7 +1368,7 @@ describe('an adapted flow, canceled', () => {
       signal: controller.signal,
     });
 
-    expect(report.outcome).toEqual({ status: 'canceled' });
+    expect(report.outcome).toEqual({ status: 'canceled', started: true });
     expect(report.stepResults.get('ship')).toMatchObject({ status: 'success', output: 'order+shipped' });
   });
 

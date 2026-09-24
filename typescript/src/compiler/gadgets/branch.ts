@@ -542,7 +542,7 @@ function sweep(
       const incoming = tctx.input(from);
       const origin: Origin =
         incoming.foreachIndex === undefined ? { stepId, path } : { stepId, path, foreachIndex: incoming.foreachIndex };
-      tctx.output(canceled, { origin });
+      tctx.output(canceled, { origin, started: false });
     })
     .build();
 }

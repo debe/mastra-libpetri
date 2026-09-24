@@ -3,6 +3,7 @@ import { defineConfig } from 'tsup';
 export default defineConfig({
   entry: [
     'src/index.ts',
+    'src/mastra/index.ts',
     'src/compiler/index.ts',
     'src/verify/index.ts',
     'src/codec/index.ts',
@@ -14,5 +15,6 @@ export default defineConfig({
   sourcemap: true,
   clean: true,
   splitting: true,
-  external: ['libpetri', '@mastra/core'],
+  // `@mastra/core` is a peer: every subpath (`@mastra/core/workflows`, `/evented`, …) stays external.
+  external: ['libpetri', '@mastra/core', /^@mastra\/core\//],
 });

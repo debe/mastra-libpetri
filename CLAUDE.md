@@ -116,11 +116,14 @@ skips.
 - `compiler/` — `StepFlowEntry[]` -> `CompiledWorkflow` (one `PetriNet`, a cached
   `PrecompiledNet`, a `NetMap` relating transitions to entries and places to `(entry, port)`).
   Takes a structural description; no Mastra runtime dependency.
-- `engine/` — `PetriExecutionEngine` and the transition actions that call back into step
-  execution.
-- `codec/` — marking snapshot <-> Mastra's `WorkflowRunState`.
-- `mastra/` — Mastra's interfaces mirrored **structurally**, so `@mastra/core` is a type-only
-  devDependency and a tsup external and the package never imports Mastra at runtime.
+- `engine/` — the kernel (`runWorkflow`: seed, run to a terminal, classify) and the run scope.
+  Host-free; `PetriExecutionEngine` itself lives in `mastra/` ([ADR 0005]).
+- `codec/` — marking snapshot <-> Mastra's `WorkflowRunState` (M4; empty today — `mastra/persist.ts`
+  builds the snapshot one way, at start and terminal).
+- `mastra/` — the **only** directory that imports `@mastra/core` at runtime ([ADR 0005]):
+  `PetriExecutionEngine extends ExecutionEngine`, the runner that fires steps on Mastra's own
+  `StepExecutor`, result formatting and persistence. `@mastra/core` is a peer dependency and a tsup
+  external; `compiler/`, `engine/` and `verify/` stay host-free, enforced by a source guard test.
 - `verify/` — property derivation and the CLI.
 - `conformance/` — the classifier and the differential harness.
 - `internal/` — the libpetri surface assertion and shared helpers.

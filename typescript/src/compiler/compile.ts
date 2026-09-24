@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { PetriNet, Transition, one, outPlace, place, type Place } from 'libpetri';
+import { PetriNet, PrecompiledNet, Transition, one, outPlace, place, type Place } from 'libpetri';
 import {
   NameVocabulary,
   WF_BAILED,
@@ -158,10 +158,12 @@ export function compile(description: WorkflowDescription, options: CompileOption
     );
     return settle;
   };
+  // A settled outcome is work that ran: the entry finished and the re-stamp turns it canceled.
   const originOf = (t: { stepId: string; path: EntryPath; foreachIndex?: number }): CanceledToken => ({
     origin: t.foreachIndex === undefined
       ? { stepId: t.stepId, path: t.path }
       : { stepId: t.stepId, path: t.path, foreachIndex: t.foreachIndex },
+    started: true,
   });
 
   const topLevelExits: Exits = {
@@ -172,7 +174,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
     // Already canceled: nothing left to decide.
     canceled: terminals.canceled,
   };
-  const settleDone = settleOf('done', terminals.done, () => ({}));
+  const settleDone = settleOf('done', terminals.done, () => ({ started: true }));
 
   const emit = (
     entry: EntryDescription,
@@ -240,6 +242,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
 
   return {
     net,
+    program: PrecompiledNet.compile(net),
     netMap: { transitionToEntry, placeToEntry },
     entryPlace: next,
     terminals,

@@ -49,13 +49,15 @@ type Residue = { readonly residue?: readonly string[] };
 type At = { readonly stepId: string; readonly path: EntryPath; readonly foreachIndex?: number };
 
 export type RunOutcome =
-  | ({ readonly status: 'success'; readonly output: unknown; readonly bailed?: true } & Residue)
+  | ({ readonly status: 'success'; readonly output: unknown; readonly bailed?: undefined } & Residue)
+  /** A top-level `bail`: Mastra reports it as a success; `At` names the step that bailed. */
+  | ({ readonly status: 'success'; readonly output: unknown; readonly bailed: true } & At & Residue)
   | ({ readonly status: 'failed'; readonly error: unknown } & At & Residue)
-  | ({ readonly status: 'tripwire'; readonly tripwire: unknown } & At & Residue)
+  | ({ readonly status: 'tripwire'; readonly tripwire: unknown; readonly error: unknown } & At & Residue)
   | ({ readonly status: 'suspended'; readonly payload: unknown } & At & Residue)
   | ({ readonly status: 'paused' } & At & Residue)
   /** Mastra's canceled run carries no step id; `origin` names what was waiting or running. */
-  | ({ readonly status: 'canceled'; readonly origin?: CanceledToken['origin'] } & Residue)
+  | ({ readonly status: 'canceled'; readonly origin?: CanceledToken['origin']; readonly started: boolean } & Residue)
   | { readonly status: 'stranded'; readonly places: readonly string[] };
 
 export interface RunOptions {
@@ -76,8 +78,12 @@ export interface RunOptions {
    * macrotask queue — a chain of zero-delay firings whose actions resolve as microtasks starves
    * the timer until the chain stops by itself. That is executor behaviour, not something this
    * file can bound.
+   *
+   * `null` means **no budget**, which is what a Mastra run has. A run with a signal whose model
+   * strands a token then waits forever — ruled out by the proven `exactlyOneTerminal`, not by a
+   * timer. Omitted, the harness default of five minutes applies.
    */
-  readonly timeoutMs?: number;
+  readonly timeoutMs?: number | null;
   /** Step records carried in from an earlier segment. Each must be a recognised outcome. */
   readonly stepResults?: ReadonlyMap<string, StepRecord>;
   /**
@@ -123,6 +129,12 @@ export async function runWorkflowDetailed(
   input: unknown,
   options: RunOptions,
 ): Promise<RunReport> {
+  if (compiled.program.compiled.net !== compiled.net) {
+    // The executor runs `program` and ignores `net`, while the verifier proves `net`. A workflow
+    // whose `net` was swapped after compiling would run one net and be proven on another — the
+    // one thing "one net serves execution and verification" rules out.
+    throw new Error(`compiled workflow '${compiled.net.name}': its program was compiled from a different net`);
+  }
   if (options.stepResults) assertStepResults(options.stepResults);
   const { signal } = options;
   const scope = new KernelRunScope({
@@ -169,6 +181,7 @@ export async function runWorkflowDetailed(
 
   executor = new PrecompiledNetExecutor(compiled.net, initial, {
     executionContextProvider: () => context,
+    program: compiled.program,
     ...(options.clock ? { clock: options.clock, deadlineToleranceMs: 0 } : {}),
     ...(signal ? { environmentPlaces: new Set([cancelPlace]), eventStore: drainOnTerminal } : {}),
   });
@@ -183,7 +196,7 @@ export async function runWorkflowDetailed(
 
   let marking: Marking;
   try {
-    marking = await executor.run(options.timeoutMs ?? 300_000, 'close');
+    marking = await executor.run(options.timeoutMs === null ? undefined : (options.timeoutMs ?? 300_000), 'close');
   } finally {
     signal?.removeEventListener('abort', onAbort);
   }
@@ -211,7 +224,7 @@ export async function runWorkflowDetailed(
 }
 
 /** Statuses a carried-in record may have: every outcome, and a combinator's `canceled`. */
-const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bailed', 'suspended', 'paused', 'canceled']);
+const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bailed', 'suspended', 'paused', 'canceled', 'waiting']);
 
 /**
  * Refuses a malformed carried-in record at the boundary. A `null` in there would otherwise be
@@ -289,11 +302,14 @@ export function classify(compiled: CompiledWorkflow, marking: Marking): RunOutco
   if (cancellation !== null) {
     // Canceled first: Mastra re-stamps whatever the interrupted entry produced
     // (`handlers/entry.ts:815-817`), so a canceled run is canceled whatever else it reached.
-    outcome = cancellation.origin === undefined ? { status: 'canceled' } : { status: 'canceled', origin: cancellation.origin };
+    outcome =
+      cancellation.origin === undefined
+        ? { status: 'canceled', started: cancellation.started }
+        : { status: 'canceled', origin: cancellation.origin, started: cancellation.started };
     reported = terminals.canceled.name;
   } else if (failure !== null) {
     outcome = isTripwire(failure.tripwire)
-      ? { status: 'tripwire', ...at(failure), tripwire: failure.tripwire }
+      ? { status: 'tripwire', ...at(failure), tripwire: failure.tripwire, error: failure.error }
       : { status: 'failed', ...at(failure), error: failure.error };
     reported = terminals.failed.name;
   } else if (suspension !== null) {
@@ -303,7 +319,7 @@ export function classify(compiled: CompiledWorkflow, marking: Marking): RunOutco
     outcome = { status: 'paused', ...at(pause) };
     reported = terminals.paused.name;
   } else if (bail !== null) {
-    outcome = { status: 'success', output: bail.output, bailed: true };
+    outcome = { status: 'success', output: bail.output, bailed: true, ...at(bail) };
     reported = terminals.bailed.name;
   } else if (done !== null) {
     outcome = { status: 'success', output: done.data };

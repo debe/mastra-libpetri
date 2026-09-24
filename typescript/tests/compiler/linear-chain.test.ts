@@ -79,7 +79,8 @@ describe('linear chain', () => {
 
     // charge ran to completion and is recorded; ship is swept before it starts.
     expect(runner.calls).toEqual(['validate', 'charge']);
-    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'ship', path: [2] } });
+    // Swept at `ship`'s gate: it never began, `started: false`.
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'ship', path: [2] }, started: false });
     expect([...stepResults.keys()]).toEqual(['validate', 'charge']);
   });
 
@@ -92,7 +93,7 @@ describe('linear chain', () => {
       runWorkflow(compiled, 'Y', { runner: new RecordingRunner(), signal: new AbortController().signal }),
     ]);
     // A cancel in one run is a token in that run's marking, never the compiled net's.
-    expect(x).toEqual({ status: 'canceled', origin: { stepId: 'validate', path: [0] } });
+    expect(x).toEqual({ status: 'canceled', origin: { stepId: 'validate', path: [0] }, started: false });
     expect(y).toEqual({ status: 'success', output: 'Y' });
   });
 
@@ -177,6 +178,19 @@ describe('linear chain', () => {
 
     expect(a.structuralHash).toBe(b.structuralHash);
     expect(a.structuralHash).not.toBe(different.structuralHash);
+  });
+
+  it('precompiles the very net it returns, once, and a run reuses it (CompiledWorkflow.program)', async () => {
+    const compiled = compile(chain);
+    // The program is libpetri's compilation of *this* net — not a copy, not another build of it.
+    expect(compiled.program.compiled.net).toBe(compiled.net);
+    expect(compiled.program.placeCount).toBe(compiled.net.places.size);
+    expect(compiled.program.transitionCount).toBe(compiled.net.transitions.size);
+    // Two runs of one compiled workflow leave the program as they found it.
+    const before = compiled.program;
+    await runWorkflow(compiled, 'a', { runner: new RecordingRunner() });
+    await runWorkflow(compiled, 'b', { runner: new RecordingRunner() });
+    expect(compiled.program).toBe(before);
   });
 
   it('rejects an empty workflow rather than compiling a net that cannot start', () => {

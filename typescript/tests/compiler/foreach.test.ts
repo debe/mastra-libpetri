@@ -404,7 +404,15 @@ describe('foreach: fail-fast (row 18)', () => {
     const report = await run([foreach(1)], ['a', 'b'], runner);
 
     expect(log.started).toEqual(['a']);
-    expect(report.outcome).toEqual({ status: 'tripwire', stepId: 'body', path: [0], foreachIndex: 0, tripwire: { reason: 'policy' } });
+    // The outcome carries the failure's `error` beside the tripwire (contract change).
+    expect(report.outcome).toEqual({
+      status: 'tripwire',
+      stepId: 'body',
+      path: [0],
+      foreachIndex: 0,
+      tripwire: { reason: 'policy' },
+      error: expect.objectContaining({ message: 'blocked' }),
+    });
   });
 
   it('treats a throwing runner as a failed item', async () => {
@@ -454,7 +462,8 @@ describe('foreach: bail, pause and suspend', () => {
     const report = await run([foreach(1)], ['a', 'b', 'c'], runner);
 
     expect(log.started).toEqual(['a', 'b']);
-    expect(report.outcome).toEqual({ status: 'success', output: 'early', bailed: true });
+    // A bail names its origin (contract change): the body, at the foreach's path, item 1.
+    expect(report.outcome).toEqual({ status: 'success', output: 'early', bailed: true, stepId: 'body', path: [0], foreachIndex: 1 });
     // Rewritten to 'success' when the bail ends the run, as Mastra rewrites the object its
     // stepResults holds (`default.ts:926-928`).
     expect(report.stepResults.get('body')).toMatchObject({ status: 'success', output: 'early', payload: 'b', metadata: { foreachIndex: 1 } });
@@ -495,7 +504,7 @@ describe('foreach: bail, pause and suspend', () => {
 
     const bailFirst = race('b');
     const bailed = await run([foreach(2)], ['a', 'b'], bailFirst.runner);
-    expect(bailed.outcome).toEqual({ status: 'success', output: 'bail:b', bailed: true });
+    expect(bailed.outcome).toEqual({ status: 'success', output: 'bail:b', bailed: true, stepId: 'body', path: [0], foreachIndex: 1 });
   });
 
   it('lets a failure outrank a bail that happened first', async () => {
@@ -522,7 +531,7 @@ describe('foreach: bail, pause and suspend', () => {
     });
     const report = await run([foreach(2)], ['a', 'b'], runner);
 
-    expect(report.outcome).toEqual({ status: 'success', output: 'early', bailed: true });
+    expect(report.outcome).toEqual({ status: 'success', output: 'early', bailed: true, stepId: 'body', path: [0], foreachIndex: 1 });
   });
 
   it('suspends at the lowest suspended index, whatever order they suspended in', async () => {
@@ -750,7 +759,10 @@ describe('foreach: nonRetryable on the aggregate failure (row 36)', () => {
 
 describe('foreach: cancellation (row 28)', () => {
   const origin = { stepId: 'body', path: [0] };
-  const canceledAt0 = { status: 'canceled', origin } as const;
+  // The cancel finisher reports a foreach that had opened (`started: true`); the sweep on the
+  // foreach's input, one that never did (`started: false`).
+  const canceledAt0 = { status: 'canceled', origin, started: true } as const;
+  const canceledBeforeAt0 = { status: 'canceled', origin, started: false } as const;
 
   /** `{...stepInfo, status: 'canceled', output: results, endedAt}` (`:1164-1169`, `:1298-1312`). */
   const expectCanceledRecord = (report: RunReport, payload: unknown, output: unknown[]): void => {
@@ -781,10 +793,10 @@ describe('foreach: cancellation (row 28)', () => {
     const report = await run([{ kind: 'step', id: 'before' }, foreach(3)], ['a', 'b'], runner, c.gadget, ac.signal);
 
     expect(runner.calls).toEqual(['before']);
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'body', path: [1] } });
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'body', path: [1] }, started: false });
     // Mastra's check before the entry (`default.ts:815`): the foreach never started — the sweep
     // took its input, so there is no partial array and no record under the body id.
-    expect(c.seen).toEqual([{ origin: { stepId: 'body', path: [1] } }]);
+    expect(c.seen).toEqual([{ origin: { stepId: 'body', path: [1] }, started: false }]);
     expect(report.stepResults.has('body')).toBe(false);
   });
 
@@ -802,8 +814,8 @@ describe('foreach: cancellation (row 28)', () => {
     const report = await run([foreach(2)], ['a', 'b'], runner, c.gadget, ac.signal);
 
     expect(runner.calls).toEqual([]);
-    expect(report.outcome).toEqual(canceledAt0);
-    expect(c.seen).toEqual([{ origin }]);
+    expect(report.outcome).toEqual(canceledBeforeAt0);
+    expect(c.seen).toEqual([{ origin, started: false }]);
     expect(report.stepResults.has('body')).toBe(false);
   });
 
@@ -819,7 +831,7 @@ describe('foreach: cancellation (row 28)', () => {
     expect(log.started).toEqual(['a']);
     expect(report.outcome).toEqual(canceledAt0);
     // `canceledResult.output` is the workers' `results` array (`:1160-1172`): `a` finished.
-    expect(c.seen).toEqual([{ origin, output: ['a!'] }]);
+    expect(c.seen).toEqual([{ origin, output: ['a!'], started: true }]);
     // ... and it is what Mastra stores under the body id (`entry.ts:811-812`), over item 0's own record.
     expectCanceledRecord(report, ['a', 'b', 'c'], ['a!']);
   });
@@ -844,6 +856,7 @@ describe('foreach: cancellation (row 28)', () => {
     expect([...log.finished].sort()).toEqual(['a', 'b', 'c']);
     expect(report.outcome).toEqual(canceledAt0);
     expect(c.seen).toHaveLength(1);
+    expect((c.seen[0] as CanceledToken).started).toBe(true);
     const output = (c.seen[0] as CanceledToken).output as unknown[];
     expect(output).toHaveLength(3);
     expect(1 in output).toBe(false);
@@ -870,7 +883,7 @@ describe('foreach: cancellation (row 28)', () => {
 
     expect(log.started).toEqual(['a', 'b']);
     expect(report.outcome).toEqual(canceledAt0);
-    expect(c.seen).toEqual([{ origin, output: [undefined, 'b!'] }]);
+    expect(c.seen).toEqual([{ origin, output: [undefined, 'b!'], started: true }]);
     expectCanceledRecord(report, ['a', 'b', 'c'], [undefined, 'b!']);
   });
 
@@ -907,7 +920,7 @@ describe('foreach: cancellation (row 28)', () => {
 
     expect(log.started).toEqual(['a', 'b']);
     expect(report.outcome).toEqual(canceledAt0);
-    expect(c.seen).toEqual([{ origin, output: [undefined, 'b!'] }]);
+    expect(c.seen).toEqual([{ origin, output: [undefined, 'b!'], started: true }]);
     expectCanceledRecord(report, ['a', 'b', 'c'], [undefined, 'b!']);
   });
 
@@ -923,7 +936,7 @@ describe('foreach: cancellation (row 28)', () => {
     });
     const report = await run([foreach(1, body({ source: 'workflow' }))], ['a', 'b'], runner, c.gadget, ac.signal);
     expect(report.outcome).toEqual(canceledAt0);
-    expect(c.seen).toEqual([{ origin, output: [] }]);
+    expect(c.seen).toEqual([{ origin, output: [], started: true }]);
     expectCanceledRecord(report, ['a', 'b'], []);
   });
 
@@ -969,7 +982,7 @@ describe('foreach: cancellation (row 28)', () => {
     const report = await run([foreach(1), { kind: 'step', id: 'after' }], ['a', 'b'], runner, c.gadget, ac.signal);
     expect(report.outcome).toEqual(canceledAt0);
     expect(runner.calls).not.toContain('after');
-    expect(c.seen).toEqual([{ origin, output: ['a!', 'b!'] }]);
+    expect(c.seen).toEqual([{ origin, output: ['a!', 'b!'], started: true }]);
     expectCanceledRecord(report, ['a', 'b'], ['a!', 'b!']);
   });
 
@@ -1059,7 +1072,7 @@ describe('foreach: cancellation (row 28)', () => {
     const intact = tapped('canceled', splitFirst(foreachGadget));
     const kept = await run(entries, ['a', 'b'], abortingBefore(intactAc), intact.gadget, intactAc.signal);
     // The sweep took the input: the foreach never opened, so there is no partial array and no record.
-    expect(intact.seen).toEqual([{ origin: at1 }]);
+    expect(intact.seen).toEqual([{ origin: at1, started: false }]);
     expect(kept.stepResults.has('body')).toBe(false);
 
     const brokenAc = new AbortController();
@@ -1068,7 +1081,8 @@ describe('foreach: cancellation (row 28)', () => {
     const lost = await run(entries, ['a', 'b'], runner, broken.gadget, brokenAc.signal);
     expect(runner.calls).toEqual(['before']);
     // It opened — frame, cursor, permits — and the cancel finisher closed it with an empty array.
-    expect(broken.seen).toEqual([{ origin: at1, output: [] }]);
+    // `cancel-empty` reports a foreach that had opened: `started: true`.
+    expect(broken.seen).toEqual([{ origin: at1, output: [], started: true }]);
     expect(lost.stepResults.get('body')).toMatchObject({ status: 'canceled', output: [] });
   });
 
@@ -1113,5 +1127,100 @@ describe('foreach: cancellation (row 28)', () => {
     expect(broken.seen).toEqual([]);
     // What a host sees: the body id holds the ordinary aggregate, not Mastra's `canceled`.
     expect(broken.report.stepResults.get('body')?.status).toBe(brokenStatus);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// `CanceledToken.started`: the sweep on the input reports a foreach that never opened; both
+// cancel finishers, one that had. A mutant flipping any one is caught.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `inner`, with every transition whose name ends in `suffix` rebuilt so the `started` flag of any
+ * canceled token it writes is inverted — every arc, the timing and the priority kept. The mutant
+ * that shows a `started` assertion is not vacuous.
+ */
+function flippingStarted(inner: Gadget, suffix: string): Gadget {
+  return (entry, next, ctx) => {
+    const r = inner(entry, next, ctx);
+    const flip = (t: Transition): Transition => {
+      const b = Transition.builder(t.name)
+        .inputs(...t.inputSpecs)
+        .outputs(t.outputSpec!)
+        .timing(t.timing)
+        .priority(t.priority)
+        .action((tctx) =>
+          t.action(
+            new Proxy(tctx, {
+              get(target, prop) {
+                if (prop === 'output') {
+                  return (p: Place<unknown>, value: unknown) =>
+                    target.output(
+                      p,
+                      value !== null && typeof value === 'object' && 'started' in value
+                        ? { ...value, started: !(value as CanceledToken).started }
+                        : value,
+                    );
+                }
+                const v: unknown = Reflect.get(target, prop, target);
+                return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+              },
+            }),
+          ),
+        );
+      for (const arc of t.reads) b.read(arc.place);
+      for (const arc of t.inhibitors) b.inhibitor(arc.place);
+      for (const arc of t.resets) b.reset(arc.place);
+      return b.build();
+    };
+    const transitions = r.transitions.map((t) => (t.name.endsWith(suffix) ? flip(t) : t));
+    expect(transitions.filter((t, i) => t !== r.transitions[i]).length, `no transition ends in '${suffix}'`).toBeGreaterThan(0);
+    return { ...r, transitions };
+  };
+}
+
+describe('foreach: a mutant flipping any sweep\'s `started` is caught', () => {
+  const origin = { stepId: 'body', path: [0] };
+
+  it('the input sweep (`.cancel`): intact false, flipped true', async () => {
+    const once = async (gadget: Gadget) => {
+      const ac = new AbortController();
+      ac.abort();
+      const c = tapped('canceled', gadget);
+      await run([foreach(2)], ['a', 'b'], itemRunner().runner, c.gadget, ac.signal);
+      return c.seen;
+    };
+    expect(await once(foreachGadget)).toEqual([{ origin, started: false }]);
+    expect(await once(flippingStarted(foreachGadget, '.cancel'))).toEqual([{ origin, started: true }]);
+  });
+
+  it('the finisher with results (`.canceled`): intact true, flipped false', async () => {
+    const once = async (gadget: Gadget) => {
+      const ac = new AbortController();
+      const c = tapped('canceled', gadget);
+      const { runner } = itemRunner((label) => {
+        if (label === 'a') ac.abort();
+        return { status: 'success', output: `${label}!` };
+      });
+      await run([foreach(1)], ['a', 'b'], runner, c.gadget, ac.signal);
+      return c.seen;
+    };
+    expect(await once(foreachGadget)).toEqual([{ origin, output: ['a!'], started: true }]);
+    expect(await once(flippingStarted(foreachGadget, '.canceled'))).toEqual([{ origin, output: ['a!'], started: false }]);
+  });
+
+  it('the finisher with no results (`.canceled-empty`): intact true, flipped false', async () => {
+    const once = async (gadget: Gadget) => {
+      const ac = new AbortController();
+      const c = tapped('canceled', gadget);
+      const { runner } = itemRunner((label) => {
+        if (label === 'a') ac.abort();
+        return label === 'a' ? { status: 'paused' } : { status: 'success', output: `${label}!` };
+      });
+      await run([foreach(1, body({ source: 'workflow' }))], ['a', 'b'], runner, c.gadget, ac.signal);
+      return c.seen;
+    };
+    expect(await once(foreachGadget)).toEqual([{ origin, output: [], started: true }]);
+    expect(await once(flippingStarted(foreachGadget, '.canceled-empty'))).toEqual([{ origin, output: [], started: false }]);
   });
 });

@@ -1,13 +1,27 @@
 /**
  * @packageDocumentation
- * mastra — the boundary with the host.
+ * mastra — the boundary with the host, and the only directory that imports `@mastra/core`
+ * ([ADR 0005]; `tests/mastra/boundary.test.ts` enforces it).
  *
- * Mastra's graph types are mirrored structurally in `host.ts`, so this package never imports
- * `@mastra/core` at runtime, and `adapt.ts` turns a committed workflow's step flow into the
- * compiler's description. `step-result.ts` translates the engine's step records to and from
- * Mastra's `StepResult`, and gives a step Mastra's `getStepResult`. See the root README for the
- * architecture.
+ * `init()` returns Mastra's own `createWorkflow` / `createStep`, bound to `PetriExecutionEngine`
+ * and branded with `PetriEngineType`. The engine extends Mastra's `ExecutionEngine`, compiles the
+ * committed step flow (`adapt.ts`) to one net, and runs every firing on Mastra's `StepExecutor`.
+ * `step-result.ts` translates the engine's step records to and from Mastra's `StepResult`. See the
+ * root README for the architecture.
  */
+export { init, PETRI_ENGINE_TYPE } from './init.js';
+export type {
+  PetriCloneStep,
+  PetriCreateStep,
+  PetriCreateWorkflow,
+  PetriEngineType,
+  PetriFactories,
+  PetriInitOptions,
+  PetriStep,
+  PetriWorkflow,
+} from './init.js';
+export { PetriExecutionEngine, UnsupportedRunModeError } from './engine.js';
+export type { PetriEngineOptions, UnsupportedRunMode } from './engine.js';
 export {
   adaptStepFlow,
   adaptExecutionGraph,

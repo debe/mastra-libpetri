@@ -324,7 +324,7 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
         .outputs(outPlace(exits.canceled))
         .action(async (tctx) => {
           tctx.input(inPlace);
-          tctx.output(exits.canceled, { origin });
+          tctx.output(exits.canceled, { origin, started: false });
         })
         .build(),
     );
@@ -421,7 +421,10 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
         .action(async (tctx) => {
           const token = tctx.input(from);
           const s = tctx.input(l.slot);
-          tctx.output(into, record(token, { item: s.item, startedAt: s.startedAt, endedAt: scopeOf(tctx).epochNow() }));
+          // The item as the step validated it, when the runner said: Mastra's aggregate record
+          // for a deciding item takes that item's own payload (`handlers/step.ts:173`).
+          const item = 'stepPayload' in (token as object) ? (token as { stepPayload?: unknown }).stepPayload : s.item;
+          tctx.output(into, record(token, { item, startedAt: s.startedAt, endedAt: scopeOf(tctx).epochNow() }));
           tctx.output(l.permit, null);
         })
         .build();
@@ -636,7 +639,7 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
             startedAt: f.startedAt,
             endedAt: scope.epochNow(),
           });
-          tctx.output(exits.canceled, { origin, output });
+          tctx.output(exits.canceled, { origin, output, started: true });
         })
         .build();
     };

@@ -366,7 +366,7 @@ function sweep(
     .outputs(outPlace(canceled))
     .action(async (tctx) => {
       tctx.input(from);
-      tctx.output(canceled, { origin: { stepId, path } });
+      tctx.output(canceled, { origin: { stepId, path }, started: false });
     })
     .build();
 }

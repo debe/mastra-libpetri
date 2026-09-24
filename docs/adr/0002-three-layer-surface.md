@@ -26,9 +26,15 @@ Three layers, each stating its own contract rather than one rule stretched over 
 | 3 — blueprints | capability the IR cannot express | **no**, and the type system says so |
 
 Layer 3 is gated by the `PetriEngineType` phantom brand on the `init()` factory's re-branded
-`createWorkflow` / `createStep` — the mechanism `@mastra/inngest` already uses to stop
-default-engine steps being mixed in. Reaching for a blueprint is therefore a typed, visible
-decision, never a silent incompatibility.
+`createWorkflow` / `createStep`: Mastra threads a `TEngineType` parameter through its step and
+workflow types, and the brand occupies it, so a default-engine step cannot be added to a petri
+workflow by type, nor the reverse. Reaching for a blueprint is therefore a typed, visible decision,
+never a silent incompatibility.
+
+*Amended M2:* an earlier version said this is "the mechanism `@mastra/inngest` already uses".
+That was reasoned from the shape of Mastra's types, not checked against Inngest's source, and
+should not have been stated as fact. The brand as built is in `src/mastra/init.ts`; nesting a petri
+workflow is `.then(createStep(inner))` (`docs/divergences.md` row 61).
 
 ## Consequences
 

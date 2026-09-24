@@ -210,12 +210,39 @@
       drafted in `patches/mastra/` (`--repo` clone required)
 
 ## M2 — Engine (the kernel)
-- [ ] `PetriExecutionEngine extends ExecutionEngine` with its own `execute()`, registered via
-      `createWorkflow({ executionEngine })`; `init()` factory with the `PetriEngineType` phantom
-      brand; `MarkingCodec` <-> `WorkflowRunState`; cancellation via `close()` + `_cancel`
-      inhibitor, never `run(timeoutMs)`; `executionContextProvider` supplies `abortSignal`
-- [ ] Data equivalence + happens-before on the fixture set at concurrency k = 1; divergence
-      register complete for everything found
+- [x] `PetriExecutionEngine extends ExecutionEngine` and owns `execute()` ([ADR 0005]):
+      `@mastra/core` is a runtime peer dependency imported **only** under `src/mastra/` (a
+      source guard enforces it), and every firing runs on Mastra's own single-step executor,
+      `StepExecutor` from `@mastra/core/workflows/evented` — one attempt per call, so the net's
+      unrolled retries own retrying, and Mastra keeps validation, spans, the step context,
+      suspend, bail and abort. One store: the executor reads the kernel's records through a
+      translating view; the runner holds only Mastra's workflow state, data that never decides
+      flow. `init()` with the `PetriEngineType` brand, both directions proven by mutation.
+      Result formatting ported from `fmtReturnValue`; start and terminal snapshots written to
+      Mastra's storage; resume, restart, time travel and per-step runs refused by name (M4)
+- [x] **The differential harness**: every fixture of a real-Mastra corpus run on both engines in
+      one process. Data equivalence is the gate — status, result, error shape, every step's
+      record, state — and happens-before too: an ordering the default engine establishes may
+      only be weakened for pairs a fixture declares independent. An **engine-identity probe**
+      proves each side ran on the engine it claims; before it, a mutant running the default
+      engine on both sides passed everything, and afterwards it fails all 33 fixtures. At k = 1
+      every fixture is `pass` or `divergent` with a register row (26, 35)
+- [x] Contract closed on the way, from what the harness and verifiers found: a canceled token
+      states `started` structurally — a fixed `.sleep` became `begin` -> `waiting` -> `wake`, so
+      "never started" and "mid-wait" are different places — which gives Mastra's `waiting`
+      record and the right persisted path; records carry the **validated** input; the
+      precompiled net is cached, as this file always claimed; a run can have no timeout; a
+      bailed success carries its origin and a tripwire its error; the executor refuses to run a
+      program compiled from a different net than the one proven
+- [x] Final integration: `npm run check` clean, `npm test` **1,257 passed** across 35 files plus
+      2 opt-in slow proofs, `npm run build` clean — against libpetri 6.1.0 and @mastra/core 1.67.0
+      from npm. Four workflows (build, close-out, final migration), 32 agents, every area
+      adversarially verified; the last verifiers re-derived each of 60 migrated `started` values
+      from the transition that fires and found none wrong and no assertion weakened. The register
+      holds 69 rows with **none open for M2**; what remains is assigned: M3 (rows 48, 49), M4
+      (resume, per-step snapshots, the codec), M5 (step events, spans, scorers), M8 (agents)
+- M4 owns the `MarkingCodec` <-> `WorkflowRunState` round-trip: `src/codec/` is empty and
+  `mastra/persist.ts` builds the snapshot one way, at start and terminal
 
 ## M3 — Concurrency + differential report
 - [ ] k > 1 under the structural budget; differ runs both engines in one process on one fake

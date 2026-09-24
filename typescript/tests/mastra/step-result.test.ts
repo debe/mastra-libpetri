@@ -50,10 +50,53 @@ describe("step records as Mastra's StepResult", () => {
     });
   });
 
-  it('passes tripwire data through, and leaves off a tripwire that is none by Mastra’s test', () => {
+  it('passes tripwire data through, and writes a tripwire that is none by Mastra’s test as an own undefined key', () => {
     const base = { status: 'failed', error: new Error('x'), payload: 'in', startedAt: T0, endedAt: T0 } as const;
     expect(toMastraStepResult({ ...base, tripwire: { reason: 'r', processorId: 'p' } })).toMatchObject({ tripwire: { reason: 'r', processorId: 'p' } });
-    expect(toMastraStepResult({ ...base, tripwire: 'no' })).not.toHaveProperty('tripwire');
+    // `default.ts:497-506` writes `tripwire: tripwireData` on every failure, undefined when none —
+    // the key exists, its value is not a tripwire.
+    for (const none of ['no', undefined, null, 0, { retry: true }]) {
+      const written: object = toMastraStepResult({ ...base, tripwire: none });
+      expect(Object.hasOwn(written, 'tripwire'), String(none)).toBe(true);
+      expect(Reflect.get(written, 'tripwire'), String(none)).toBeUndefined();
+    }
+  });
+
+  it('writes the tripwire key as an own key in both directions', () => {
+    // To Mastra: a record with no tripwire field at all still gets the key.
+    const record: StepRecord = { status: 'failed', error: new Error('x'), payload: 'in', startedAt: T0, endedAt: T0 + 1 };
+    const written = toMastraStepResult(record);
+    expect(Object.keys(written)).toContain('tripwire');
+    expect(written).toStrictEqual({ status: 'failed', error: record.error, payload: 'in', startedAt: T0, endedAt: T0 + 1, tripwire: undefined });
+
+    // From Mastra and back: what Mastra holds in memory (own key, undefined) comes back identical,
+    // key included — and what JSON storage gives back (key dropped) comes back as Mastra writes it.
+    const inMemory = { status: 'failed', error: new Error('y'), payload: 'in', startedAt: T0, endedAt: T0, tripwire: undefined } as const;
+    const back = toMastraStepResult(fromMastraStepResult(inMemory)!);
+    expect(back).toStrictEqual(inMemory);
+    expect(Object.keys(back)).toContain('tripwire');
+    const { tripwire: _dropped, ...fromJson } = inMemory;
+    const restored = toMastraStepResult(fromMastraStepResult(fromJson)!);
+    expect(Object.keys(restored)).toContain('tripwire');
+    expect(restored).toStrictEqual(inMemory);
+
+    // And a real tripwire survives the round trip as data.
+    const tripped = { ...inMemory, tripwire: { reason: 'pii', processorId: 'p' } };
+    expect(toMastraStepResult(fromMastraStepResult(tripped)!)).toStrictEqual(tripped);
+  });
+
+  it('writes no tripwire key on any status but failed', () => {
+    const at = { payload: 'in', startedAt: T0, endedAt: T0 } as const;
+    for (const record of [
+      { status: 'success', output: 1, ...at },
+      { status: 'bailed', output: 1, ...at },
+      { status: 'paused', ...at },
+      { status: 'suspended', suspendPayload: 'p', suspendedAt: T0, ...at },
+      { status: 'waiting', payload: 'in', startedAt: T0 },
+      { status: 'canceled' },
+    ] as const satisfies readonly StepRecord[]) {
+      expect(Object.keys(toMastraStepResult(record)), record.status).not.toContain('tripwire');
+    }
   });
 
   it("turns a failure that is not an Error into one, as getErrorFromUnknown's three branches do", () => {
@@ -317,6 +360,53 @@ describe('a canceled record, which only a loop or a foreach writes', () => {
   });
 });
 
+describe("a sleep's waiting record, as handlers/entry.ts:605-609 writes it", () => {
+  const waiting: StepRecord = { status: 'waiting', payload: 'in', startedAt: T0 };
+  const mastra = { status: 'waiting', payload: 'in', startedAt: T0 } as const;
+
+  it("writes Mastra's StepWaiting: status, payload and startedAt, and nothing it did not write", () => {
+    expect(toMastraStepResult(waiting)).toStrictEqual(mastra);
+  });
+
+  it('requires startedAt, as StepWaiting does, and takes now for a missing one', () => {
+    expect(() => toMastraStepResult({ status: 'waiting', payload: 'in' })).toThrow(/'waiting' step record has no startedAt/);
+    expect(toMastraStepResult({ status: 'waiting', payload: 'in' }, { now: T0 })).toStrictEqual(mastra);
+  });
+
+  it('keeps unmodelled host fields, and takes status, payload and startedAt from the record', () => {
+    const record: StepRecord = { ...waiting, host: { status: 'running', payload: 'stale', startedAt: 1, note: 'kept' } };
+    expect(toMastraStepResult(record)).toStrictEqual({ ...mastra, note: 'kept' });
+  });
+
+  it('reads a stored StepWaiting as a waiting record, keeping the original as host', () => {
+    // A snapshot of a run canceled mid-sleep holds it; the kernel accepts it carried in.
+    expect(fromMastraStepResult(mastra)).toEqual({ ...waiting, host: mastra });
+  });
+
+  it('round-trips: Mastra -> record -> Mastra is the identity, and record -> Mastra -> record keeps the record', () => {
+    const record = fromMastraStepResult(mastra);
+    expect(record).toBeDefined();
+    expect(toMastraStepResult(record!)).toStrictEqual(mastra);
+    expect(fromMastraStepResult(toMastraStepResult(waiting))).toMatchObject(waiting);
+  });
+
+  it('is what a run canceled mid-sleep leaves, translated as Mastra holds it', async () => {
+    // A real 60s sleep, aborted 20ms in: the abort lands mid-wait. (A virtual clock jumps to the
+    // wake, so it cannot hold a run mid-wait.)
+    const ac = new AbortController();
+    const compiled = compile(adapt([step('quote'), { type: 'sleep', id: 'nap', duration: 60_000 }, step('ship')]));
+    const runner = new RecordingRunner({ steps: { quote: (x) => (setTimeout(() => ac.abort(), 20), { status: 'success', output: x }) } });
+    const before = Date.now();
+    const report = await runWorkflowDetailed(compiled, 'order', { runner, signal: ac.signal, timeoutMs: 10_000 });
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'nap', path: [1] }, started: true });
+    const written = toMastraStepResult(report.stepResults.get('nap')!);
+    expect(written).toStrictEqual({ status: 'waiting', payload: 'order', startedAt: expect.any(Number) });
+    expect(written.startedAt).toBeGreaterThanOrEqual(before);
+    // Mastra's accessor gives null for a waiting sleep, as for every status but success.
+    expect(getStepResultView({ getStepResult: (id) => report.stepResults.get(id), initData: 'order' })('nap')).toBeNull();
+  });
+});
+
 describe('reading what Mastra stored', () => {
   it('reads a failure from storage with its serialized error, and the non-outcome statuses as no record', () => {
     const stored = {
@@ -338,9 +428,9 @@ describe('reading what Mastra stored', () => {
       tripwire: { reason: 'r' },
       host: stored,
     });
-    for (const status of ['running', 'waiting'] as const) {
-      expect(fromMastraStepResult({ status, payload: 'in', startedAt: T0 })).toBeUndefined();
-    }
+    // A step in flight is not an outcome. (`waiting` is: a sleep canceled mid-wait keeps it — see
+    // the waiting describe below.)
+    expect(fromMastraStepResult({ status: 'running', payload: 'in', startedAt: T0 })).toBeUndefined();
     expect(fromMastraStepResult({ status: 'skipped', payload: {}, startedAt: T0, endedAt: T0 })).toBeUndefined();
     expect(() => fromMastraStepResult({ status: 'teleported' } as unknown as StoredStepResult)).toThrow(/teleported/);
   });

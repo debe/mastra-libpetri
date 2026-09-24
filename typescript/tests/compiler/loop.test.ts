@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { Transition, arcPlace, requiredCount, type PetriNet, type Place } from 'libpetri';
+import { Transition, arcPlace, one, outPlace, place, requiredCount, type PetriNet, type Place } from 'libpetri';
 import { compile } from '../../src/compiler/compile.js';
 import { MAX_ITERATION_BOUND, loopGadget } from '../../src/compiler/gadgets/loop.js';
 import type { Gadget } from '../../src/compiler/gadgets/types.js';
 import type {
+  CanceledToken,
   EntryDescription,
   RunView,
   StepDescription,
@@ -281,13 +282,15 @@ describe('loop: every non-success iteration leaves, and leaves nothing behind', 
       'a tripwire, which rides the failure path',
       tick,
       { status: 'failed', error: 'blocked', tripwire: { reason: 'policy' } },
-      { status: 'tripwire', stepId: 'tick', path: [0], tripwire: { reason: 'policy' } },
+      // The outcome carries the failure's `error` beside the tripwire (contract change).
+      { status: 'tripwire', stepId: 'tick', path: [0], tripwire: { reason: 'policy' }, error: 'blocked' },
     ],
     [
       'a bail, which ends the run as a success',
       tick,
       { status: 'bailed', output: 'early' },
-      { status: 'success', output: 'early', bailed: true },
+      // A bail names the step that bailed (contract change): the body, at the loop's path.
+      { status: 'success', output: 'early', bailed: true, stepId: 'tick', path: [0] },
     ],
     [
       "a suspension, recorded at the loop's path",
@@ -578,14 +581,14 @@ describe('loop: removing any cleanup arc strands tokens (non-vacuity)', () => {
     ['leave-failed', { dropReset: '.budget' }, () => loopRunner(() => true, { tick: bodyOn2({ status: 'failed', error: 'e' }) }), tick,
       { status: 'failed', stepId: 'tick', path: [0], error: 'e' }, ['s.0.poll.budget=3']],
     ['leave-bailed', { dropReset: '.budget' }, () => loopRunner(() => true, { tick: bodyOn2({ status: 'bailed', output: 'b' }) }), tick,
-      { status: 'success', output: 'b', bailed: true }, ['s.0.poll.budget=3']],
+      { status: 'success', output: 'b', bailed: true, stepId: 'tick', path: [0] }, ['s.0.poll.budget=3']],
     ['leave-suspended', { dropReset: '.budget' }, () => loopRunner(() => true, { tick: bodyOn2({ status: 'suspended', suspendPayload: 'p' }) }), tick,
       { status: 'suspended', stepId: 'tick', path: [0], payload: 'p' }, ['s.0.poll.budget=3']],
     ['leave-paused', { dropReset: '.budget' }, () => loopRunner(() => true, { tick: bodyOn2({ status: 'paused' }) }),
       { kind: 'step', id: 'tick', source: 'workflow' },
       { status: 'paused', stepId: 'tick', path: [0] }, ['s.0.poll.budget=3']],
     ['leave-bailed', { dropInput: '.running' }, () => loopRunner(() => true, { tick: bodyOn2({ status: 'bailed', output: 'b' }) }), tick,
-      { status: 'success', output: 'b', bailed: true }, ['s.0.poll.running']],
+      { status: 'success', output: 'b', bailed: true, stepId: 'tick', path: [0] }, ['s.0.poll.running']],
   ];
 
   it.each(scenarios)('%s without %o', async (transitionRole, mutation, makeRunner, body, clean, residue) => {
@@ -782,14 +785,16 @@ describe('loop: starting from a record already under the body id', () => {
  * left over from the iteration. Before `start` (`default.ts:815`) nothing is stored.
  */
 describe('loop: cancellation', () => {
-  // The loop's result lives under the body's id, so its cancellation names the body.
-  const canceledAtLoop = { status: 'canceled', origin: { stepId: 'tick', path: [0] } } as const;
+  // The loop's result lives under the body's id, so its cancellation names the body. `started`
+  // tells the two sweep families apart: `cancel-in`, before the loop's first transition, reports
+  // work that never began; `cancel-ready` / `cancel-produced` / `cancel-exiting`, after `start`,
+  // report a loop that had (and each records the bare canceled result).
+  const canceledAtLoop = { status: 'canceled', origin: { stepId: 'tick', path: [0] }, started: true } as const;
+  const canceledBeforeLoop = { status: 'canceled', origin: { stepId: 'tick', path: [0] }, started: false } as const;
   const bareCanceled = { status: 'canceled' } as const;
 
-  // RED until the lead closes the arrival window (contract issue): a pre-aborted run seeds
-  // `wf.cancel.request`, and `start` fires in the same executor cycle as `arrive`, whose output
-  // lands only when its action completes — so the loop is entered and `cancel-ready` records the
-  // bare canceled result, where Mastra's `default.ts:815` returns before anything is stored.
+  // A pre-aborted run seeds the signal itself (the arrival window this once pinned is closed in the
+  // kernel), so `cancel-in` fires and the loop never began: `started: false`.
   it('never starts when the signal fired before the entry: nothing runs, nothing is recorded', async () => {
     const ac = new AbortController();
     ac.abort();
@@ -797,7 +802,7 @@ describe('loop: cancellation', () => {
 
     const report = await runWorkflowDetailed(compile(only(loop('dowhile', 5))), 0, { runner, signal: ac.signal });
 
-    expect(report.outcome).toEqual(canceledAtLoop);
+    expect(report.outcome).toEqual(canceledBeforeLoop);
     expect(runner.calls).toEqual([]);
     expect(conditions).toEqual([]);
     expect(report.stepResults.has('tick')).toBe(false);
@@ -814,7 +819,7 @@ describe('loop: cancellation', () => {
 
     const outcome = await runWorkflow(compile(between(loop('dowhile', 5))), 0, { runner, signal: ac.signal });
 
-    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [1] } });
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [1] }, started: false });
     expect(runner.calls).toEqual(['prime']);
   });
 
@@ -859,7 +864,8 @@ describe('loop: cancellation', () => {
       { runner, signal: ac.signal },
     );
 
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [1] } });
+    // `cancel-ready`: the loop had started.
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [1] }, started: true });
     // Only the `.then(tick)` ran; the loop's body never did.
     expect(runner.calls).toEqual(['tick']);
     expect(report.stepResults.get('tick')).toEqual(bareCanceled);
@@ -876,7 +882,8 @@ describe('loop: cancellation', () => {
 
     const report = await runWorkflowDetailed(compile(between(loop('dowhile', 5))), 0, { runner, signal: ac.signal });
 
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [1] } });
+    // `cancel-produced`: a body had run.
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [1] }, started: true });
     expect(runner.calls).toEqual(['prime', 'tick']);
     expect(conditions).toEqual([]);
     // The iteration's success record is replaced by Mastra's bare canceled result
@@ -957,7 +964,8 @@ describe('loop: cancellation', () => {
         { runner, signal: ac.signal },
       );
 
-      expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [0] } });
+      // The settle stage re-stamps an outcome that ran: `started: true`.
+      expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [0] }, started: true });
       expect(runner.calls).toEqual(['tick', 'tick']);
       expect(conditions.map((c) => c.iteration)).toEqual([1]);
       // Not the bare canceled record: Mastra stores the body's own result, then re-stamps only
@@ -994,7 +1002,7 @@ describe('loop: cancellation', () => {
           0,
           { runner, signal: ac.signal },
         );
-        expect(report.outcome, `run ${i}`).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [0] } });
+        expect(report.outcome, `run ${i}`).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [0] }, started: true });
         expect(runner.calls, `run ${i}`).toEqual(['tick', 'tick']);
         expect(report.stepResults.get('tick'), `run ${i}`).toMatchObject(bodyOutcome);
       }
@@ -1041,7 +1049,7 @@ describe('loop: cancellation', () => {
       { runner, signal: ac.signal },
     );
 
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [1] } });
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [1] }, started: false });
     expect(runner.calls).toEqual(['tick']);
     expect(report.stepResults.get('tick')).toMatchObject({ status: 'success', output: 1, payload: 0 });
   });
@@ -1098,7 +1106,7 @@ describe('loop: removing a cancellation inhibitor changes the run (non-vacuity)'
     const real = await run(compile(between(loop('dowhile', 5))));
     const broken = await run(compile(between(loop('dowhile', 5)), { gadgets: { loop: noInhibitor('start') } }));
 
-    expect(real.outcome).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [1] } });
+    expect(real.outcome).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [1] }, started: false });
     expect(real.stepResults.has('tick')).toBe(false);
     expect(broken.stepResults.get('tick')).toMatchObject({ status: 'failed' });
   });
@@ -1179,10 +1187,120 @@ describe('loop: removing a cancellation inhibitor changes the run (non-vacuity)'
     };
     const shape: WorkflowDescription = { id: 'poller', entries: [loop('dowhile', 5), { kind: 'step', id: 'ship' }] };
 
-    expect(await run(compile(shape))).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [0] } });
+    expect(await run(compile(shape))).toEqual({ status: 'canceled', origin: { stepId: 'tick', path: [0] }, started: true });
     expect(await run(compile(shape, { gadgets: { loop: noInhibitor('finish') } }))).toEqual({
       status: 'canceled',
       origin: { stepId: 'ship', path: [1] },
+      started: false,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// `CanceledToken.started` — structural: which sweep fired says whether the work had begun.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Observes every token a gadget writes to its `canceled` exit without changing what happens
+ * next: the gadget is compiled with a local tap in that exit's stead, and one forwarding
+ * transition copies each token on. It reads `started` straight off the token, independent of
+ * whether the kernel's `RunOutcome` forwards it.
+ */
+function tappedCanceled(inner: Gadget): { gadget: Gadget; seen: unknown[] } {
+  const seen: unknown[] = [];
+  const gadget: Gadget = (entry, next, ctx) => {
+    const tap = place<CanceledToken>(ctx.names.reserve(`test.tap.canceled.${entry.id}`, 'test observation tap'));
+    const result = inner(entry, next, { ...ctx, exits: { ...ctx.exits, canceled: tap } });
+    const forward = Transition.builder(`test.tap.canceled.${entry.id}.forward`)
+      .inputs(one(tap))
+      .outputs(outPlace(ctx.exits.canceled))
+      .action(async (tctx) => {
+        const token = tctx.input(tap);
+        seen.push(token);
+        tctx.output(ctx.exits.canceled, token);
+      })
+      .build();
+    return { ...result, transitions: [...result.transitions, forward] };
+  };
+  return { gadget, seen };
+}
+
+/**
+ * `inner`, with every transition whose name ends in `suffix` rebuilt so the `started` flag of any
+ * canceled token it writes is inverted — every arc, the timing and the priority kept. The mutant
+ * that shows a `started` assertion is not vacuous.
+ */
+function flippingStarted(inner: Gadget, suffix: string): Gadget {
+  return (entry, next, ctx) => {
+    const r = inner(entry, next, ctx);
+    const flip = (t: Transition): Transition => {
+      const b = Transition.builder(t.name)
+        .inputs(...t.inputSpecs)
+        .outputs(t.outputSpec!)
+        .timing(t.timing)
+        .priority(t.priority)
+        .action((tctx) =>
+          t.action(
+            new Proxy(tctx, {
+              get(target, prop) {
+                if (prop === 'output') {
+                  return (p: Place<unknown>, value: unknown) =>
+                    target.output(
+                      p,
+                      value !== null && typeof value === 'object' && 'started' in value
+                        ? { ...value, started: !(value as CanceledToken).started }
+                        : value,
+                    );
+                }
+                const v: unknown = Reflect.get(target, prop, target);
+                return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+              },
+            }),
+          ),
+        );
+      for (const arc of t.reads) b.read(arc.place);
+      for (const arc of t.inhibitors) b.inhibitor(arc.place);
+      for (const arc of t.resets) b.reset(arc.place);
+      return b.build();
+    };
+    const transitions = r.transitions.map((t) => (t.name.endsWith(suffix) ? flip(t) : t));
+    expect(transitions.filter((t, i) => t !== r.transitions[i]).length, `no transition ends in '${suffix}'`).toBeGreaterThan(0);
+    return { ...r, transitions };
+  };
+}
+
+describe('loop: which cancel sweep fired, read from `started` on the token', () => {
+  /** One scenario per sweep: the shape, a runner that lands the abort there, and the flag. */
+  type Scenario = readonly [sweep: string, make: (ac: AbortController) => RecordingRunner, entries: 'only' | 'between', path: number, started: boolean];
+  const scenarios: readonly Scenario[] = [
+    // `prime` aborts: the loop's gate sweeps its input before `start` — nothing began.
+    ['cancel-in', (ac) => loopRunner(() => true, { prime: () => { ac.abort(); return { status: 'success', output: 0 }; } }).runner, 'between', 1, false],
+    // The condition aborts and says repeat: the next iteration's `ready` is swept (:742/:889).
+    ['cancel-ready', (ac) => loopRunner(() => { ac.abort(); return true; }).runner, 'only', 0, true],
+    // The body aborts and succeeds: swept before the condition (:807).
+    ['cancel-produced', (ac) => loopRunner(() => true, { tick: (i, c) => { ac.abort(); return increment(i, c); } }).runner, 'only', 0, true],
+    // The condition aborts and says stop: the loop's success is swept (:889).
+    ['cancel-exiting', (ac) => loopRunner(() => { ac.abort(); return false; }).runner, 'only', 0, true],
+  ];
+  const shapeOf = (entries: 'only' | 'between') => (entries === 'only' ? only(loop('dowhile', 5)) : between(loop('dowhile', 5)));
+
+  it.each(scenarios)('%s reports started %s', async (sweep, make, entries, path, started) => {
+    const ac = new AbortController();
+    const tap = tappedCanceled(loopGadget);
+    const report = await runWorkflowDetailed(compile(shapeOf(entries), { gadgets: { loop: tap.gadget } }), 0, {
+      runner: make(ac),
+      signal: ac.signal,
+    });
+    expect(tap.seen, sweep).toEqual([{ origin: { stepId: 'tick', path: [path] }, started }]);
+    // A sweep after `start` records the bare canceled result; `cancel-in` records nothing.
+    if (started) expect(report.stepResults.get('tick')).toEqual({ status: 'canceled' });
+    else expect(report.stepResults.has('tick')).toBe(false);
+  });
+
+  it.each(scenarios)('a mutant flipping %s is caught', async (sweep, make, entries, path, started) => {
+    const ac = new AbortController();
+    const tap = tappedCanceled(flippingStarted(loopGadget, `.${sweep}`));
+    await runWorkflowDetailed(compile(shapeOf(entries), { gadgets: { loop: tap.gadget } }), 0, { runner: make(ac), signal: ac.signal });
+    expect(tap.seen).toEqual([{ origin: { stepId: 'tick', path: [path] }, started: !started }]);
   });
 });

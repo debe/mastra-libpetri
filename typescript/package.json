@@ -13,6 +13,10 @@
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     },
+    "./mastra": {
+      "import": "./dist/mastra/index.js",
+      "types": "./dist/mastra/index.d.ts"
+    },
     "./compiler": {
       "import": "./dist/compiler/index.js",
       "types": "./dist/compiler/index.d.ts"
@@ -49,6 +53,10 @@
     "tsup": "^8.5.1",
     "tsx": "^4.22.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.6"
+    "vitest": "^4.1.6",
+    "zod": "^4.6.5"
+  },
+  "peerDependencies": {
+    "@mastra/core": ">=1.67.0 <2"
   }
 }

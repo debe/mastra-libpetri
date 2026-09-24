@@ -229,7 +229,9 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
 
   // Named by the body: that is where the loop's result lives (`handlers/entry.ts:810-812`).
   const loopFailure = (error: unknown): FailureToken => ({ stepId: body.id, path: viewPath, error });
-  const canceled: CanceledToken = { origin: { stepId: body.id, path: viewPath } };
+  // Before the loop's first transition nothing has run; between iterations a body has.
+  const notStarted: CanceledToken = { origin: { stepId: body.id, path: viewPath }, started: false };
+  const canceled: CanceledToken = { origin: { stepId: body.id, path: viewPath }, started: true };
   /**
    * Mastra's bare canceled result, replacing the last iteration's record (`handlers/entry.ts:811`).
    * Nothing else — no payload, no timestamps, no metadata — because Mastra's has nothing else.
@@ -411,7 +413,7 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
         .outputs(outPlace(exits.canceled))
         .action(async (c) => {
           c.input(inPlace);
-          c.output(exits.canceled, canceled);
+          c.output(exits.canceled, notStarted);
         })
         .build(),
     );

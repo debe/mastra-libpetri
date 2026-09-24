@@ -461,7 +461,7 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
         return { runner, done: runWorkflow(compiled, 'x', { runner, signal: ac.signal, timeoutMs: 300 }) };
       };
       const real = run(compile(prepThen(blockAfterPrep)));
-      expect(await real.done).toEqual({ status: 'canceled', origin: { stepId: 'route', path: [1] } });
+      expect(await real.done).toEqual({ status: 'canceled', origin: { stepId: 'route', path: [1] }, started: false });
       const swept = run(compile(prepThen(blockAfterPrep), { gadgets: { branch: dropping('cancel') } }));
       await expect(swept.done).rejects.toThrow();
       expect(swept.runner.calls).toEqual(['prep']);
@@ -498,12 +498,14 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
 
       // The real block stops at its own check; the mutant starts and runs what it selected.
       expect(await runOnce(compile(description))).toEqual({
-        outcome: { status: 'canceled', origin: { stepId: 'route', path: [1] } },
+        outcome: { status: 'canceled', origin: { stepId: 'route', path: [1] }, started: false },
         calls: ['prep'],
       });
       const flipped = await runOnce(mutant);
       expect(flipped.calls).toEqual(expectedCalls);
-      expect(flipped.outcome).not.toEqual({ status: 'canceled', origin: { stepId: 'route', path: [1] } });
+      // `not.toMatchObject`, not `not.toEqual` with the new `started` key: an extra or missing key
+      // must not make this negative pass on its own — the claim is the block's own check never fired.
+      expect(flipped.outcome).not.toMatchObject({ status: 'canceled', origin: { stepId: 'route', path: [1] } });
     }, 600_000);
   }
 
@@ -554,11 +556,11 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
     it('flips the run in which a condition aborts, as a middle and as a last entry', async () => {
       const realMiddle = await abortingCondition(compile(middle));
       expect(realMiddle).toEqual({
-        outcome: { status: 'canceled', origin: { stepId: 'audit', path: [2] } },
+        outcome: { status: 'canceled', origin: { stepId: 'audit', path: [2] }, started: false },
         calls: ['a', 'b', 'prep'],
       });
       const realLast = await abortingCondition(compile(last));
-      expect(realLast).toEqual({ outcome: { status: 'canceled' }, calls: ['a', 'b'] });
+      expect(realLast).toEqual({ outcome: { status: 'canceled', started: true }, calls: ['a', 'b'] });
 
       // The mutant sweeps both arms: neither runs, and the swept arms never arrive at the join.
       const mutantMiddle = await abortingCondition(compile(middle, { gadgets: { branch: gatedArms } }));

@@ -2,6 +2,7 @@ import type { RunView, StepRecord } from '../compiler/types.js';
 import type {
   StepBailed,
   StepCanceled,
+  StepWaiting,
   StepFailure,
   StepMetadata,
   StepPaused,
@@ -29,7 +30,7 @@ import type {
  * A `StepResult` the engine can produce: every status a finished outcome can have, and the
  * `canceled` record a loop or foreach writes.
  */
-export type OutcomeStepResult = StepSuccess | StepFailure | StepSuspended | StepPaused | StepBailed | StepCanceled;
+export type OutcomeStepResult = StepSuccess | StepFailure | StepSuspended | StepPaused | StepBailed | StepCanceled | StepWaiting;
 
 export interface ToMastraOptions {
   /**
@@ -144,7 +145,9 @@ export function toMastraStepResult(record: StepRecord, options: ToMastraOptions 
         status: 'failed',
         error: (options.normalizeError ?? normalizeError)(record.error),
         endedAt: time('endedAt', record.endedAt),
-        ...(tripwire === undefined ? {} : { tripwire }),
+        // An own key even when there is no tripwire: Mastra writes `tripwire: undefined` on every
+        // failure (`default.ts:497-506`), and the differential harness compares keys, not values.
+        tripwire,
         ...(record.nonRetryable === true ? { nonRetryable: true as const } : {}),
       };
     }
@@ -158,15 +161,18 @@ export function toMastraStepResult(record: StepRecord, options: ToMastraOptions 
       };
     case 'paused':
       return { ...common, status: 'paused' };
+    case 'waiting':
+      // A sleep canceled mid-wait keeps this, as Mastra's does (`handlers/entry.ts:602-609`).
+      return { ...common, status: 'waiting' };
   }
 }
 
 /**
  * A Mastra `stepResults` entry as a `StepRecord`, or `undefined` when it is not an outcome.
  *
- * `running`, `waiting` and `skipped` are not outcomes: a step in flight (`handlers/step.ts:169-178`),
- * a sleep in flight (`handlers/entry.ts:602-606`) and an arm time travel did not take
- * (`handlers/control-flow.ts:517-528`). The engine's store holds only what a step *produced*,
+ * `running` and `skipped` are not records: a step in flight (`handlers/step.ts:169-178`) and an
+ * arm time travel did not take (`handlers/control-flow.ts:517-528`). `waiting` is: a sleep writes it
+ * when it begins and it survives a cancel (`handlers/entry.ts:602-609,641-643`). The engine's store holds only what a step *produced*,
  * so none of them has a `StepRecord`, and `undefined` is what `getStepResult` returns for a step
  * with no record — which Mastra's own accessor treats identically, returning `null` for every
  * status but `success` (`step.ts:179-193`). A caller that must keep such an entry for the codec
@@ -216,8 +222,11 @@ export function fromMastraStepResult(result: StoredStepResult): StepRecord | und
       };
     case 'paused':
       return { ...common, status: 'paused' };
-    case 'running':
     case 'waiting':
+      // A sleep that began and, if the run was canceled, never finished — kept as Mastra keeps it
+      // (`handlers/entry.ts:602-609,641-643`).
+      return { ...common, status: 'waiting' };
+    case 'running':
     case 'skipped':
       return undefined;
     default:

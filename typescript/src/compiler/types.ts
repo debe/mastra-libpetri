@@ -1,4 +1,4 @@
-import type { Place, PetriNet } from 'libpetri';
+import type { Place, PetriNet, PrecompiledNet } from 'libpetri';
 import type { EntryPath } from './names.js';
 
 /**
@@ -133,6 +133,12 @@ export type StepOutcome = (
    * engine never reads it; the codec prefers it when it rebuilds `WorkflowRunState`.
    */
   readonly host?: unknown;
+  /**
+   * The input the step actually ran on — Mastra's `payload`, which is the input **after** schema
+   * validation, defaults and coercions applied (`handlers/step.ts:111,173`). Absent, the record
+   * takes the flow token's data, which is the same thing for a runner that validates nothing.
+   */
+  readonly payload?: unknown;
 };
 
 /**
@@ -148,7 +154,13 @@ export type StepRecord =
    * (`handlers/control-flow.ts:1164-1169`). Only a combinator writes it — it is not a
    * `StepOutcome`, so a runner cannot return it.
    */
-  | ({ readonly status: 'canceled'; readonly output?: unknown; readonly host?: unknown } & Partial<RecordFields>);
+  | ({ readonly status: 'canceled'; readonly output?: unknown; readonly host?: unknown } & Partial<RecordFields>)
+  /**
+   * A sleep that has begun waiting. Mastra writes `{status: 'waiting', payload, startedAt}` when a
+   * sleep begins (`handlers/entry.ts:602-609`) and leaves it there if the run is canceled mid-wait;
+   * the sleep overwrites it with `success` when the wait ends. Only a sleep writes it.
+   */
+  | ({ readonly status: 'waiting'; readonly payload: unknown; readonly host?: unknown } & Partial<Omit<RecordFields, 'payload'>>);
 
 /** What a record carries beside the outcome — the rest of Mastra's `StepResult`. */
 export interface RecordFields {
@@ -263,6 +275,8 @@ export interface Origin {
 
 /** The failure path. `tripwire` set means the run ends as `'tripwire'`, not `'failed'`. */
 export interface FailureToken extends Origin {
+  /** The step's validated input, when the runner reported one — for a foreach's aggregate record. */
+  readonly stepPayload?: unknown;
   readonly error: unknown;
   readonly tripwire?: unknown;
   readonly nonRetryable?: true;
@@ -270,6 +284,8 @@ export interface FailureToken extends Origin {
 
 /** The early-exit path of `bail(result)`. */
 export interface BailToken extends Origin {
+  /** The step's validated input, when the runner reported one — for a foreach's aggregate record. */
+  readonly stepPayload?: unknown;
   readonly output: unknown;
 }
 
@@ -282,7 +298,10 @@ export interface SuspendToken extends Origin {
 }
 
 /** A nested workflow that paused. */
-export interface PauseToken extends Origin {}
+export interface PauseToken extends Origin {
+  /** The step's validated input, when the runner reported one — for a foreach's aggregate record. */
+  readonly stepPayload?: unknown;
+}
 
 /**
  * Work that stopped because the run was canceled. `origin` names the entry that was waiting or
@@ -292,6 +311,14 @@ export interface PauseToken extends Origin {}
 export interface CanceledToken {
   readonly origin?: Origin;
   readonly output?: unknown;
+  /**
+   * Whether the work at `origin` had **started**. A sweep at a start gate reports work that never
+   * ran; a sweep inside a running construct (a sleep mid-wait, a loop between iterations, a foreach
+   * draining) and the settle stage report work that did. Mastra's persisted `executionPath` for a
+   * canceled run names the last entry that ran, so the codec needs this — and it is structural: a
+   * different place, never an inference from timing.
+   */
+  readonly started: boolean;
 }
 
 /**
@@ -337,6 +364,11 @@ export interface NetMap {
 
 export interface CompiledWorkflow {
   readonly net: PetriNet;
+  /**
+   * The net compiled once for libpetri's executor, reused by every run of this workflow — the
+   * compile cache's point. Without it the executor recompiles the net on every run.
+   */
+  readonly program: PrecompiledNet;
   readonly netMap: NetMap;
   /** Where the initial token is injected to start a run. */
   readonly entryPlace: Place<FlowToken>;

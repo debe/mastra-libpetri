@@ -11,6 +11,7 @@ import {
 import { runWorkflow, runWorkflowDetailed } from '../../src/engine/index.js';
 import { cancelStructureViolations, describeReport, verifyWorkflow, type PropertyReport } from '../../src/verify/index.js';
 import type {
+  CanceledToken,
   EntryDescription,
   Exits,
   FlowToken,
@@ -42,6 +43,10 @@ import { ManualClock } from '../support/manual-clock.js';
  *   and a past instant wait 0; an Invalid Date or a wait past the timer ceiling wakes after ~1ms
  *   in Mastra, a defect this engine refuses rather than reproduces (divergence rows 9, 10).
  * - `handlers/entry.ts:664-665,775-776`: a sleep records `{status:'success', output: <its input>}`.
+ * - `handlers/entry.ts:602-609`: before that, when the sleep BEGINS, `{status:'waiting', payload,
+ *   startedAt}` — left in place when the run is canceled mid-wait or the sleep fn throws. A fixed
+ *   sleep is `begin` -> `waiting` -> `wake`, so a sweep on `in` (never began, `started: false`) is
+ *   a different transition from one on `waiting` (mid-wait, `started: true`).
  */
 
 const EPOCH = 1_700_000_000_000;
@@ -274,12 +279,16 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
 
     // TripWire is not in the nonRetryable check (`default.ts:463`), so all three attempts run.
     expect(runner.calls).toEqual(['guard', 'guard', 'guard']);
-    // `fmtReturnValue` sets `tripwire` and leaves `error` unset (`default.ts:622-628`).
+    // `fmtReturnValue` sets `tripwire` and leaves the run result's `error` unset
+    // (`default.ts:622-628`). The kernel's outcome still carries the final attempt's `error` beside
+    // it — the contract changed so `result.ts` can fall back to it when the value is an `Error` but
+    // not a Mastra `TripWire`; dropping `error` from the run result is the formatter's job.
     expect(outcome).toEqual({
       status: 'tripwire',
       stepId: 'guard',
       path: [0],
       tripwire: { reason: 'blocked 2', processorId: 'moderation' },
+      error: expect.objectContaining({ message: 'blocked 2' }),
     });
   });
 
@@ -318,7 +327,8 @@ describe('step retries (executeStepWithRetry, default.ts:455-511)', () => {
     [
       'bailed',
       { status: 'bailed', output: 'early' },
-      { status: 'success', output: 'early', bailed: true },
+      // A bail now names the step that bailed (`At`), so the result can place it on the path.
+      { status: 'success', output: 'early', bailed: true, stepId: 'charge', path: [0] },
     ],
     [
       'suspended',
@@ -523,7 +533,9 @@ describe('step outcomes at the top level', () => {
     expect(stepResults.has('c')).toBe(false);
   });
 
-  it('ends the run as tripwire, with no error field, when the failure carries one', async () => {
+  // Was "with no error field": the kernel's outcome now carries the failure's `error` beside the
+  // tripwire (contract change); Mastra's run result still has none, which `result.ts` enforces.
+  it('ends the run as tripwire, carrying the failure\'s error beside it, when the failure carries one', async () => {
     const runner = new RecordingRunner({
       steps: { b: () => ({ status: 'failed', error: new Error('blocked'), tripwire: { reason: 'blocked' } }) },
     });
@@ -531,7 +543,13 @@ describe('step outcomes at the top level', () => {
     const outcome = await runWorkflow(compile(chain), 'x', { runner });
 
     expect(runner.calls).toEqual(['a', 'b']);
-    expect(outcome).toEqual({ status: 'tripwire', stepId: 'b', path: [1], tripwire: { reason: 'blocked' } });
+    expect(outcome).toEqual({
+      status: 'tripwire',
+      stepId: 'b',
+      path: [1],
+      tripwire: { reason: 'blocked' },
+      error: expect.objectContaining({ message: 'blocked' }),
+    });
   });
 
   it('ends the run as a success carrying bailed: true on bail, and stops the chain', async () => {
@@ -542,7 +560,8 @@ describe('step outcomes at the top level', () => {
     // `if (status === 'bailed') status = 'success'` and return (`default.ts:926-928`): the bail
     // payload is the run's result and every later entry is skipped.
     expect(runner.calls).toEqual(['a', 'b']);
-    expect(outcome).toEqual({ status: 'success', output: 'early', bailed: true });
+    // The bail carries its origin: the step that bailed and its view path.
+    expect(outcome).toEqual({ status: 'success', output: 'early', bailed: true, stepId: 'b', path: [1] });
     // Mastra rewrites the bailing entry's own record to 'success' when the bail ends the run
     // (`default.ts:926-928` mutates the object `stepResults` holds), and so does the kernel.
     expect(stepResults.get('b')).toEqual(rec({ status: 'success', output: 'early', payload: 'x' }));
@@ -893,6 +912,36 @@ describe('per-run sleep and sleepUntil (resolveWait)', () => {
     expect(runner.calls).toEqual(['a']);
   });
 
+  it('records waiting before resolveWait runs, so the fn sees it, and success overwrites it at the end', async () => {
+    const clock = new ManualClock(EPOCH);
+    const seen: (StepRecord | undefined)[] = [];
+    const runner = new RecordingRunner({
+      waits: {
+        nap: (_input, view) => {
+          seen.push(view.getStepResult('nap'));
+          return 250;
+        },
+      },
+    });
+
+    const { stepResults } = await runWorkflowDetailed(compile(wf(step('a'), perRunSleep(), step('b'))), 'x', {
+      runner,
+      clock,
+    });
+
+    // `stepResults[entry.id] = {status: 'waiting', payload: prevOutput, startedAt}` is stored before
+    // `executeSleep` calls the fn (`handlers/entry.ts:602-609`, `handlers/sleep.ts:83-99`), and the
+    // fn's `getStepResult` reads that same object.
+    expect(seen).toEqual([{ status: 'waiting', payload: 'x', startedAt: EPOCH }]);
+    expect(stepResults.get('nap')).toEqual({
+      status: 'success',
+      output: 'x',
+      payload: 'x',
+      startedAt: EPOCH,
+      endedAt: EPOCH + 250,
+    });
+  });
+
   it('fails the run when the runner has no resolveWait', async () => {
     const runner = new RecordingRunner();
     expect(runner.resolveWait).toBeUndefined();
@@ -1121,7 +1170,11 @@ describe('a rejection carrying no reason is still a rejection', () => {
 
     expect(report.outcome).toEqual({ status: 'failed', stepId: 'nap', path: [0], error: undefined });
     expect(runner.calls).toEqual([]);
-    expect(report.stepResults.has('nap')).toBe(false);
+    // Was `has('nap') === false`. The contract now writes the `waiting` record when the sleep
+    // BEGINS, before its fn is called — as Mastra does (`handlers/entry.ts:602-609` stores it, then
+    // `executeSleep` calls the fn, `handlers/sleep.ts:83`). A throwing fn never reaches the
+    // overwrite with `success`, so the `waiting` record is what is left, in both engines.
+    expect(report.stepResults.get('nap')).toEqual({ status: 'waiting', payload: 'x', startedAt: expect.any(Number) });
   });
 });
 
@@ -1320,7 +1373,8 @@ describe('ride-along foreachIndex and iteration', () => {
 
     const outcome = await runWorkflow(compiled, 'x', { runner, signal: ac.signal });
 
-    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'a', path: [0], foreachIndex: 5 } });
+    // The settle stage re-stamps an outcome that ran: `started: true`.
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'a', path: [0], foreachIndex: 5 }, started: true });
   });
 });
 
@@ -1362,10 +1416,15 @@ describe('sleeps honour the cancel place at the top level', () => {
     expect(names(cancelWaited.outputPlaces())).toEqual(['wf.canceled']);
   });
 
-  it('a fixed sleep is a timed wake alone: no waited place, no resume', () => {
+  // Was "a timed wake alone": the contract split the fixed sleep into an immediate `begin` that
+  // records `waiting`, a `waiting` place, and the delayed `wake` — so a sweep can tell a sleep that
+  // never began (on `in`) from one mid-wait (on `waiting`). Still no `waited` place and no resume.
+  it('a fixed sleep is begin -> waiting -> timed wake: no waited place, no resume', () => {
     const compiled = compile(wf({ kind: 'sleep', id: 'nap', duration: { fixed: 1_000 } }));
     const own = [...compiled.net.transitions].map((t) => t.name).filter((n) => n.startsWith('t.0.'));
-    expect(own.sort()).toEqual(['t.0.nap.cancel', 't.0.nap.wake']);
+    expect(own.sort()).toEqual(['t.0.nap.begin', 't.0.nap.cancel', 't.0.nap.cancel-waiting', 't.0.nap.wake']);
+    const places = [...compiled.net.places].map((p) => p.name).filter((n) => n.startsWith('s.0.'));
+    expect(places.sort()).toEqual(['s.0.nap.in', 's.0.nap.waiting']);
     expect([...compiled.net.transitions].find((t) => t.name === 't.0.nap.wake')!.timing).toEqual({
       type: 'delayed',
       afterMs: 1_000,
@@ -1427,11 +1486,19 @@ describe('cancelStructureViolations flags every leaf inhibitor stripped', () => 
         "'t.1.b.run' competes with sweep 't.1.b.cancel' for [s.1.b.in] without an inhibitor on 'wf.cancel'",
       ],
     ],
+    // The fixed sleep's wake now consumes `waiting`, so it competes with `cancel-waiting` there
+    // (it used to consume `in` and compete with `cancel`); `begin` took over the start gate.
     [
       "a fixed sleep's wake",
       [fixedSleep],
       { sleep: stripping(sleepGadget, '.wake') },
-      ["'t.0.nap.wake' competes with sweep 't.0.nap.cancel' for [s.0.nap.in] without an inhibitor on 'wf.cancel'"],
+      ["'t.0.nap.wake' competes with sweep 't.0.nap.cancel-waiting' for [s.0.nap.waiting] without an inhibitor on 'wf.cancel'"],
+    ],
+    [
+      "a fixed sleep's begin",
+      [fixedSleep],
+      { sleep: stripping(sleepGadget, '.begin') },
+      ["'t.0.nap.begin' competes with sweep 't.0.nap.cancel' for [s.0.nap.in] without an inhibitor on 'wf.cancel'"],
     ],
     [
       "a per-run sleep's wake",
@@ -1481,6 +1548,357 @@ describe('the sweep carries the foreach index onto the canceled origin', () => {
     // The sweep — not the settle stage: nothing ran and nothing was recorded.
     expect(runner.calls).toEqual([]);
     expect(stepResults.size).toBe(0);
-    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'a', path: [0], foreachIndex: 5 } });
+    // Swept at its start gate: the step never began, `started: false`.
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'a', path: [0], foreachIndex: 5 }, started: false });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Observes every token a gadget writes to its `canceled` exit without changing what happens
+ * next: the gadget is compiled with a local tap in that exit's stead, and one forwarding
+ * transition copies each token on. The canceled token's `started` is the thing observed —
+ * structural, from which sweep fired — so a mutant that flips one sweep's flag fails here even
+ * where the outcome does not show it.
+ */
+function tappedCanceled(inner: Gadget): { gadget: Gadget; seen: unknown[] } {
+  const seen: unknown[] = [];
+  const gadget: Gadget = (entry, next, ctx) => {
+    const tap = place<CanceledToken>(ctx.names.reserve(`test.tap.canceled.${entry.id}`, 'test observation tap'));
+    const result = inner(entry, next, { ...ctx, exits: { ...ctx.exits, canceled: tap } });
+    const forward = Transition.builder(`test.tap.canceled.${entry.id}.forward`)
+      .inputs(one(tap))
+      .outputs(outPlace(ctx.exits.canceled))
+      .action(async (tctx) => {
+        const token = tctx.input(tap);
+        seen.push(token);
+        tctx.output(ctx.exits.canceled, token);
+      })
+      .build();
+    return { ...result, transitions: [...result.transitions, forward] };
+  };
+  return { gadget, seen };
+}
+
+/**
+ * `inner`, with every transition whose name ends in `suffix` rebuilt so the `started` flag of any
+ * canceled token it writes is inverted — every arc, the timing and the priority kept. A mutant for
+ * the non-vacuity of the `started` assertions.
+ */
+function flippingStarted(inner: Gadget, suffix: string): Gadget {
+  return (entry, next, ctx) => {
+    const r = inner(entry, next, ctx);
+    const flip = (t: Transition): Transition => {
+      const b = Transition.builder(t.name)
+        .inputs(...t.inputSpecs)
+        .outputs(t.outputSpec!)
+        .timing(t.timing)
+        .priority(t.priority)
+        .action((tctx) =>
+          t.action(
+            new Proxy(tctx, {
+              get(target, prop) {
+                if (prop === 'output') {
+                  return (p: Place<unknown>, value: unknown) =>
+                    target.output(
+                      p,
+                      value !== null && typeof value === 'object' && 'started' in value
+                        ? { ...value, started: !(value as CanceledToken).started }
+                        : value,
+                    );
+                }
+                const v: unknown = Reflect.get(target, prop, target);
+                return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+              },
+            }),
+          ),
+        );
+      for (const arc of t.reads) b.read(arc.place);
+      for (const arc of t.inhibitors) b.inhibitor(arc.place);
+      for (const arc of t.resets) b.reset(arc.place);
+      return b.build();
+    };
+    return { ...r, transitions: r.transitions.map((t) => (t.name.endsWith(suffix) ? flip(t) : t)) };
+  };
+}
+
+/**
+ * A {@link ManualClock} that, the first time it is asked to wait a finite time, aborts `ac`
+ * instead of advancing — the abort lands *during* the first timed wait, at virtual time 0 past
+ * it, deterministically. Every later wait advances as usual.
+ */
+class AbortingClock extends ManualClock {
+  #fired = false;
+  constructor(private readonly ac: AbortController, epochOrigin = EPOCH) {
+    super(epochOrigin);
+  }
+  override async sleep(delayMs: number, ready: () => boolean, signal: AbortSignal): Promise<void> {
+    if (!this.#fired && Number.isFinite(delayMs) && delayMs > 0 && !signal.aborted && !ready()) {
+      this.#fired = true;
+      this.ac.abort();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      return;
+    }
+    return super.sleep(delayMs, ready, signal);
+  }
+}
+
+describe('a fixed sleep is begin -> waiting -> wake, and its cancel sweeps say whether it began', () => {
+  const nap = (ms = 60_000): EntryDescription => ({ kind: 'sleep', id: 'nap', duration: { fixed: ms } });
+  const at0 = { stepId: 'nap', path: [0] };
+  const at1 = { stepId: 'nap', path: [1] };
+
+  it('begin is immediate and gated; wake is delayed and gated; each place has its own sweep', () => {
+    const compiled = compile(wf(nap(1_000), step('b')));
+    const byName = new Map([...compiled.net.transitions].map((t) => [t.name, t]));
+    const names = (ps: Iterable<{ name: string }>) => [...ps].map((p) => p.name).sort();
+    const begin = byName.get('t.0.nap.begin')!;
+    const wake = byName.get('t.0.nap.wake')!;
+
+    expect(begin.timing).toEqual({ type: 'immediate' });
+    expect(names(begin.inputPlaces())).toEqual(['s.0.nap.in']);
+    expect(names(begin.outputPlaces())).toEqual(['s.0.nap.waiting']);
+    expect(begin.inhibitors.map((a) => a.place.name)).toEqual(['wf.cancel']);
+
+    expect(wake.timing).toEqual({ type: 'delayed', afterMs: 1_000 });
+    expect(names(wake.inputPlaces())).toEqual(['s.0.nap.waiting']);
+    expect(names(wake.outputPlaces())).toEqual(['s.1.b.in']);
+    expect(wake.inhibitors.map((a) => a.place.name)).toEqual(['wf.cancel']);
+
+    for (const [sweep, from] of [['t.0.nap.cancel', 's.0.nap.in'], ['t.0.nap.cancel-waiting', 's.0.nap.waiting']] as const) {
+      const t = byName.get(sweep)!;
+      expect(t.reads.map((a) => a.place.name), sweep).toEqual(['wf.cancel']);
+      expect(names(t.inputPlaces()), sweep).toEqual([from]);
+      expect(names(t.outputPlaces()), sweep).toEqual(['wf.canceled']);
+    }
+  });
+
+  it('records waiting at begin and success at wake, exactly its duration after begin, in virtual time', async () => {
+    const clock = new ManualClock(EPOCH);
+    const log: Stamp[] = [];
+    // `a` fails once and retries 250ms later, so the sleep begins at 250, not 0: the wake is timed
+    // from `begin`, not from the run's start.
+    const runner = new RecordingRunner({
+      steps: stamped(clock, log, ['a', 'b'], {
+        a: (input, call) => (call.attempt === 0 ? { status: 'failed', error: 'once' } : { status: 'success', output: input }),
+      }),
+    });
+
+    const { outcome, stepResults } = await runWorkflowDetailed(
+      compile(wf(step('a', { retries: 1, retryDelayMs: 250 }), { kind: 'sleep', id: 'nap', duration: { fixed: 60_000 } }, step('b'))),
+      'x',
+      { runner, clock },
+    );
+
+    expect(outcome).toEqual({ status: 'success', output: 'x' });
+    expect(firstAt(log, 'b')).toBe(250 + 60_000);
+    expect(clock.elapsed()).toBe(250 + 60_000);
+    // The `waiting` record `begin` wrote is overwritten by `wake`'s success; `startedAt` is the
+    // instant `begin` fired, `endedAt` the instant `wake` did (`handlers/entry.ts:602-609,655-665`).
+    expect(stepResults.get('nap')).toEqual({
+      status: 'success',
+      output: 'x',
+      payload: 'x',
+      startedAt: EPOCH + 250,
+      endedAt: EPOCH + 250 + 60_000,
+    });
+  });
+
+  it('canceled before it begins: the start-gate sweep, no record, started false', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const clock = new ManualClock(EPOCH);
+    const tap = tappedCanceled(sleepGadget);
+    const runner = new RecordingRunner();
+
+    const { outcome, stepResults } = await runWorkflowDetailed(
+      compile(wf(nap(), step('b')), { gadgets: { sleep: tap.gadget } }),
+      'x',
+      { runner, clock, signal: ac.signal },
+    );
+
+    // Mastra's check before the entry (`default.ts:815`): the sleep never began, so there is no
+    // `waiting` record and nothing on the path.
+    expect(tap.seen).toEqual([{ origin: at0, started: false }]);
+    expect(stepResults.size).toBe(0);
+    expect(runner.calls).toEqual([]);
+    expect(clock.elapsed()).toBe(0);
+    // Last, so every assertion above runs even while the kernel drops `started` (contractIssues).
+    expect(outcome).toEqual({ status: 'canceled', origin: at0, started: false });
+  });
+
+  it('canceled mid-wait: the waiting sweep, the waiting record kept, started true, wake never fires', async () => {
+    const ac = new AbortController();
+    const clock = new AbortingClock(ac);
+    const tap = tappedCanceled(sleepGadget);
+    const runner = new RecordingRunner();
+
+    const { outcome, stepResults } = await runWorkflowDetailed(
+      compile(wf(step('a'), nap(), step('b')), { gadgets: { sleep: tap.gadget } }),
+      'x',
+      { runner, clock, signal: ac.signal },
+    );
+
+    // `abortableSleep` resolves early, the entry is re-stamped canceled, and the `waiting` record
+    // written when the sleep began is left in place (`handlers/entry.ts:602-609,638-643`).
+    expect(tap.seen).toEqual([{ origin: at1, started: true }]);
+    expect(stepResults.get('nap')).toEqual({ status: 'waiting', payload: 'x', startedAt: EPOCH });
+    expect(runner.calls).toEqual(['a']);
+    // The wake never fired: no virtual time passed.
+    expect(clock.elapsed()).toBe(0);
+    // Last, so every assertion above runs even while the kernel drops `started` (contractIssues).
+    expect(outcome).toEqual({ status: 'canceled', origin: at1, started: true });
+  });
+
+  it('a mutant whose waiting sweep reports started false is caught', async () => {
+    const ac = new AbortController();
+    const tap = tappedCanceled(flippingStarted(sleepGadget, '.cancel-waiting'));
+    await runWorkflowDetailed(compile(wf(step('a'), nap(), step('b')), { gadgets: { sleep: tap.gadget } }), 'x', {
+      runner: new RecordingRunner(),
+      clock: new AbortingClock(ac),
+      signal: ac.signal,
+    });
+    // The intact gadget reports `started: true` here (test above); the mutant reports false.
+    expect(tap.seen).toEqual([{ origin: at1, started: false }]);
+  });
+
+  it('a mutant whose start-gate sweep reports started true is caught', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const tap = tappedCanceled(flippingStarted(sleepGadget, '.cancel'));
+    await runWorkflowDetailed(compile(wf(nap(), step('b')), { gadgets: { sleep: tap.gadget } }), 'x', {
+      runner: new RecordingRunner(),
+      clock: new ManualClock(EPOCH),
+      signal: ac.signal,
+    });
+    expect(tap.seen).toEqual([{ origin: at0, started: true }]);
+  });
+});
+
+describe('the action-side sleeps and the step: which sweep reports started', () => {
+  const perRun: EntryDescription = { kind: 'sleep', id: 'nap', duration: { perRun: true } };
+  const perRunUntil: EntryDescription = { kind: 'sleepUntil', id: 'nap', until: { perRun: true } };
+  const fixedUntil: EntryDescription = { kind: 'sleepUntil', id: 'nap', until: { fixed: EPOCH + 60_000 } };
+  const at1 = { stepId: 'nap', path: [1] };
+
+  it.each([
+    ['a per-run sleep', perRun],
+    ['a per-run sleepUntil', perRunUntil],
+    ['a fixed sleepUntil', fixedUntil],
+  ] as const)('%s canceled before it begins: `cancel` on in, no record, started false', async (_label, entry) => {
+    const ac = new AbortController();
+    const tap = tappedCanceled(sleepGadget);
+    const runner = new RecordingRunner({
+      steps: { a: (x) => (ac.abort(), { status: 'success', output: x }) },
+      waits: { nap: () => { throw new Error('resolveWait must not run'); } },
+    });
+    const kind = entry.kind;
+
+    const { outcome, stepResults } = await runWorkflowDetailed(
+      compile(wf(step('a'), entry, step('b')), { gadgets: { [kind]: tap.gadget } }),
+      'x',
+      { runner, clock: new ManualClock(EPOCH), signal: ac.signal },
+    );
+
+    // `a` aborted during its own run, then succeeded: the settle stage passes a success through
+    // (only the non-success exits are re-stamped at the top level), and the sleep's gate sweeps it.
+    expect(tap.seen).toEqual([{ origin: at1, started: false }]);
+    expect(stepResults.has('nap')).toBe(false);
+    expect(runner.calls).toEqual(['a']);
+    // Last, so every assertion above runs even while the kernel drops `started` (contractIssues).
+    expect(outcome).toEqual({ status: 'canceled', origin: at1, started: false });
+  });
+
+  it.each([
+    ['a per-run sleep', perRun],
+    ['a per-run sleepUntil', perRunUntil],
+    ['a fixed sleepUntil', fixedUntil],
+  ] as const)('%s canceled mid-wait: `cancel-waited`, the waiting record kept, started true', async (_label, entry) => {
+    const ac = new AbortController();
+    const clock = new AbortingClock(ac);
+    const tap = tappedCanceled(sleepGadget);
+    const runner = new RecordingRunner({
+      waits: { nap: () => (entry.kind === 'sleep' ? 60_000 : EPOCH + 60_000) },
+    });
+
+    const { outcome, stepResults } = await runWorkflowDetailed(
+      compile(wf(step('a'), entry, step('b')), { gadgets: { [entry.kind]: tap.gadget } }),
+      'x',
+      { runner, clock, signal: ac.signal },
+    );
+
+    expect(tap.seen).toEqual([{ origin: at1, started: true }]);
+    expect(stepResults.get('nap')).toEqual({ status: 'waiting', payload: 'x', startedAt: EPOCH });
+    expect(runner.calls).toEqual(['a']);
+    expect(clock.elapsed()).toBe(0);
+    // Last, so every assertion above runs even while the kernel drops `started` (contractIssues).
+    expect(outcome).toEqual({ status: 'canceled', origin: at1, started: true });
+  });
+
+  it('a step swept at its gate reports started false', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const tap = tappedCanceled(stepGadget);
+    const { outcome } = await runWorkflowDetailed(compile(wf(step('a')), { gadgets: { step: tap.gadget } }), 'x', {
+      runner: new RecordingRunner(),
+      signal: ac.signal,
+    });
+    expect(tap.seen).toEqual([{ origin: { stepId: 'a', path: [0] }, started: false }]);
+    // Last, so every assertion above runs even while the kernel drops `started` (contractIssues).
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'a', path: [0] }, started: false });
+  });
+
+  it.each([
+    ['failed', { status: 'failed', error: 'x' }],
+    ['bailed', { status: 'bailed', output: 'b' }],
+    ['suspended', { status: 'suspended', suspendPayload: 'p' }],
+    ['paused', { status: 'paused' }],
+  ] as const)('a step that %s after the abort is re-stamped by the settle stage: started true', async (_label, result) => {
+    const ac = new AbortController();
+    const runner = new RecordingRunner({ steps: { a: () => (ac.abort(), result as StepOutcome) } });
+    const { outcome } = await runWorkflowDetailed(compile(wf(step('a'), step('b'))), 'x', { runner, signal: ac.signal });
+    // Mastra's entry-end check re-stamps the entry that ran (`handlers/entry.ts:815-817`).
+    expect(runner.calls).toEqual(['a']);
+    // Last, so every assertion above runs even while the kernel drops `started` (contractIssues).
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'a', path: [0] }, started: true });
+  });
+
+  it('the last entry\'s success re-stamped after the run: no origin, started true', async () => {
+    const ac = new AbortController();
+    const runner = new RecordingRunner({ steps: { a: (x) => (ac.abort(), { status: 'success', output: x }) } });
+    const { outcome } = await runWorkflowDetailed(compile(wf(step('a'))), 'x', { runner, signal: ac.signal });
+    // `settleDone`: every entry ran; the run-end check re-stamps it.
+    // Last, so every assertion above runs even while the kernel drops `started` (contractIssues).
+    expect(outcome).toEqual({ status: 'canceled', started: true });
+  });
+});
+
+describe('sleeps proven with the begin/waiting/wake split', () => {
+  const fixed = (id: string, ms = 1_000): EntryDescription => ({ kind: 'sleep', id, duration: { fixed: ms } });
+
+  it('proves a fixed sleep first, last, back to back, and beside every other leaf form', async () => {
+    await expectProvenBothSegments(
+      wf(
+        fixed('s0'),
+        step('a', { retries: 1, retryDelayMs: 5 }),
+        fixed('s1', 0),
+        fixed('s2'),
+        { kind: 'sleep', id: 's3', duration: { perRun: true } },
+        { kind: 'sleepUntil', id: 's4', until: { fixed: EPOCH } },
+        fixed('s5'),
+      ),
+    );
+  }, 180_000);
+
+  it('the structural check is clean for every sleep form in every position', () => {
+    for (const entries of [
+      [fixed('s0')],
+      [fixed('s0'), fixed('s1')],
+      [step('a'), fixed('s0'), step('b')],
+      [fixed('s0'), { kind: 'sleepUntil', id: 'u', until: { perRun: true } } as EntryDescription, fixed('s1')],
+    ]) {
+      expect(cancelStructureViolations(compile(wf(...entries)))).toEqual([]);
+    }
   });
 });

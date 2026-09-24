@@ -163,14 +163,11 @@ export const sleepGadget: Gadget = (entry, next, ctx) => {
 
   const { cancel, viewPath } = ctx;
   const inPlace = place<FlowToken>(ctx.names.entryIn(ctx.path, entry.id));
-  const builder = Transition.builder(ctx.names.entryWake(ctx.path, entry.id)).inputs(one(inPlace));
-  // A sleep in progress ends on cancel, as Mastra's `abortableSleep` resolves early and the entry
-  // is re-stamped `canceled`. For a fixed sleep the token *waits in* `inPlace` while the delay
-  // runs, so the sweep ends it the moment the signal lands; a wait resolved in the action ends
-  // through `scope.signal` instead, and the settle stage or the next entry's sweep does the rest.
+  // A sweep on `inPlace` reports a sleep that never began; the sweeps on `waiting` (fixed) and
+  // `waited` (action-side) report one that had — separate places, so `CanceledToken.started` is
+  // structural rather than guessed from timing.
   const extra: Transition[] =
     cancel === undefined ? [] : [sweep(ctx.names.entryTransition(ctx.path, entry.id, 'cancel'), inPlace, cancel, ctx.exits, entry.id, viewPath)];
-  if (cancel !== undefined) builder.inhibitor(cancel);
 
   const record = (scope: RunScope, incoming: FlowToken, startedAt: number): void =>
     scope.recordStepResult(entry.id, {
@@ -180,25 +177,52 @@ export const sleepGadget: Gadget = (entry, next, ctx) => {
       startedAt,
       endedAt: scope.epochNow(),
     });
+  // What Mastra writes when a sleep begins, and leaves if the run is canceled mid-wait
+  // (`handlers/entry.ts:602-609`). The wait's end overwrites it with `success`.
+  const recordWaiting = (scope: RunScope, incoming: FlowToken, startedAt: number): void =>
+    scope.recordStepResult(entry.id, { status: 'waiting', payload: incoming.data, startedAt });
 
   if (entry.kind === 'sleep' && 'fixed' in wait) {
-    const ms = wait.fixed;
-    builder
-      .timing(delayed(ms))
-      .outputs(outPlace(next))
+    // `begin` fires at once and records the wait; the token then waits in `waiting` for the
+    // delayed `wake`. Before this split the token waited in `inPlace` itself, so a cancel sweep
+    // could not tell a sleep that never began from one halfway through.
+    const waiting = place<RetryToken>(ctx.names.entryPlace(ctx.path, entry.id, 'waiting'));
+    const begin = Transition.builder(ctx.names.entryTransition(ctx.path, entry.id, 'begin'))
+      .inputs(one(inPlace))
+      .outputs(outPlace(waiting))
       .action(async (tctx) => {
         const incoming = tctx.input(inPlace);
         const scope = scopeOf(tctx);
-        // The wait already happened as the transition's timing; it began `ms` before now.
-        record(scope, incoming, scope.epochNow() - ms);
-        tctx.output(next, incoming);
+        const startedAt = scope.epochNow();
+        recordWaiting(scope, incoming, startedAt);
+        const started: RetryToken = { ...incoming, startedAt };
+        tctx.output(waiting, started);
       });
-    return { inPlace, transitions: [builder.build(), ...extra] };
+    const wake = Transition.builder(ctx.names.entryWake(ctx.path, entry.id))
+      .timing(delayed(wait.fixed))
+      .inputs(one(waiting))
+      .outputs(outPlace(next))
+      .action(async (tctx) => {
+        const done = tctx.input(waiting);
+        const scope = scopeOf(tctx);
+        record(scope, done, done.startedAt ?? scope.epochNow());
+        tctx.output(next, { ...carried(done), data: done.data });
+      });
+    if (cancel !== undefined) {
+      begin.inhibitor(cancel);
+      wake.inhibitor(cancel);
+      extra.push(sweep(ctx.names.entryTransition(ctx.path, entry.id, 'cancel-waiting'), waiting, cancel, ctx.exits, entry.id, viewPath, true));
+    }
+    return { inPlace, transitions: [begin.build(), wake.build(), ...extra] };
   }
 
+  const builder = Transition.builder(ctx.names.entryWake(ctx.path, entry.id)).inputs(one(inPlace));
+  if (cancel !== undefined) builder.inhibitor(cancel);
+
   // **The wait's end is routed by the net, not by the action.** An action-side wait that the
-  // signal cuts short must be canceled *at the sleep* with no record — Mastra leaves
-  // `{status: 'waiting'}` and returns the entry canceled (`handlers/entry.ts:605-609,642-643`).
+  // signal cuts short must be canceled *at the sleep*, keeping the `waiting` record written when the
+  // wait began — Mastra leaves `{status: 'waiting'}` there and returns the entry canceled
+  // (`handlers/entry.ts:602-609,641-643`).
   // Deciding that in the action by reading `scope.signal.aborted` made `wf.canceled` reachable in
   // a run no cancel reaches, as far as a value-blind verifier can tell, and broke `neverCanceled`
   // — a flag deciding cancellation, which the hard rule forbids. So the action only waits and
@@ -211,8 +235,10 @@ export const sleepGadget: Gadget = (entry, next, ctx) => {
     const incoming = tctx.input(inPlace);
     const scope = scopeOf(tctx);
     const startedAt = scope.epochNow();
+    recordWaiting(scope, incoming, startedAt);
 
-    // Decide, then emit: resolve and wait first, where a throw writes nothing. `threw` is a
+    // Decide, then emit: resolve and wait first, where a throw writes no success record and leaves
+    // the `waiting` one, as Mastra's does (`handlers/entry.ts:604-608`). `threw` is a
     // flag of its own because a rejection may carry `undefined` as its reason, and testing the
     // caught value would read that as success and skip the wait.
     let threw = false;
@@ -254,7 +280,7 @@ export const sleepGadget: Gadget = (entry, next, ctx) => {
     });
   if (cancel !== undefined) {
     resume.inhibitor(cancel);
-    extra.push(sweep(ctx.names.entryTransition(ctx.path, entry.id, 'cancel-waited'), waited, cancel, ctx.exits, entry.id, viewPath));
+    extra.push(sweep(ctx.names.entryTransition(ctx.path, entry.id, 'cancel-waited'), waited, cancel, ctx.exits, entry.id, viewPath, true));
   }
   return { inPlace, transitions: [builder.build(), resume.build(), ...extra] };
 };
@@ -270,6 +296,7 @@ function sweep(
   exits: Exits,
   stepId: string,
   path: EntryPath,
+  started = false,
 ): Transition {
   return Transition.builder(name)
     .inputs(one(from))
@@ -277,7 +304,7 @@ function sweep(
     .outputs(outPlace(exits.canceled))
     .action(async (tctx) => {
       const incoming = tctx.input(from);
-      tctx.output(exits.canceled, { origin: withIndex({ stepId, path }, incoming) });
+      tctx.output(exits.canceled, { origin: withIndex({ stepId, path }, incoming), started });
     })
     .build();
 }
@@ -394,15 +421,17 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     const now = scope.epochNow();
     const when =
       outcome.status === 'suspended' ? { suspendedAt: now } : outcome.status === 'paused' ? {} : { endedAt: now };
+    const payload = 'payload' in outcome ? outcome.payload : incoming.data;
     scope.recordStepResult(stepId, {
       ...outcome,
-      payload: incoming.data,
+      payload,
       startedAt,
       ...when,
       ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
     });
 
     const origin = withIndex({ stepId, path }, incoming);
+    const stepPayload = 'payload' in outcome ? { stepPayload: outcome.payload } : {};
     switch (outcome.status) {
       case 'success':
         // The item's index and the iteration ride on, so the combinator that started the step can
@@ -412,19 +441,20 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
       case 'failed':
         tctx.output(exits.failed, {
           ...origin,
+          ...stepPayload,
           error: outcome.error,
           ...(outcome.tripwire === undefined ? {} : { tripwire: outcome.tripwire }),
           ...(outcome.nonRetryable === true ? { nonRetryable: true as const } : {}),
         });
         return;
       case 'bailed':
-        tctx.output(exits.bailed, { ...origin, output: outcome.output });
+        tctx.output(exits.bailed, { ...origin, ...stepPayload, output: outcome.output });
         return;
       case 'suspended':
         tctx.output(exits.suspended, { ...origin, payload: outcome.suspendPayload });
         return;
       case 'paused':
-        tctx.output(exits.paused, origin);
+        tctx.output(exits.paused, { ...origin, ...stepPayload });
         return;
     }
   };

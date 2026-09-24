@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { compile } from '../../src/compiler/index.js';
+import { Transition, one, outPlace, place, type Place } from 'libpetri';
+import { branchGadget, compile, type Gadget } from '../../src/compiler/index.js';
 import type {
+  CanceledToken,
   EntryDescription,
   RunView,
   StepDescription,
@@ -328,7 +330,9 @@ describe('branch: failure, suspension and their precedence', () => {
 
     const outcome = await runWorkflow(compile(threeArms), 'alert', { runner });
 
-    expect(outcome).toStrictEqual({ status: 'tripwire', stepId: 'sms', path: [0, 1], tripwire });
+    // The outcome carries the failure's `error` beside the tripwire (contract change) for the
+    // result formatter's fallback; Mastra's run result itself has none.
+    expect(outcome).toStrictEqual({ status: 'tripwire', stepId: 'sms', path: [0, 1], tripwire, error: 'tripped' });
   });
 
   it('treats a throwing arm step as a failed arm rather than a lost token', async () => {
@@ -482,7 +486,8 @@ describe('branch: failure, suspension and their precedence', () => {
       timeoutMs: 5_000,
     });
     expect(runner.calls).toEqual(['prep']);
-    expect(outcome).toStrictEqual({ status: 'canceled', origin: { stepId: 'route', path: [1] } });
+    // The failure ran and the settle stage re-stamped it: `started: true`.
+    expect(outcome).toStrictEqual({ status: 'canceled', origin: { stepId: 'route', path: [1] }, started: true });
   });
 });
 
@@ -610,7 +615,8 @@ describe('branch: cancellation', () => {
 
     const report = await runWorkflowDetailed(compile(armsThenAudit), 'x', { runner, signal: ac.signal, clock: new ManualClock() });
 
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'route', path: [1] } });
+    // Swept at the block's gate: it never began, `started: false`.
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'route', path: [1] }, started: false });
     expect(runner.selected).toEqual([]);
     expect(runner.calls).toEqual(['prep']);
     expect(report.stepResults.get('prep')).toMatchObject({ status: 'success', output: 'x' });
@@ -628,7 +634,7 @@ describe('branch: cancellation', () => {
 
     const outcome = await runWorkflow(compile(threeArms), 'x', { runner, signal: ac.signal });
 
-    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'route', path: [0] } });
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'route', path: [0] }, started: false });
     expect(runner.selected).toEqual([]);
     expect(runner.calls).toEqual([]);
   });
@@ -640,7 +646,7 @@ describe('branch: cancellation', () => {
       runner: new RecordingRunner(),
       signal: ac.signal,
     });
-    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'route', path: [0] } });
+    expect(outcome).toEqual({ status: 'canceled', origin: { stepId: 'route', path: [0] }, started: false });
   });
 
   it('aborted while an arm runs: every selected arm still runs and is recorded, the next entry is swept', async () => {
@@ -662,7 +668,7 @@ describe('branch: cancellation', () => {
     }
     // Mastra re-stamps the block `canceled` after it (`handlers/entry.ts:815-817`) and never
     // starts `audit`; the net's check is the next entry's sweep.
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'audit', path: [2] } });
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'audit', path: [2] }, started: false });
   });
 
   it('aborted while an arm runs in a last-entry block: the settle stage re-stamps the success canceled', async () => {
@@ -679,7 +685,7 @@ describe('branch: cancellation', () => {
 
     expect([...runner.calls].sort()).toEqual(['email', 'push']);
     expect(report.stepResults.get('email')).toMatchObject({ status: 'success' });
-    expect(report.outcome).toEqual({ status: 'canceled' });
+    expect(report.outcome).toEqual({ status: 'canceled', started: true });
   });
 
   it('aborted while an arm fails: canceled outranks the failure, which keeps its record', async () => {
@@ -694,7 +700,7 @@ describe('branch: cancellation', () => {
 
     const report = await runWorkflowDetailed(compile(threeArms), 'x', { runner, signal: ac.signal, timeoutMs: 5_000 });
 
-    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'sms', path: [0, 1] } });
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'sms', path: [0, 1] }, started: true });
     expect(report.stepResults.get('sms')).toMatchObject({ status: 'failed', error: 'down' });
     expect(report.stepResults.get('email')).toMatchObject({ status: 'success', output: 'late' });
   });
@@ -729,7 +735,7 @@ describe('branch: cancellation', () => {
     // `toStrictEqual` also refuses a `residue` key. The origin is the next entry's sweep; Mastra
     // stops at the block itself (`handlers/entry.ts:815-817`) — the contract-level origin
     // difference recorded for every top-level entry, not specific to `.branch()`.
-    expect(report.outcome).toStrictEqual({ status: 'canceled', origin: { stepId: 'audit', path: [2] } });
+    expect(report.outcome).toStrictEqual({ status: 'canceled', origin: { stepId: 'audit', path: [2] }, started: false });
   });
 
   it('a condition aborts, then selects two arms, as the last entry: both arms run, the run ends canceled', async () => {
@@ -746,7 +752,7 @@ describe('branch: cancellation', () => {
     expect(report.stepResults.get('sms')).toMatchObject({ status: 'success', output: 'sms(x)' });
     // Mastra's ladder reaches `canceled` (`:612`) and `entry.ts:815-817` re-stamps it anyway; the
     // settle stage is where the net does it, and a canceled run carries no step id.
-    expect(report.outcome).toStrictEqual({ status: 'canceled' });
+    expect(report.outcome).toStrictEqual({ status: 'canceled', started: true });
   });
 
   it('a condition aborts and selects a reused arm: the reuse still arrives, nothing is left behind', async () => {
@@ -766,7 +772,7 @@ describe('branch: cancellation', () => {
     });
 
     expect(runner.calls).toEqual(['sms', 'email']);
-    expect(report.outcome).toStrictEqual({ status: 'canceled' });
+    expect(report.outcome).toStrictEqual({ status: 'canceled', started: true });
   });
 
   it('an arm retrying after the abort keeps retrying: retries are not gated', async () => {
@@ -783,7 +789,7 @@ describe('branch: cancellation', () => {
     });
 
     expect(runner.attempts).toEqual([{ stepId: 'flaky', attempt: 0 }, { stepId: 'flaky', attempt: 1 }]);
-    expect(outcome).toEqual({ status: 'canceled' });
+    expect(outcome).toEqual({ status: 'canceled', started: true });
   });
 
   it('a signal that never fires changes nothing, and every outcome still ends the run', async () => {
@@ -814,5 +820,109 @@ describe('branch: cancellation', () => {
       const outcome = await runWorkflow(compile(description), 'x', { runner, signal, clock: new ManualClock(), timeoutMs: 5_000 });
       expect(outcome, label).toStrictEqual(expected);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// `CanceledToken.started` — structural: which sweep fired says whether the work had begun.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Observes every token a gadget writes to its `canceled` exit without changing what happens
+ * next: the gadget is compiled with a local tap in that exit's stead, and one forwarding
+ * transition copies each token on. It reads `started` straight off the token, independent of
+ * whether the kernel's `RunOutcome` forwards it.
+ */
+function tappedCanceled(inner: Gadget): { gadget: Gadget; seen: unknown[] } {
+  const seen: unknown[] = [];
+  const gadget: Gadget = (entry, next, ctx) => {
+    const tap = place<CanceledToken>(ctx.names.reserve(`test.tap.canceled.${entry.id}`, 'test observation tap'));
+    const result = inner(entry, next, { ...ctx, exits: { ...ctx.exits, canceled: tap } });
+    const forward = Transition.builder(`test.tap.canceled.${entry.id}.forward`)
+      .inputs(one(tap))
+      .outputs(outPlace(ctx.exits.canceled))
+      .action(async (tctx) => {
+        const token = tctx.input(tap);
+        seen.push(token);
+        tctx.output(ctx.exits.canceled, token);
+      })
+      .build();
+    return { ...result, transitions: [...result.transitions, forward] };
+  };
+  return { gadget, seen };
+}
+
+/**
+ * `inner`, with every transition whose name ends in `suffix` rebuilt so the `started` flag of any
+ * canceled token it writes is inverted — every arc, the timing and the priority kept. The mutant
+ * that shows a `started` assertion is not vacuous.
+ */
+function flippingStarted(inner: Gadget, suffix: string): Gadget {
+  return (entry, next, ctx) => {
+    const r = inner(entry, next, ctx);
+    const flip = (t: Transition): Transition => {
+      const b = Transition.builder(t.name)
+        .inputs(...t.inputSpecs)
+        .outputs(t.outputSpec!)
+        .timing(t.timing)
+        .priority(t.priority)
+        .action((tctx) =>
+          t.action(
+            new Proxy(tctx, {
+              get(target, prop) {
+                if (prop === 'output') {
+                  return (p: Place<unknown>, value: unknown) =>
+                    target.output(
+                      p,
+                      value !== null && typeof value === 'object' && 'started' in value
+                        ? { ...value, started: !(value as CanceledToken).started }
+                        : value,
+                    );
+                }
+                const v: unknown = Reflect.get(target, prop, target);
+                return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+              },
+            }),
+          ),
+        );
+      for (const arc of t.reads) b.read(arc.place);
+      for (const arc of t.inhibitors) b.inhibitor(arc.place);
+      for (const arc of t.resets) b.reset(arc.place);
+      return b.build();
+    };
+    const transitions = r.transitions.map((t) => (t.name.endsWith(suffix) ? flip(t) : t));
+    expect(transitions.filter((t, i) => t !== r.transitions[i]).length, `no transition ends in '${suffix}'`).toBeGreaterThan(0);
+    return { ...r, transitions };
+  };
+}
+
+describe('branch: the block\'s cancel sweep reports started false', () => {
+  const shape = workflow(step('prep'), branch('route', step('email'), step('sms')), step('audit'));
+  const abortingPrep = () => {
+    const ac = new AbortController();
+    const runner = runnerFor({ route: () => [0, 1] }, { prep: (input) => { ac.abort(); return ok(input); } });
+    return { runner, signal: ac.signal };
+  };
+
+  it('a block swept at its gate never began: started false, no condition asked', async () => {
+    const tap = tappedCanceled(branchGadget);
+    const control = abortingPrep();
+    await runWorkflow(compile(shape, { gadgets: { branch: tap.gadget } }), 'x', { ...control, timeoutMs: 5_000 });
+    expect(tap.seen).toStrictEqual([{ origin: { stepId: 'route', path: [1] }, started: false }]);
+    expect(control.runner.selected).toEqual([]);
+  });
+
+  it('a block whose condition ran writes nothing to its canceled exit', async () => {
+    const ac = new AbortController();
+    const tap = tappedCanceled(branchGadget);
+    const runner = runnerFor({ route: () => { ac.abort(); return [0, 1]; } });
+    await runWorkflow(compile(shape, { gadgets: { branch: tap.gadget } }), 'x', { runner, signal: ac.signal, timeoutMs: 5_000 });
+    expect(tap.seen).toStrictEqual([]);
+  });
+
+  it('a mutant whose sweep reports started true is caught', async () => {
+    const tap = tappedCanceled(flippingStarted(branchGadget, '.cancel'));
+    await runWorkflow(compile(shape, { gadgets: { branch: tap.gadget } }), 'x', { ...abortingPrep(), timeoutMs: 5_000 });
+    expect(tap.seen).toStrictEqual([{ origin: { stepId: 'route', path: [1] }, started: true }]);
   });
 });

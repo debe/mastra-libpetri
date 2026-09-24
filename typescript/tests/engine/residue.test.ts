@@ -42,7 +42,7 @@ describe('residue reporting', () => {
   const suspension: SuspendToken = { stepId: 'b', path: [1], payload: { ask: 'approve' } };
   const pause: PauseToken = { stepId: 'b', path: [1] };
   const bail: BailToken = { stepId: 'a', path: [0], output: 'early' };
-  const cancellation: CanceledToken = { origin: { stepId: 'b', path: [1] } };
+  const cancellation: CanceledToken = { origin: { stepId: 'b', path: [1] }, started: false };
 
   it('finds the stray place it is about to mark', () => {
     expect(stray).toBeDefined();
@@ -72,13 +72,14 @@ describe('residue reporting', () => {
 
   it.each([
     ['done', () => terminals.done, done, { status: 'success', output: 'ok' }],
-    ['bailed', () => terminals.bailed, bail, { status: 'success', output: 'early', bailed: true }],
+    // A bail carries its origin: the step that bailed, where it sits (`stepExecutionPath`'s end).
+    ['bailed', () => terminals.bailed, bail, { status: 'success', output: 'early', bailed: true, stepId: 'a', path: [0] }],
     ['failed', () => terminals.failed, failure, { status: 'failed', stepId: 'a', path: [0], error: 'boom' }],
     [
       'failed with a tripwire',
       () => terminals.failed,
       { stepId: 'a', path: [0], error: new Error('blocked'), tripwire: { reason: 'blocked' } } satisfies FailureToken,
-      { status: 'tripwire', stepId: 'a', path: [0], tripwire: { reason: 'blocked' } },
+      { status: 'tripwire', stepId: 'a', path: [0], tripwire: { reason: 'blocked' }, error: new Error('blocked') },
     ],
     [
       'suspended',
@@ -87,13 +88,13 @@ describe('residue reporting', () => {
       { status: 'suspended', stepId: 'b', path: [1], payload: { ask: 'approve' } },
     ],
     ['paused', () => terminals.paused, pause, { status: 'paused', stepId: 'b', path: [1] }],
-    ['canceled', () => terminals.canceled, cancellation, { status: 'canceled', origin: { stepId: 'b', path: [1] } }],
-    ['canceled with no origin', () => terminals.canceled, {} satisfies CanceledToken, { status: 'canceled' }],
+    ['canceled', () => terminals.canceled, cancellation, { status: 'canceled', origin: { stepId: 'b', path: [1] }, started: false }],
+    ['canceled with no origin', () => terminals.canceled, { started: true } satisfies CanceledToken, { status: 'canceled', started: true }],
     [
       'canceled from a foreach item',
       () => terminals.canceled,
-      { origin: { stepId: 'b', path: [1], foreachIndex: 4 } } satisfies CanceledToken,
-      { status: 'canceled', origin: { stepId: 'b', path: [1], foreachIndex: 4 } },
+      { origin: { stepId: 'b', path: [1], foreachIndex: 4 }, started: true } satisfies CanceledToken,
+      { status: 'canceled', origin: { stepId: 'b', path: [1], foreachIndex: 4 }, started: true },
     ],
   ] as const)('classifies a lone token in the %s terminal cleanly', (_name, terminal, value, expected) => {
     expect(classify(compiled, markingOf([terminal() as Place<unknown>, [value]]))).toEqual(expected);
@@ -110,7 +111,13 @@ describe('residue reporting', () => {
       'tripwire',
       () => terminals.failed,
       { stepId: 'b', path: [1], foreachIndex: 2, error: 'e', tripwire: { reason: 'r' } } satisfies FailureToken,
-      { status: 'tripwire', stepId: 'b', path: [1], foreachIndex: 2, tripwire: { reason: 'r' } },
+      { status: 'tripwire', stepId: 'b', path: [1], foreachIndex: 2, tripwire: { reason: 'r' }, error: 'e' },
+    ],
+    [
+      'bailed',
+      () => terminals.bailed,
+      { stepId: 'b', path: [1], foreachIndex: 0, output: 'early' } satisfies BailToken,
+      { status: 'success', output: 'early', bailed: true, stepId: 'b', path: [1], foreachIndex: 0 },
     ],
     [
       'suspended',
@@ -127,6 +134,28 @@ describe('residue reporting', () => {
   ] as const)('a %s outcome carries the full origin, foreachIndex included (0 too)', (_name, terminal, value, expected) => {
     // What the codec needs to write the snapshot's paths; an index of 0 is an index.
     expect(classify(compiled, markingOf([terminal() as Place<unknown>, [value]]))).toEqual(expected);
+  });
+
+  it('a plain success carries no origin and no bailed key, so the two successes stay apart', () => {
+    const outcome = classify(compiled, markingOf([terminals.done, [done]]));
+    expect(outcome).toEqual({ status: 'success', output: 'ok' });
+    for (const key of ['bailed', 'stepId', 'path', 'foreachIndex']) expect(outcome).not.toHaveProperty(key);
+    // And the bailed one carries all of them as own keys (foreachIndex only when set).
+    const bailed = classify(compiled, markingOf([terminals.bailed, [bail]]));
+    expect(Object.keys(bailed).sort()).toEqual(['bailed', 'output', 'path', 'status', 'stepId']);
+  });
+
+  it('a tripwire carries the failure\'s error beside the tripwire, as the same object', () => {
+    const error = new Error('blocked');
+    const tripwire = { reason: 'blocked' };
+    const outcome = classify(compiled, markingOf([terminals.failed, [{ stepId: 'a', path: [0], error, tripwire } satisfies FailureToken]]));
+    expect(outcome.status).toBe('tripwire');
+    if (outcome.status !== 'tripwire') return;
+    expect(outcome.error).toBe(error);
+    expect(outcome.tripwire).toBe(tripwire);
+    // A tripwire whose error is `undefined` still has the key: the variant requires it.
+    const bare = classify(compiled, markingOf([terminals.failed, [{ stepId: 'a', path: [0], error: undefined, tripwire }]]));
+    expect(Object.keys(bare)).toContain('error');
   });
 
   it('keeps nothing but the origin from an exit token: no stray fields reach the outcome', () => {
@@ -158,7 +187,7 @@ describe('residue reporting', () => {
   it('reports a bail and a completion together as a bail with wf.done as residue', () => {
     const outcome = classify(compiled, markingOf([terminals.done, [done]], [terminals.bailed, [bail]]));
 
-    expect(outcome).toEqual({ status: 'success', output: 'early', bailed: true, residue: ['wf.done'] });
+    expect(outcome).toEqual({ status: 'success', output: 'early', bailed: true, stepId: 'a', path: [0], residue: ['wf.done'] });
   });
 
   it('picks a fixed precedence among terminals and reports every loser as residue', () => {
@@ -206,10 +235,12 @@ describe('residue reporting', () => {
       expect(classify(compiled, all)).toEqual({
         status: 'canceled',
         origin: { stepId: 'b', path: [1] },
+        started: false,
         residue: ['wf.bailed', 'wf.done', 'wf.failed', 'wf.paused', 'wf.suspended'],
       });
-      expect(classify(compiled, markingOf([terminals.canceled, [{}]], [terminals.done, [done]]))).toEqual({
+      expect(classify(compiled, markingOf([terminals.canceled, [{ started: true } satisfies CanceledToken]], [terminals.done, [done]]))).toEqual({
         status: 'canceled',
+        started: true,
         residue: ['wf.done'],
       });
     });
@@ -222,6 +253,7 @@ describe('residue reporting', () => {
       expect(classify(compiled, markingOf([terminals.canceled, [cancellation]], [compiled.cancel, [null]]))).toEqual({
         status: 'canceled',
         origin: { stepId: 'b', path: [1] },
+        started: false,
       });
       expect(classify(compiled, markingOf([terminals.failed, [failure]], [compiled.cancel, [null]]))).toEqual({
         status: 'failed',
@@ -243,13 +275,14 @@ describe('residue reporting', () => {
     it('still reports real residue beside a canceled terminal and a marked cancel place', () => {
       expect(
         classify(compiled, markingOf([terminals.canceled, [cancellation]], [compiled.cancel, [null]], [stray, [{ data: 1 }]])),
-      ).toEqual({ status: 'canceled', origin: { stepId: 'b', path: [1] }, residue: [stray.name] });
+      ).toEqual({ status: 'canceled', origin: { stepId: 'b', path: [1] }, started: false, residue: [stray.name] });
     });
 
     it('reports a second canceled token as residue', () => {
-      expect(classify(compiled, markingOf([terminals.canceled, [cancellation, {}]]))).toEqual({
+      expect(classify(compiled, markingOf([terminals.canceled, [cancellation, { started: true } satisfies CanceledToken]]))).toEqual({
         status: 'canceled',
         origin: { stepId: 'b', path: [1] },
+        started: false,
         residue: ['wf.canceled'],
       });
     });

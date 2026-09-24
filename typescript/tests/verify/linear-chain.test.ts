@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { Transition, and, one, outPlace, place } from 'libpetri';
 import { compile, type Gadget } from '../../src/compiler/index.js';
 import { runWorkflow } from '../../src/engine/index.js';
-import { verifyWorkflow, describeReport, type PropertyReport } from '../../src/verify/index.js';
-import type { FlowToken, WorkflowDescription } from '../../src/compiler/types.js';
+import { cancelStructureViolations, verifyWorkflow, describeReport, type PropertyReport } from '../../src/verify/index.js';
+import type { EntryDescription, FlowToken, WorkflowDescription } from '../../src/compiler/types.js';
 import { RecordingRunner } from '../fixtures/runner.js';
 
 /** Every report `verifyWorkflow` returns by default, in order: both segments on one closed net. */
@@ -126,5 +126,32 @@ describe('exactlyOneTerminal catches what the other two cannot', () => {
     // The run agrees: classify reports the failure and names the second terminal as residue.
     const outcome = await runWorkflow(compiled, 'x', { runner: new RecordingRunner() });
     expect(outcome).toEqual({ status: 'failed', stepId: 'a', path: [0], error: 'both', residue: ['wf.done'] });
+  });
+});
+
+/**
+ * The fixed sleep is now `begin` (immediate, records `waiting`) -> `waiting` -> `wake` (delayed),
+ * with a sweep on each place. Proved beside every combinator, the sleep on both sides of it:
+ * properties, initial marking, environment and sinks as `verifyWorkflow`'s default above (the
+ * structural check first, then the closed and the cancel segment).
+ */
+describe('fixed sleeps around every gadget, proved', () => {
+  const nap = (id: string): EntryDescription => ({ kind: 'sleep', id, duration: { fixed: 25 } });
+  const arms = [{ kind: 'step', id: 'a' }, { kind: 'step', id: 'b', retries: 1 }] as const;
+  const gadgets: ReadonlyArray<readonly [string, EntryDescription]> = [
+    ['parallel', { kind: 'parallel', id: 'fan', arms }],
+    ['branch', { kind: 'branch', id: 'route', arms }],
+    ['dowhile', { kind: 'loop', id: 'poll', loopType: 'dowhile', iterationBound: 2, body: { kind: 'step', id: 'tick' } }],
+    ['foreach', { kind: 'foreach', id: 'items', concurrency: 2, body: { kind: 'step', id: 'item' } }],
+  ];
+
+  // Each query's solver budget is 300s — what `tests/verify/foreach.test.ts` gives a two-lane
+  // foreach, whose queries the 30s default leaves `unknown`.
+  it.concurrent.for(gadgets)('a fixed sleep before and after a %s', { timeout: 1_800_000 }, async ([, entry], { expect }) => {
+    const description: WorkflowDescription = { id: 'sleepy', entries: [nap('before'), entry, nap('after')] };
+    expect(cancelStructureViolations(compile(description))).toEqual([]);
+    const reports = await verifyWorkflow(compile(description), { timeoutMs: 300_000 });
+    expect(reports.map((r) => `${r.segment}/${r.property}`)).toEqual(ALL_REPORTS);
+    for (const report of reports) expect(report.result.verdict.type, describeReport(report)).toBe('proven');
   });
 });
