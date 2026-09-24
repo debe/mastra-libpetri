@@ -118,8 +118,8 @@ skips.
   Takes a structural description; no Mastra runtime dependency.
 - `engine/` — the kernel (`runWorkflow`: seed, run to a terminal, classify) and the run scope.
   Host-free; `PetriExecutionEngine` itself lives in `mastra/` ([ADR 0005]).
-- `codec/` — marking snapshot <-> Mastra's `WorkflowRunState` (M4; empty today — `mastra/persist.ts`
-  builds the snapshot one way, at start and terminal).
+- `codec/` — host-free snapshot helpers (empty today). Decoding Mastra's resume parameter lives in
+  `mastra/resume-codec.ts`, because it reads Mastra's types ([ADR 0005], [ADR 0007]).
 - `mastra/` — the **only** directory that imports `@mastra/core` at runtime ([ADR 0005]):
   `PetriExecutionEngine extends ExecutionEngine`, the runner that fires steps on Mastra's own
   `StepExecutor`, result formatting and persistence. `@mastra/core` is a peer dependency and a tsup

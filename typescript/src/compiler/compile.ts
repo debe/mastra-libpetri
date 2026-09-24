@@ -29,6 +29,7 @@ import type {
   FailureToken,
   FlowToken,
   PauseToken,
+  ResumeSite,
   StepDescription,
   SuspendToken,
   Terminals,
@@ -124,6 +125,9 @@ export function compile(description: WorkflowDescription, options: CompileOption
   const extraPlaces: Place<unknown>[] = [];
   const transitions: Transition[] = [];
   const stepAttempts: string[] = [];
+  // Resume sites ([ADR 0007]), keyed by path; a gadget registers its own through GadgetResult.
+  const resumeSites = new Map<string, ResumeSite>();
+  const pathToEntry = new Map<string, { entryId: string; kind: EntryDescription['kind'] }>();
 
   // **The arrival is part of the net.** Registering `wf.cancel` itself as an environment place
   // would be the direct model, but libpetri routes any net with an environment place away from
@@ -226,6 +230,11 @@ export function compile(description: WorkflowDescription, options: CompileOption
       transitionToEntry.set(t.name, { path, id: entry.id });
     }
     if (result.places) extraPlaces.push(...result.places);
+    for (const site of result.resumeSites ?? []) {
+      const key = site.path.join('.');
+      if (resumeSites.has(key)) throw new Error(`two resume sites at path ${key}`);
+      resumeSites.set(key, site);
+    }
     return result;
   };
 
@@ -234,7 +243,9 @@ export function compile(description: WorkflowDescription, options: CompileOption
   const last = description.entries.length - 1;
   let next: Place<FlowToken> = settleDone;
   for (let i = last; i >= 0; i--) {
-    next = emit(description.entries[i]!, [i], next, topLevelExits, i === last, { cancel }).inPlace;
+    const entry = description.entries[i]!;
+    pathToEntry.set(String(i), { entryId: entry.id, kind: entry.kind });
+    next = emit(entry, [i], next, topLevelExits, i === last, { cancel }).inPlace;
   }
 
   const net = PetriNet.builder(description.id)
@@ -263,13 +274,14 @@ export function compile(description: WorkflowDescription, options: CompileOption
   return {
     net,
     program: PrecompiledNet.compile(net),
-    netMap: { transitionToEntry, placeToEntry },
+    netMap: { transitionToEntry, placeToEntry, pathToEntry },
     entryPlace: next,
     terminals,
     cancel,
     cancelRequest,
     ...(permits && k !== undefined ? { budget: { permits, k } } : {}),
     stepAttempts,
+    resumeSites,
     structuralHash: structuralHash(description, names.names()),
   };
 }
@@ -300,7 +312,7 @@ function structuralHash(description: WorkflowDescription, names: readonly string
     }
   };
   return createHash('sha256')
-    .update(JSON.stringify({ v: 4, id: description.id, shape: description.entries.map(shape), names }))
+    .update(JSON.stringify({ v: 5, id: description.id, shape: description.entries.map(shape), names }))
     .digest('hex')
     .slice(0, 16);
 }

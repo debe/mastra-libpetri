@@ -218,6 +218,11 @@ export interface StepCall extends RunView {
   readonly attempt: number;
   /** Which `.foreach()` item this call runs — Mastra's `executionContext.foreachIndex`. */
   readonly foreachIndex?: number;
+  /**
+   * This call is the attempt a resume feeds ([ADR 0007]): the runner hands it the resume data and
+   * the stored suspend data, and records it as a resumed step (`resumePayload`, `resumedAt`).
+   */
+  readonly resumed?: true;
 }
 
 /**
@@ -261,6 +266,13 @@ export interface FlowToken {
   readonly foreachIndex?: number;
   /** 1-based loop iteration, as Mastra's `metadata.iterationCount`. */
   readonly iteration?: number;
+  /**
+   * The one attempt a resume feeds its data to ([ADR 0007]) — Mastra's `resume.steps[0] ===
+   * step.id` (`handlers/step.ts:140-142`), made positional. Colour only: no arc, branch or guard
+   * reads it. A retry of that attempt keeps it, as `executeStepWithRetry` re-calls with the same
+   * params; nothing downstream inherits it.
+   */
+  readonly resumed?: true;
 }
 
 /**
@@ -282,6 +294,8 @@ export interface FailureToken extends Origin {
   readonly error: unknown;
   readonly tripwire?: unknown;
   readonly nonRetryable?: true;
+  /** A failed `.foreach()`'s `__workflow_meta` (`handlers/control-flow.ts:1355-1369`). */
+  readonly foreach?: ForeachMeta;
 }
 
 /** The early-exit path of `bail(result)`. */
@@ -299,6 +313,38 @@ export interface BailToken extends Origin {
  */
 export interface SuspendToken extends Origin {
   readonly payload: unknown;
+  /**
+   * When the step suspended, on the run's clock. Always stamped by the leaf; optional in the type
+   * so a hand-built token need not invent one. Mastra's `suspendedPaths` keeps the *last* suspension
+   * in time per step id (`handlers/step.ts:395-397`), and this is how the codec orders them.
+   */
+  readonly suspendedAt?: number;
+  /**
+   * The other suspensions parked in the same block, in arm or item index order — the join reports
+   * the lowest and carries the rest here instead of dropping them, so the result's `suspended`
+   * list and the snapshot's `suspendedPaths` name every one (`default.ts:630-643`). Full tokens,
+   * because their payloads are needed.
+   */
+  readonly pending?: readonly SuspendToken[];
+  /** A suspended `.foreach()`'s `__workflow_meta` (`handlers/control-flow.ts:1432-1450`). */
+  readonly foreach?: ForeachMeta;
+}
+
+/**
+ * What a suspended or failed `.foreach()` carries in its aggregate record's `__workflow_meta`, so a
+ * resume can skip the items that succeeded and re-run the one that suspended.
+ */
+export interface ForeachMeta {
+  /** The lowest suspended item's index — Mastra's `__workflow_meta.foreachIndex`. */
+  readonly foreachIndex: number;
+  /** Every item's own record, by index — Mastra's `__workflow_meta.foreachOutput`. */
+  readonly foreachOutput: readonly ForeachItemRecord[];
+}
+
+/** One `.foreach()` item's own outcome, as Mastra keeps it in `foreachOutput`. */
+export interface ForeachItemRecord {
+  readonly index: number;
+  readonly record: StepRecord;
 }
 
 /** A nested workflow that paused. */
@@ -358,6 +404,72 @@ export interface Terminals extends Exits {
 }
 
 /**
+ * A place a resumed run can start from ([ADR 0007]). Every position Mastra can resume at has one: a
+ * top-level step or loop (its own input place, gated and swept like any entry), an arm of a
+ * `.parallel()` or `.branch()`, and a `.foreach()`. A resume seeds exactly **one** token here — the
+ * kernel asserts it — and each site is proven as its own segment from that marking.
+ */
+export type ResumeSite = EntrySite | ArmSite | ForeachSite;
+
+/** A top-level step (a nested workflow included) or loop. A sleep never suspends and has none. */
+export interface EntrySite {
+  readonly kind: 'entry';
+  readonly path: readonly [number];
+  readonly stepId: string;
+  readonly construct: 'step' | 'loop';
+  readonly place: Place<FlowToken>;
+}
+
+/** One arm of a `.parallel()` or `.branch()`. */
+export interface ArmSite {
+  readonly kind: 'arm';
+  readonly block: 'parallel' | 'branch';
+  readonly path: readonly [number, number];
+  readonly stepId: string;
+  readonly place: Place<ArmResume>;
+}
+
+/** A `.foreach()`. */
+export interface ForeachSite {
+  readonly kind: 'foreach';
+  readonly path: readonly [number];
+  readonly stepId: string;
+  readonly place: Place<ForeachResume>;
+}
+
+/**
+ * The token that re-enters a block at one arm. `data` is the resumed arm's stored input; each
+ * sibling's recorded outcome is replayed through the block's own join, so the block's interior is
+ * rebuilt by transitions, never written by hand.
+ */
+export interface ArmResume {
+  readonly data: unknown;
+  readonly siblings: readonly SiblingVerdict[];
+}
+
+/** A sibling arm's stored outcome, mapped to the arrival a real collect would have produced. */
+export type SiblingVerdict =
+  | { readonly kind: 'ok'; readonly index: number; readonly output: unknown }
+  | { readonly kind: 'suspended'; readonly index: number; readonly token: SuspendToken }
+  | { readonly kind: 'failed'; readonly index: number; readonly token: FailureToken }
+  /** Bailed or paused — swallowed by the block, as in a fresh run. */
+  | { readonly kind: 'settled'; readonly index: number }
+  /** A branch arm with no record: its condition was not truthy (`handlers/entry.ts:43-46`). */
+  | { readonly kind: 'skipped'; readonly index: number };
+
+/**
+ * The token that re-enters a `.foreach()`: the stored item array, the items still to run (in
+ * order, the resumed ones flagged), the items that succeeded (skipped, their outputs reused), and
+ * the suspensions that stay parked (`handlers/control-flow.ts:1227-1270`).
+ */
+export interface ForeachResume {
+  readonly items: readonly unknown[];
+  readonly order: readonly { readonly index: number; readonly resumed?: true }[];
+  readonly done: readonly ForeachItemRecord[];
+  readonly parked: readonly SuspendToken[];
+}
+
+/**
  * Relates net structure back to the workflow it came from, so a counterexample trace, an event
  * or a restored marking can be reported in Mastra's terms rather than in place names.
  */
@@ -366,6 +478,8 @@ export interface NetMap {
   readonly transitionToEntry: ReadonlyMap<string, { readonly path: EntryPath; readonly id: string }>;
   /** Place name -> the entry whose input it is. */
   readonly placeToEntry: ReadonlyMap<string, { readonly path: EntryPath; readonly id: string }>;
+  /** A top-level path, joined with `.` -> the entry there — how a stored `resumePath` is resolved. */
+  readonly pathToEntry: ReadonlyMap<string, { readonly entryId: string; readonly kind: EntryDescription['kind'] }>;
 }
 
 export interface CompiledWorkflow {
@@ -406,6 +520,8 @@ export interface CompiledWorkflow {
    * already touching the permits cannot see an attempt compiled with none.
    */
   readonly stepAttempts: readonly string[];
+  /** Every resume site, keyed by its path joined with `.` ([ADR 0007]). */
+  readonly resumeSites: ReadonlyMap<string, ResumeSite>;
   /** Stable over structure alone, so it keys a compile cache across runs. */
   readonly structuralHash: string;
 }

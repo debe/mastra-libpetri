@@ -24,6 +24,7 @@ import type {
 } from '../compiler/types.js';
 import type { EntryPath } from '../compiler/names.js';
 import { KernelRunScope } from './scope.js';
+import type { ResumeSeed } from '../compiler/resume.js';
 
 /** Present only when non-empty — see {@link RunOutcome}. */
 type Residue = { readonly residue?: readonly string[] };
@@ -97,6 +98,12 @@ export interface RunOptions {
    * the reason a run without a signal registers no environment place at all.
    */
   readonly signal?: AbortSignal;
+  /**
+   * Start a resumed segment ([ADR 0007]): one token at a registered resume site instead of the
+   * entry place. The permits and a pre-aborted signal are seeded as for a fresh run; nothing is
+   * restored from a marking.
+   */
+  readonly resume?: ResumeSeed;
 }
 
 export interface RunReport {
@@ -134,6 +141,11 @@ export async function runWorkflowDetailed(
     // whose `net` was swapped after compiling would run one net and be proven on another — the
     // one thing "one net serves execution and verification" rules out.
     throw new Error(`compiled workflow '${compiled.net.name}': its program was compiled from a different net`);
+  }
+  if (options.resume !== undefined) {
+    // CONTRACT STUB (ADR 0007): the kernel area implements the seeded segment. Refused rather than
+    // silently run from the entry place.
+    throw new Error('runWorkflowDetailed: resumed segments are not implemented yet (M4, ADR 0007)');
   }
   if (options.stepResults) assertStepResults(options.stepResults);
   const { signal } = options;

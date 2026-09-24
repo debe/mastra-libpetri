@@ -39,9 +39,21 @@ export type {
   StepDescription,
   StepOutcome,
   StepRecord,
+  ResumeSite,
+  EntrySite,
+  ArmSite,
+  ForeachSite,
+  ArmResume,
+  SiblingVerdict,
+  ForeachResume,
+  ForeachMeta,
+  ForeachItemRecord,
   StepRunner,
   StepSource,
   SuspendToken,
   Terminals,
   WorkflowDescription,
 } from './types.js';
+export { resumeSeed, UnresumablePositionError } from './resume.js';
+export type { ResumeRequest, ResumeSeed } from './resume.js';
+export { foreachSeed } from './resume-foreach.js';

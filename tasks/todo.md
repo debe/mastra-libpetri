@@ -282,24 +282,40 @@
       opt-in slow proofs proven (`SLOW_PROOFS=1`); `npm run build` clean — libpetri 6.1.0 and
       @mastra/core 1.67.0 from npm. 74 register rows, none open for M3 or earlier
 
-## M4 — Suspend, resume, durability
-- [ ] `_suspend` place + terminal-marking classification (success / failed / suspended /
-      canceled / bailed / tripwire / stranded); codec round-trips `activePaths`,
-      `activeStepsPath`, `suspendedPaths`, `resumeLabels` and the positional `executionPath`;
-      capture via `executor.snapshot()` asserting `actionInFlight === false`, restore via
-      `Marking.fromSnapshot()`
-- [ ] Environment-place hygiene: `drain()` and injection driven from **inside** `Clock.sleep`,
-      where the executor has already assigned its wake-up resolver — a `drain()` from outside
-      the loop can be lost. Injection uses `injectNoAwait()`, never the awaitable form, which
-      would suspend the only thing that can resolve it. Seeds use `seedToken(clock, value)`
-- [ ] Restore semantics: elapsed time is not preserved ([CORE-073]), so `.sleep(ms)` re-waits in
-      full. Sound because restores are rare and `Delayed` fails safe; no hard timing emitted on
-      any path that can cross a restore. Divergence row + the starvation condition recorded
+## M4 — Suspend and resume ([ADR 0007])
+- [x] Design: research, three independent designs, three judges, synthesis; the seeded-segment
+      design chosen unanimously. Contract written and typechecked: resume sites, arm and foreach
+      re-entry tokens, `FlowToken.resumed`, `pending` suspensions, foreach meta, stubs that throw
+- [ ] W1 compiler core — site collection, entry sites, `resumeSeed` with the changed-workflow refusal
+- [ ] W2 blocks — arm re-entry and `replay-i` for `.parallel()` and `.branch()`; `pending` in join-susp
+- [ ] W3 leaf and loop — the resumed attempt, its record shape, `suspendedAt`, the loop's first iteration
+- [ ] W5 kernel — the seeded segment and its one-token assertion
+- [ ] W6 runner — resume data, suspend data, the nested-workflow resume overlay, labels
+- [ ] W7 engine and snapshot — the decoder, refusals before persist, the overwrite guard, the carried
+      context, `suspendedPaths` from every suspension, tracing ids, `stepExecutionPath` continuation
+- [ ] W8 verification — resume segments with and without cancel, and the gate, threshold, coverage
+      and timing structure checks
+- [ ] W4 foreach — last: cursor order, parked items, re-entry; its refusal lifted only when green
+- [ ] W9 conformance — suspend-then-resume on both engines and crossed, at every k
+- Dropped from the plan, with reasons in ADR 0007: capturing a marking with `executor.snapshot()`
+  (a suspended marking is dead and rebuilt from records; `snapshot()` throws after drain), and
+  driving drain and injection from inside `Clock.sleep` (a resume injects nothing)
+
+## M4b — Restart and crash recovery
+- [ ] `Run.restart` and boot-time recovery: per-step snapshot writes and `activeStepsPath`
+      (row 55), `engineType` in Mastra's run registry (row 62), the restart halves of rows 40 and
+      54. Reuses M4's sites and decoder. Restore timing is decided here, not for resume
 
 ## M5 — Streaming and watch
 - [ ] `EventStore` adapter maps net events onto Mastra's step-event vocabulary and publishes to
       `workflow.events.v2.${runId}`, so existing `.watch()` / `.stream()` observers keep working
       unchanged; `DebugAwareEventStore` tee for the libpetri debug UI
+- [ ] **The live testbed, and browser e2e.** The plan listed a live testbed — a real Mastra app with
+      this engine registered, driven end to end — under verification but never gave it a
+      milestone; nothing drives a browser today. It lands here, where it becomes worth recording:
+      once step events flow (row 57), a run in Mastra Studio shows its steps progress, and the
+      libpetri debug UI shows the net's marking live. Recorded browser runs of both, against a
+      `.testbed/` app (gitignored), with its numbers kept apart from conformance numbers
 
 ## M6 — Verification
 - [ ] `verify(workflow)`: deadlock freedom with the complete sink list, termination at declared

@@ -1,6 +1,6 @@
 import type { Place, Transition } from 'libpetri';
 import type { NameVocabulary, EntryPath } from '../names.js';
-import type { EntryDescription, Exits, FlowToken, StepDescription } from '../types.js';
+import type { EntryDescription, Exits, FlowToken, ResumeSite, StepDescription } from '../types.js';
 
 /**
  * What a gadget emitted.
@@ -14,6 +14,8 @@ export interface GadgetResult {
   readonly transitions: readonly Transition[];
   /** Internal places that no arc reaches, if any. Arc-referenced places are auto-collected. */
   readonly places?: readonly Place<unknown>[];
+  /** The resume sites this gadget registers ([ADR 0007]) — its arms, or itself. */
+  readonly resumeSites?: readonly ResumeSite[];
 }
 
 /**
