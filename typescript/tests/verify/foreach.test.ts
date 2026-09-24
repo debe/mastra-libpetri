@@ -11,6 +11,7 @@ import {
   type SmtVerificationResult,
 } from 'libpetri/verification';
 import { compile, type Gadget } from '../../src/compiler/index.js';
+import { budgetStructureViolations } from '../../src/verify/budget.js';
 import { foreachGadget } from '../../src/compiler/gadgets/foreach.js';
 import {
   cancelStructureViolations,
@@ -33,8 +34,10 @@ import type { CompiledWorkflow, EntryDescription, StepDescription } from '../../
  * before `split` to after the terminal). `verifyWorkflow` runs both by default and runs
  * `cancelStructureViolations` first. The encoding is untimed and value-blind, so `start.l`'s "more
  * items" / "last item" choice is free: **one proof covers every item count at once**, including
- * the empty array (`split`'s second branch) and a non-array (its third). The shapes below therefore
- * vary only in concurrency and in what surrounds the foreach.
+ * the empty array (`split`'s second branch, which opens the foreach with no cursor and leaves it
+ * to `join-empty` or `canceled-empty` — so the cancel segment also covers an arrival *inside* an
+ * empty foreach, row 49) and a non-array (its third). The shapes below therefore vary only in
+ * concurrency, in what surrounds the foreach and in the run's step budget.
  *
  * `proven` is compared by string. `isViolated()` is false for `unknown` too, so a "not violated"
  * assertion would keep passing once a query started timing out. `unknown` fails, everywhere.
@@ -67,6 +70,24 @@ const BOTH = [
   'cancel/terminatesAtSink',
   'cancel/exactlyOneTerminal',
 ];
+/**
+ * With a run budget compiled in ([ADR 0006]) each segment adds `permitsBounded`
+ * (`placeBound(wf.permits, k)`) and `permitsReturned` (`quiescentCount([wf.permits], k, k)`), and
+ * the initial marking of both segments also holds `k` permits.
+ */
+const BOTH_BUDGETED = [
+  'closed/deadlockFree',
+  'closed/terminatesAtSink',
+  'closed/exactlyOneTerminal',
+  'closed/neverCanceled',
+  'closed/permitsBounded',
+  'closed/permitsReturned',
+  'cancel/deadlockFree',
+  'cancel/terminatesAtSink',
+  'cancel/exactlyOneTerminal',
+  'cancel/permitsBounded',
+  'cancel/permitsReturned',
+];
 const keyOf = (r: PropertyReport): string => `${r.segment}/${r.property}`;
 
 /** Appends a line to the file `PROOF_LOG` names, when it names one — the route-and-ms record. */
@@ -84,10 +105,11 @@ async function prove(
   label: string,
   compiled: CompiledWorkflow,
   timeoutMs = 300_000,
+  expected: readonly string[] = BOTH,
 ): Promise<readonly PropertyReport[]> {
   const reports = await verifyWorkflow(compiled, { timeoutMs });
   proofLog(`[${label}] ${reports.map(describeReport).join('; ')}`);
-  expect(reports.map(keyOf)).toEqual(BOTH);
+  expect(reports.map(keyOf)).toEqual(expected);
   for (const report of reports) expect(report.result.verdict.type, `${label}: ${describeReport(report)}`).toBe('proven');
   return reports;
 }
@@ -223,6 +245,27 @@ describe.concurrent('compiled foreach, proved (both segments)', () => {
   });
 });
 
+/**
+ * The run budget composes with the lanes ([ADR 0006], M3). A lane is the foreach's own bound — at
+ * most `c` items dispatched — and each item's step attempt then takes one of the run's `k` permits
+ * on top of it, handing it back on every outcome branch; no foreach transition touches the
+ * permits. So an item can sit in its lane waiting for a permit, and neither bound can starve the
+ * other: a lane holds no permit while it waits, and a permit is never held across a settle, a
+ * retry delay or a finisher. Proven for c = 2 at k = 1 (the budget binds below the lane count) and
+ * k = 2 (they coincide): the initial marking is one token in the entry place plus `k` permits,
+ * plus the cancel request in the `cancel` segment; route SMT, as for every foreach shape; eleven
+ * properties. Peak items in flight = min(c, k) is measured by `tests/compiler/foreach.test.ts`
+ * — "in flight" is an executor notion (a transition whose action has not returned), not a marking.
+ */
+describe.concurrent('compiled foreach under a run budget, proved (both segments)', () => {
+  it.for([1, 2])('c = 2, k = %i: the budget is conserved from the arcs, and all eleven properties are proven', SLOW, async (k, { expect }) => {
+    const compiled = compile({ id: 'batch', entries: [foreach(2)] }, { concurrency: k });
+    expect(compiled.budget?.k).toBe(k);
+    expect(budgetStructureViolations(compiled)).toEqual([]);
+    await prove(expect, `foreach(c=2) k=${k}`, compiled, 300_000, BOTH_BUDGETED);
+  });
+});
+
 describe.runIf(SLOW_LANE).concurrent('SLOW LANE (SLOW_PROOFS=1): compiled foreach with three lanes, 600s per query', () => {
   const BUDGET = { timeout: 7 * 600_000 + 60_000 } as const;
 
@@ -330,6 +373,11 @@ describe.concurrent('compiled foreach: each safeguard is load-bearing (mutated c
     ['join fires beside a recorded failure', { transition: /\.items\.join$/, dropInhibitor: /faults/ }],
     ['join fires beside a recorded bail or pause', { transition: /\.items\.join$/, dropInhibitor: /exits/ }],
     ['join fires beside a recorded suspension', { transition: /\.items\.join$/, dropInhibitor: /suspensions/ }],
+    ['join-empty fires beside results', { transition: /\.items\.join-empty$/, dropInhibitor: /results/ }],
+    ['join-empty fires with items still queued', { transition: /\.items\.join-empty$/, dropInhibitor: /cursor/ }],
+    ['join-empty fires beside a recorded failure', { transition: /\.items\.join-empty$/, dropInhibitor: /faults/ }],
+    ['join-empty fires beside a recorded bail or pause', { transition: /\.items\.join-empty$/, dropInhibitor: /exits/ }],
+    ['join-empty fires beside a recorded suspension', { transition: /\.items\.join-empty$/, dropInhibitor: /suspensions/ }],
     ['a bail is decided over a failure', { transition: /\.items\.exit$/, dropInhibitor: /faults/ }],
     ['a suspension is decided over a failure', { transition: /\.items\.suspend$/, dropInhibitor: /faults/ }],
     ['a suspension is decided over a bail', { transition: /\.items\.suspend$/, dropInhibitor: /exits/ }],
@@ -454,7 +502,7 @@ describe('compiled foreach: every inhibitor on the signal has structural teeth',
   it('the real gadget is structurally sound, and every one of these transitions carries the inhibitor', () => {
     const real = build([foreach(lanes)]);
     expect(cancelStructureViolations(real)).toEqual([]);
-    for (const name of ['split', 'lane0.start', 'lane1.start', 'join', 'fail', 'exit', 'suspend']) {
+    for (const name of ['split', 'lane0.start', 'lane1.start', 'join', 'join-empty', 'fail', 'exit', 'suspend']) {
       const t = [...real.net.transitions].find((x) => x.name === `t.0.items.${name}`);
       expect(t?.inhibitors.map((a) => a.place.name), name).toContain('wf.cancel');
     }
@@ -470,6 +518,10 @@ describe('compiled foreach: every inhibitor on the signal has structural teeth',
     ['join', /\.items\.join$/, [
       competes('t.0.items.join', 't.0.items.canceled', `s.0.items.results, s.0.items.frame, ${permits()}`),
       competes('t.0.items.join', 't.0.items.canceled-empty', `s.0.items.frame, ${permits()}`),
+    ]],
+    ['join-empty', /\.items\.join-empty$/, [
+      competes('t.0.items.join-empty', 't.0.items.canceled', `s.0.items.frame, ${permits()}`),
+      competes('t.0.items.join-empty', 't.0.items.canceled-empty', `s.0.items.frame, ${permits()}`),
     ]],
     ['fail', /\.items\.fail$/, [competes('t.0.items.fail', 't.0.items.canceled-empty', `s.0.items.frame, ${permits()}`)]],
     ['exit', /\.items\.exit$/, [competes('t.0.items.exit', 't.0.items.canceled-empty', `s.0.items.frame, ${permits()}`)]],

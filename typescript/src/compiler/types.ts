@@ -277,6 +277,8 @@ export interface Origin {
 export interface FailureToken extends Origin {
   /** The step's validated input, when the runner reported one — for a foreach's aggregate record. */
   readonly stepPayload?: unknown;
+  /** When the step's first attempt started — a foreach item's own start, for the aggregate record. */
+  readonly stepStartedAt?: number;
   readonly error: unknown;
   readonly tripwire?: unknown;
   readonly nonRetryable?: true;
@@ -286,6 +288,8 @@ export interface FailureToken extends Origin {
 export interface BailToken extends Origin {
   /** The step's validated input, when the runner reported one — for a foreach's aggregate record. */
   readonly stepPayload?: unknown;
+  /** When the step's first attempt started — a foreach item's own start, for the aggregate record. */
+  readonly stepStartedAt?: number;
   readonly output: unknown;
 }
 
@@ -301,6 +305,8 @@ export interface SuspendToken extends Origin {
 export interface PauseToken extends Origin {
   /** The step's validated input, when the runner reported one — for a foreach's aggregate record. */
   readonly stepPayload?: unknown;
+  /** When the step's first attempt started — a foreach item's own start, for the aggregate record. */
+  readonly stepStartedAt?: number;
 }
 
 /**
@@ -387,6 +393,19 @@ export interface CompiledWorkflow {
    * firing in which an already-enabled start could slip past the inhibitor. [ADR 0004]
    */
   readonly cancelRequest: Place<null>;
+  /**
+   * The run's step budget, when one was compiled in ([ADR 0006]): a place holding `k` permits.
+   * Every step attempt consumes one when it fires and returns it in **every** outcome branch, so
+   * permits plus steps in flight is `k` at every marking — a P-invariant, proven as
+   * `permitsBounded` and `permitsReturned`. Absent, steps run unbounded, as Mastra's do.
+   */
+  readonly budget?: { readonly permits: Place<null>; readonly k: number };
+  /**
+   * The name of every step-attempt transition, recorded by the leaf whether or not a budget was
+   * compiled in. The budget's structural check needs it: a check that looks only at transitions
+   * already touching the permits cannot see an attempt compiled with none.
+   */
+  readonly stepAttempts: readonly string[];
   /** Stable over structure alone, so it keys a compile cache across runs. */
   readonly structuralHash: string;
 }

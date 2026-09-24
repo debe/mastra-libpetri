@@ -1102,6 +1102,7 @@ describe('non-vacuity of the leaf', () => {
       )
       .action(
         stepAction({
+          permits: undefined,
           stepId: entry.id,
           path: ctx.path,
           source: entry.source ?? 'step',
@@ -1263,10 +1264,13 @@ function stamping(only: string, fields: Omit<FlowToken, 'data'>, inner: Gadget =
 describe('the exit tokens a step writes carry their Origin', () => {
   const exitOf = async (outcome: StepOutcome, fields: Omit<FlowToken, 'data'> = {}) => {
     const gadget = stamping('s', fields, probing(stepGadget));
+    // A virtual clock, so a stamp on the token can be asserted to the instant.
+    const clock = new ManualClock();
     const probed = await runWorkflow(compile(wf(step('s', { retries: 1 })), { gadgets: { step: gadget } }), 'in', {
       runner: new RecordingRunner({ steps: { s: () => outcome } }),
+      clock,
     });
-    return { probed };
+    return { probed, clock };
   };
 
   it('a final failure: stepId, view path, error — and nonRetryable only when set', async () => {
@@ -1310,11 +1314,17 @@ describe('the exit tokens a step writes carry their Origin', () => {
     });
   });
 
-  it('carries a foreach index onto every exit token', async () => {
+  it('carries a foreach index, and the attempt\'s own start, onto every exit token', async () => {
+    // A foreach item's exit token carries `stepStartedAt`: the aggregate record takes the deciding
+    // item's own start, not its dispatch (`handlers/step.ts:166,174`). The suspension does not —
+    // its aggregate keeps the foreach's start. No virtual time passes, so the start is the clock's
+    // epoch at the run's first instant.
     const fields = { foreachIndex: 3 };
-    expect((await exitOf({ status: 'failed', error: 'x', nonRetryable: true }, fields)).probed).toEqual({
+    const failed = await exitOf({ status: 'failed', error: 'x', nonRetryable: true }, fields);
+    const start = failed.clock.epochNow();
+    expect(failed.probed).toEqual({
       status: 'success',
-      output: { exit: 'failed', token: { stepId: 's', path: [0], foreachIndex: 3, error: 'x', nonRetryable: true } },
+      output: { exit: 'failed', token: { stepId: 's', path: [0], foreachIndex: 3, stepStartedAt: start, error: 'x', nonRetryable: true } },
     });
     expect((await exitOf({ status: 'suspended', suspendPayload: 'p' }, fields)).probed).toEqual({
       status: 'success',
@@ -1322,12 +1332,17 @@ describe('the exit tokens a step writes carry their Origin', () => {
     });
     expect((await exitOf({ status: 'bailed', output: 'o' }, fields)).probed).toEqual({
       status: 'success',
-      output: { exit: 'bailed', token: { stepId: 's', path: [0], foreachIndex: 3, output: 'o' } },
+      output: { exit: 'bailed', token: { stepId: 's', path: [0], foreachIndex: 3, stepStartedAt: start, output: 'o' } },
     });
     expect((await exitOf({ status: 'paused' }, fields)).probed).toEqual({
       status: 'success',
-      output: { exit: 'paused', token: { stepId: 's', path: [0], foreachIndex: 3 } },
+      output: { exit: 'paused', token: { stepId: 's', path: [0], foreachIndex: 3, stepStartedAt: start } },
     });
+  });
+
+  it('a step outside a foreach carries no stepStartedAt', async () => {
+    const { probed } = await exitOf({ status: 'failed', error: 'x', nonRetryable: true });
+    expect(probed).toEqual({ status: 'success', output: { exit: 'failed', token: { stepId: 's', path: [0], error: 'x', nonRetryable: true } } });
   });
 });
 

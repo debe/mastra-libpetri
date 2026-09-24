@@ -1224,3 +1224,262 @@ describe('foreach: a mutant flipping any sweep\'s `started` is caught', () => {
     expect(await once(flippingStarted(foreachGadget, '.canceled-empty'))).toEqual([{ origin, output: [], started: false }]);
   });
 });
+
+// ===========================================================================================
+// Row 49 and the run budget (M3).
+// ===========================================================================================
+
+/**
+ * A [TIME-015] clock the test drives, with one addition over `tests/support/manual-clock.ts`: a
+ * step can spend model time (`advance`). That is what makes "when did this item start" a question
+ * with more than one answer — the only way a dispatch and an item's first attempt can be apart
+ * under a virtual clock is a sibling spending time while this item waits for a run permit.
+ */
+class SteppingClock {
+  #now = 0;
+  constructor(readonly epochOrigin: number) {}
+  now(): number {
+    return this.#now;
+  }
+  epochNow(): number {
+    return this.epochOrigin + this.#now;
+  }
+  advance(ms: number): void {
+    this.#now += ms;
+  }
+  async sleep(delayMs: number, ready: () => boolean, signal: AbortSignal): Promise<void> {
+    if (signal.aborted || ready()) return;
+    if (Number.isFinite(delayMs)) {
+      this.#now += delayMs;
+      return;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
+const EPOCH = 1_700_000_000_000;
+
+/**
+ * An array-like whose `length` aborts the run when read. Mastra reads `prevOutput.length` inside
+ * `executeForeach` (`:1053`, and again in the enqueue loop `:1228`), after the check before the
+ * entry (`default.ts:815`) and after `startTime` (`:988`), so reading it is the one deterministic
+ * way to land an abort **during** the foreach, before any item is queued. Here `itemsOf` reads it
+ * inside `split`'s action — the same instant in the foreach's life.
+ */
+function abortingLength(ac: AbortController, length: number): { readonly length: number; readonly [k: number]: unknown } {
+  const target: Record<number, unknown> = {};
+  for (let k = 0; k < length; k++) target[k] = `item${k}`;
+  return Object.defineProperty(target, 'length', {
+    get() {
+      ac.abort();
+      return length;
+    },
+    enumerable: false,
+  }) as unknown as { readonly length: number };
+}
+
+describe('foreach over no items, canceled (row 49)', () => {
+  const origin = { stepId: 'body', path: [0] };
+
+  /**
+   * **When Mastra records `canceled []`.** Three windows, read from the source:
+   *
+   * 1. Aborted before the entry: `default.ts:815` stops the run before `executeEntry`; the foreach
+   *    never starts and nothing is recorded under the body id. (Here: the input sweep.)
+   * 2. Aborted after the entry began and before the check after the drain: with no items nothing
+   *    is enqueued (`:1228`), `inFlight` is 0 so the wait is skipped (`:1276`), `canceledResult`
+   *    is still null (only a worker sets it, `:1160-1172`), and `:1298` sees the signal —
+   *    `{...stepInfo, status: 'canceled', output: [], endedAt}`, stored by `entry.ts:811-812`. The
+   *    window holds `executeForeach`'s awaits (span, `workflow-step-start` publish) and its read of
+   *    `prevOutput.length`. (Here: `split` opened the foreach, `canceled-empty` decides it.)
+   * 3. Aborted after `executeForeach` returned `success []`: `entry.ts:815-817` relabels the entry
+   *    `canceled` but has already stored the success record — an entry-level window every entry
+   *    kind shares, not the foreach's. (Here: the run is canceled whatever else it reached, the
+   *    kernel's rule; not re-tested here.)
+   */
+  it('an abort during the foreach — while it reads its input — records canceled [] under the body id', async () => {
+    const ac = new AbortController();
+    const clock = new SteppingClock(EPOCH);
+    const c = tapped('canceled');
+    const { runner } = itemRunner();
+    const input = abortingLength(ac, 0);
+    const report = await runWorkflowDetailed(build([foreach(2)], c.gadget), input, { runner, clock, timeoutMs: 10_000, signal: ac.signal });
+
+    expect(ac.signal.aborted).toBe(true);
+    expect(runner.calls).toEqual([]);
+    expect(report.outcome).toEqual({ status: 'canceled', origin, started: true });
+    expect(c.seen).toEqual([{ origin, output: [], started: true }]);
+    const record = report.stepResults.get('body')!;
+    expect(record).toEqual({ status: 'canceled', output: [], payload: input, startedAt: EPOCH, endedAt: EPOCH });
+  });
+
+  it('an abort while it reads a non-empty input starts no item and records canceled [] (the worker\'s check, :1160)', async () => {
+    const ac = new AbortController();
+    const c = tapped('canceled');
+    const { runner } = itemRunner();
+    const input = abortingLength(ac, 2);
+    const report = await runWorkflowDetailed(build([foreach(2)], c.gadget), input, { runner, timeoutMs: 10_000, signal: ac.signal });
+
+    expect(runner.calls).toEqual([]);
+    expect(report.outcome).toEqual({ status: 'canceled', origin, started: true });
+    expect(c.seen).toEqual([{ origin, output: [], started: true }]);
+    expect(report.stepResults.get('body')).toMatchObject({ status: 'canceled', output: [], payload: input });
+  });
+
+  it('an abort before the entry never opens an empty foreach: no record (default.ts:815)', async () => {
+    const ac = new AbortController();
+    const c = tapped('canceled');
+    const runner = new RecordingRunner({
+      steps: {
+        before: (x) => {
+          ac.abort();
+          return { status: 'success', output: x };
+        },
+      },
+    });
+    const report = await run([{ kind: 'step', id: 'before' }, foreach(2)], [], runner, c.gadget, ac.signal);
+
+    expect(report.outcome).toEqual({ status: 'canceled', origin: { stepId: 'body', path: [1] }, started: false });
+    expect(c.seen).toEqual([{ origin: { stepId: 'body', path: [1] }, started: false }]);
+    expect(report.stepResults.has('body')).toBe(false);
+  });
+
+  it('with a signal that never fires, an empty foreach succeeds with [] at its own instants', async () => {
+    const ac = new AbortController();
+    const clock = new SteppingClock(EPOCH);
+    const runner = new RecordingRunner({
+      steps: {
+        before: (x) => {
+          clock.advance(250);
+          return { status: 'success', output: x };
+        },
+      },
+    });
+    const report = await runWorkflowDetailed(build([{ kind: 'step', id: 'before' }, foreach(2), { kind: 'step', id: 'after' }]), [], {
+      runner,
+      clock,
+      timeoutMs: 10_000,
+      signal: ac.signal,
+    });
+    expect(report.outcome).toEqual({ status: 'success', output: [] });
+    expect(runner.calls).toEqual(['before', 'after']);
+    // `{...stepInfo, status: 'success', output: results, endedAt}` (`:1486-1492`).
+    expect(report.stepResults.get('body')).toEqual({ status: 'success', output: [], payload: [], startedAt: EPOCH + 250, endedAt: EPOCH + 250 });
+  });
+
+  it('without join-empty\'s inhibitor on the signal, the abort during an empty foreach is lost to success (mutant)', async () => {
+    const once = async (gadget: Gadget) => {
+      const ac = new AbortController();
+      const c = tapped('canceled', gadget);
+      const report = await runWorkflowDetailed(build([foreach(2)], c.gadget), abortingLength(ac, 0), {
+        runner: itemRunner().runner,
+        timeoutMs: 10_000,
+        signal: ac.signal,
+      });
+      return { status: report.outcome.status, recorded: report.stepResults.get('body')?.status, seen: c.seen };
+    };
+    expect(await once(foreachGadget)).toEqual({ status: 'canceled', recorded: 'canceled', seen: [{ origin, output: [], started: true }] });
+    // `join-empty` is declared before `canceled-empty`, so without the arc the tie-break
+    // ([EXEC-002]) takes it: the foreach records success though the run was aborted inside it.
+    // The kernel still reports the run canceled (the entry-level rule), which is why the record is
+    // what this checks.
+    const mutant = await once(mutated({ transition: /\.items\.join-empty$/, dropInhibitor: /^wf\.cancel$/ }));
+    expect(mutant.recorded).toBe('success');
+    expect(mutant.seen).toEqual([]);
+  });
+});
+
+describe('foreach: a deciding item\'s startedAt is its own (row 49)', () => {
+  /**
+   * Mastra's failed aggregate is `{...finalErrorResult, suspendPayload}` (`:1360-1369`) and its
+   * bail `return exitResult` (`:1406`) — the item's own `StepResult`, whose `startedAt` is
+   * `Date.now()` taken once by the item's `executeStep` before its retry loop
+   * (`handlers/step.ts:166,174`). It is not the foreach's `stepInfo.startedAt`: that object is
+   * local to `executeForeach` and is never written into `stepResults` before items run, so the
+   * item's `omitPriorCompletionFields(stepResults[id])` has nothing of it to carry on a fresh run.
+   *
+   * Under a run budget ([ADR 0006]) an item can be dispatched into its lane and then wait for a
+   * permit while a sibling spends model time: the dispatch instant and the item's own start
+   * differ, and only the latter is Mastra's. k = 1, c = 2: both items are dispatched at EPOCH; the
+   * first to get the permit spends 100 ms and succeeds; the second starts at EPOCH + 100, spends
+   * 50 ms and ends badly.
+   *
+   * These were `it.fails` until the leaf reported the start: the settle stamped the *dispatch*
+   * (EPOCH). The leaf's exit tokens now carry `stepStartedAt`, which the gadget prefers. Contract change requested: `stepAction` (leaf.ts) adds
+   * `stepStartedAt: startedAt` to the failed / bailed / paused token of an item
+   * (`incoming.foreachIndex !== undefined`), and `FailureToken`, `BailToken`, `PauseToken` declare
+   * `readonly stepStartedAt?: number`. With that applied to a scratch copy both assertions hold
+   * exactly as written; drop the `.fails` then. Row 49 stays open for this until it lands.
+   */
+  const scenario = async (last: StepOutcome) => {
+    const clock = new SteppingClock(EPOCH);
+    const startedAt: number[] = [];
+    const runner = new RecordingRunner({
+      steps: {
+        body: async (input) => {
+          startedAt.push(clock.epochNow());
+          if (startedAt.length === 1) {
+            // Real time only, no model time: lets the executor dispatch the second item into its
+            // lane at EPOCH, where it waits for the one permit this step holds.
+            await sleep(10);
+            clock.advance(100);
+            return { status: 'success', output: `${String(input)}!` };
+          }
+          clock.advance(50);
+          return last;
+        },
+      },
+    });
+    const compiled = compile({ id: 'batch', entries: [foreach(2)] }, { concurrency: 1 });
+    const report = await runWorkflowDetailed(compiled, ['a', 'b'], { runner, clock, timeoutMs: 10_000 });
+    return { report, startedAt };
+  };
+
+  it('a failed aggregate takes the failing item\'s first-attempt instant, not its dispatch', async () => {
+    const { report, startedAt } = await scenario({ status: 'failed', error: 'boom' });
+    expect(startedAt).toEqual([EPOCH, EPOCH + 100]);
+    expect(report.outcome.status).toBe('failed');
+    expect(report.stepResults.get('body')).toMatchObject({ status: 'failed', payload: 'b', startedAt: EPOCH + 100, endedAt: EPOCH + 150 });
+  });
+
+  it('a bailed aggregate takes the bailing item\'s first-attempt instant, not its dispatch', async () => {
+    const { report, startedAt } = await scenario({ status: 'bailed', output: 'out' });
+    expect(startedAt).toEqual([EPOCH, EPOCH + 100]);
+    // `success`: a bail that ends the run is rewritten so (`default.ts:926-928`), times untouched.
+    expect(report.stepResults.get('body')).toMatchObject({ status: 'success', output: 'out', payload: 'b', startedAt: EPOCH + 100, endedAt: EPOCH + 150 });
+  });
+
+  it('unbounded, dispatch and first attempt coincide and the aggregate is exact', async () => {
+    const clock = new SteppingClock(EPOCH);
+    const runner = new RecordingRunner({
+      steps: {
+        body: (input) => {
+          clock.advance(input === 'a' ? 100 : 50);
+          return input === 'a' ? { status: 'success', output: 'a!' } : { status: 'failed', error: 'boom' };
+        },
+      },
+    });
+    const report = await runWorkflowDetailed(build([foreach(1)]), ['a', 'b'], { runner, clock, timeoutMs: 10_000 });
+    expect(report.stepResults.get('body')).toMatchObject({ status: 'failed', payload: 'b', startedAt: EPOCH + 100, endedAt: EPOCH + 150 });
+  });
+});
+
+describe('foreach under a run budget (ADR 0006): each item takes a permit on top of its lane', () => {
+  /** Peak items in flight, measured by the runner, for c = 2 at each k; each item holds 25 ms. */
+  it.each<[number | undefined, number]>([
+    [1, 1],
+    [2, 2],
+    [3, 2],
+    [undefined, 2],
+  ])('c = 2, k = %s: peak items in flight is %i = min(c, k), and the output is unchanged', async (k, peak) => {
+    const { runner, log } = itemRunner(async (label) => {
+      await sleep(25);
+      return { status: 'success', output: `${label}!` };
+    });
+    const compiled = compile({ id: 'batch', entries: [foreach(2)] }, k === undefined ? {} : { concurrency: k });
+    const report = await runWorkflowDetailed(compiled, ['a', 'b', 'c', 'd'], { runner, timeoutMs: 10_000 });
+    expect(report.outcome).toEqual({ status: 'success', output: ['a!', 'b!', 'c!', 'd!'] });
+    expect(log.maxInFlight).toBe(peak);
+    expect(log.started).toEqual(['a', 'b', 'c', 'd']);
+  });
+});

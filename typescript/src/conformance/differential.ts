@@ -29,7 +29,13 @@
  *    fixture declares independent may weaken — the net's partial order, `docs/divergences.md`
  *    row 4 — and it is then reported, not gated.
  * 3. **The ordering report — not a gate.** Weakened (declared independent) and strengthened
- *    pairs, listed.
+ *    pairs, listed. A strengthening — the candidate orders a pair the oracle overlapped, as a run
+ *    budget of k serialising a `.parallel()`'s arms does ([ADR 0006]) — is allowed and never
+ *    silent: {@link formatDifferentialReport} lists every one, per fixture and budget.
+ * 4. **The run budget — the gate.** A case may name the candidate's `concurrency` (k): the most
+ *    steps it may have in flight at once. The peak is read off each side's trace (open spans at
+ *    once); a candidate peak above k fails the fixture, and no attribution can rescue it. Each
+ *    side's wall time is measured too — reported, never gated.
  *
  * A difference is `divergent` only when an {@link Attribution} naming a `docs/divergences.md` row
  * covers its path; an unattributed difference makes the fixture `fail`.
@@ -99,6 +105,24 @@ export interface DifferentialCase<I = unknown> {
   readonly run: (engine: EngineName, input: I) => Promise<Observation>;
   readonly divergences?: readonly Attribution[];
   readonly independent?: readonly IndependentPair[];
+  /**
+   * The candidate's run budget — at most this many steps in flight ([ADR 0006]) — as `run` builds
+   * it; absent, unbounded. The harness does not configure the engine, it checks the trace.
+   */
+  readonly concurrency?: number;
+}
+
+/** A budget as reports print it: the number, or `unbounded`. */
+export type BudgetLabel = number | 'unbounded';
+
+/** Per-side measurements of one fixture: reported; only the candidate's peak against k is gated. */
+export interface Measurements {
+  /** The candidate's budget, or `unbounded`. */
+  readonly concurrency: BudgetLabel;
+  /** Most traced steps open at once, per side ({@link peakInFlight}). */
+  readonly peakInFlight: { readonly oracle: number; readonly candidate: number };
+  /** Wall time of each side's `run`, in milliseconds (`performance.now()`), or `null` when not measured. */
+  readonly wallMs: { readonly oracle: number | null; readonly candidate: number | null };
 }
 
 export interface Difference {
@@ -145,6 +169,9 @@ export interface Verdict {
   readonly ordering: OrderingReport;
   /** Declared attributions that matched nothing in this run. A caller gates it: a stale row. */
   readonly unusedAttributions: readonly Attribution[];
+  /** Why the candidate broke its run budget. Non-empty makes the verdict `fail`; never attributable. */
+  readonly budget: readonly string[];
+  readonly measurements: Measurements;
 }
 
 /**
@@ -168,22 +195,41 @@ export const EXCLUDED_PATHS: readonly string[] = [
 /** A UUID inside a string — minted per build or per run, so an id. */
 export const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
-/** Runs the fixture on the oracle, then on the candidate — sequentially, never interleaved. */
+/** Runs the fixture on the oracle, then on the candidate — sequentially, never interleaved — timing each. */
 export async function runBoth<I>(fixture: DifferentialCase<I>, input: I = fixture.input): Promise<Verdict> {
-  const oracle = await fixture.run('default', input);
-  const candidate = await fixture.run('petri', input);
-  return compareObservations(fixture.name, oracle, candidate, fixture.divergences ?? [], fixture.independent ?? []);
+  const timed = async (engine: EngineName) => {
+    const t0 = performance.now();
+    const observation = await fixture.run(engine, input);
+    return { observation, ms: performance.now() - t0 };
+  };
+  const oracle = await timed('default');
+  const candidate = await timed('petri');
+  return compareObservations(fixture.name, oracle.observation, candidate.observation, fixture.divergences ?? [], fixture.independent ?? [], {
+    ...(fixture.concurrency === undefined ? {} : { concurrency: fixture.concurrency }),
+    wallMs: { oracle: oracle.ms, candidate: candidate.ms },
+  });
 }
 
-/** The whole comparison, pure: identity, data, happens-before, then the verdict. */
+/** What {@link compareObservations} is told beyond the two observations: the budget and the timings. */
+export interface CompareOptions {
+  /** The candidate's run budget; absent, unbounded and nothing is gated. */
+  readonly concurrency?: number;
+  readonly wallMs?: { readonly oracle: number; readonly candidate: number };
+}
+
+/** The whole comparison, pure: identity, data, happens-before, the budget, then the verdict. */
 export function compareObservations(
   name: string,
   oracle: Observation,
   candidate: Observation,
   attributions: readonly Attribution[],
   independent: readonly IndependentPair[] = [],
+  options: CompareOptions = {},
 ): Verdict {
   const identity = engineIdentity(oracle, candidate);
+  const k = options.concurrency;
+  const peak = { oracle: peakInFlight(oracle.trace), candidate: peakInFlight(candidate.trace) };
+  const budget = k !== undefined && peak.candidate > k ? [`candidate had ${peak.candidate} steps in flight at once, above its budget of ${k}`] : [];
   const raw: { path: string; oracle: unknown; candidate: unknown }[] = [];
 
   if (oracle.kind !== candidate.kind) {
@@ -212,7 +258,7 @@ export function compareObservations(
   });
 
   const verdict: VerdictKind =
-    identity.length > 0
+    identity.length > 0 || budget.length > 0
       ? 'fail'
       : differences.length === 0
         ? 'pass'
@@ -228,7 +274,35 @@ export function compareObservations(
     differences,
     ordering: ordering.report,
     unusedAttributions: attributions.filter((at) => !used.has(at)),
+    budget,
+    measurements: {
+      concurrency: k ?? 'unbounded',
+      peakInFlight: peak,
+      wallMs: { oracle: options.wallMs?.oracle ?? null, candidate: options.wallMs?.candidate ?? null },
+    },
   };
+}
+
+/**
+ * The most steps a trace had open at once: +1 at each `start`, -1 at each `end` closing an open
+ * one, in trace order. A step that never ended stays open to the end of the trace.
+ */
+export function peakInFlight(trace: readonly TraceEvent[]): number {
+  const open = new Map<string, number>();
+  let now = 0;
+  let peak = 0;
+  for (const e of trace) {
+    const n = open.get(e.label) ?? 0;
+    if (e.kind === 'start') {
+      open.set(e.label, n + 1);
+      now += 1;
+      peak = Math.max(peak, now);
+    } else if (n > 0) {
+      open.set(e.label, n - 1);
+      now -= 1;
+    }
+  }
+  return peak;
 }
 
 /**
@@ -287,6 +361,7 @@ export function formatVerdicts(verdicts: readonly Verdict[]): string {
       `${v.verdict.padEnd(9)} ${v.fixture} (oracle: ${v.oracleOutcome}; execute() default ${x.oracle.default}/${x.candidate.default}, petri ${x.oracle.petri}/${x.candidate.petri})${cited}`,
     );
     for (const p of v.identity) lines.push(`  IDENTITY: ${p}`);
+    for (const p of v.budget) lines.push(`  BUDGET: ${p}`);
     for (const d of v.differences) {
       const who = d.row === undefined ? 'FINDING' : `row ${d.row}`;
       lines.push(`  ${who}: ${d.path}  oracle=${show(d.oracle)}  petri=${show(d.candidate)}`);
@@ -295,6 +370,73 @@ export function formatVerdicts(verdicts: readonly Verdict[]): string {
     if (o.weakened.length > 0) lines.push(`  weakened (independent): ${o.weakened.map(([a, b]) => `${a}<${b}`).join(', ')}`);
     if (o.strengthened.length > 0) lines.push(`  strengthened: ${o.strengthened.map(([a, b]) => `${a}<${b}`).join(', ')}`);
     for (const at of v.unusedAttributions) lines.push(`  unused attribution: row ${at.row} (${at.paths.join(', ')})`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * The M3 differential report: the corpus run at several budgets. First the verdict table — one row
+ * per fixture, one column per budget, each cell `verdict peak/k` — then the measurements per
+ * fixture and budget (peak in flight and wall time on each engine), then **every strengthening**,
+ * per fixture and budget: an ordering the candidate imposed that the oracle did not have. Nothing
+ * a budget changed about ordering is left out.
+ */
+export function formatDifferentialReport(verdicts: readonly Verdict[]): string {
+  const budgets = [...new Set(verdicts.map((v) => v.measurements.concurrency))];
+  const fixtures = [...new Set(verdicts.map((v) => v.fixture))];
+  const at = (f: string, k: BudgetLabel) => verdicts.find((v) => v.fixture === f && v.measurements.concurrency === k);
+  const width = Math.max(7, ...fixtures.map((f) => f.length));
+  const col = (k: BudgetLabel) => `k=${k === 'unbounded' ? 'inf' : k}`;
+  const lines: string[] = ['verdict table (cell: verdict, candidate peak in flight / oracle peak)'];
+  lines.push(`${'fixture'.padEnd(width)}  ${budgets.map((k) => col(k).padEnd(18)).join('')}`);
+  for (const f of fixtures) {
+    const cells = budgets.map((k) => {
+      const v = at(f, k);
+      return (v === undefined ? '-' : `${v.verdict} ${v.measurements.peakInFlight.candidate}/${v.measurements.peakInFlight.oracle}`).padEnd(18);
+    });
+    lines.push(`${f.padEnd(width)}  ${cells.join('')}`);
+  }
+  const totals = budgets.map((k) => {
+    const vs = verdicts.filter((v) => v.measurements.concurrency === k);
+    const count = (kind: VerdictKind) => vs.filter((v) => v.verdict === kind).length;
+    return `${col(k)}: ${count('pass')} pass, ${count('divergent')} divergent, ${count('fail')} fail`;
+  });
+  lines.push(`totals  ${totals.join('; ')}`);
+
+  lines.push('', 'measurements (peak in flight oracle/petri; wall ms oracle/petri)');
+  for (const f of fixtures) {
+    const cells = budgets.map((k) => {
+      const m = at(f, k)?.measurements;
+      if (m === undefined) return `${col(k)} -`;
+      const ms = (x: number | null) => (x === null ? '?' : x.toFixed(1));
+      return `${col(k)} ${m.peakInFlight.oracle}/${m.peakInFlight.candidate} ${ms(m.wallMs.oracle)}/${ms(m.wallMs.candidate)}`;
+    });
+    lines.push(`${f.padEnd(width)}  ${cells.join(' | ')}`);
+  }
+
+  lines.push('', 'strengthenings (candidate a<b the oracle overlapped), per fixture and budget');
+  let any = false;
+  for (const f of fixtures) {
+    for (const k of budgets) {
+      const v = at(f, k);
+      if (v === undefined || v.ordering.strengthened.length === 0) continue;
+      any = true;
+      lines.push(`${f} ${col(k)} (${v.ordering.strengthened.length}): ${v.ordering.strengthened.map(([a, b]) => `${a}<${b}`).join(', ')}`);
+    }
+  }
+  if (!any) lines.push('none');
+
+  const weakened = verdicts.filter((v) => v.ordering.weakened.length > 0);
+  lines.push('', 'weakenings (declared independent), per fixture and budget');
+  for (const v of weakened) {
+    lines.push(`${v.fixture} ${col(v.measurements.concurrency)} (${v.ordering.weakened.length}): ${v.ordering.weakened.map(([a, b]) => `${a}<${b}`).join(', ')}`);
+  }
+  if (weakened.length === 0) lines.push('none');
+
+  lines.push('', 'per-fixture detail');
+  for (const k of budgets) {
+    lines.push(`-- ${col(k)}`);
+    lines.push(formatVerdicts(verdicts.filter((v) => v.measurements.concurrency === k)));
   }
   return lines.join('\n');
 }

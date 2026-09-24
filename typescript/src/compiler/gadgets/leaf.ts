@@ -1,5 +1,6 @@
 import {
   Transition,
+  and,
   place,
   one,
   outPlace,
@@ -76,7 +77,7 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
   }
 
   const source = entry.source ?? 'step';
-  const { names, path, viewPath, exits, cancel } = ctx;
+  const { names, path, viewPath, exits, cancel, permits } = ctx;
   const inPlace = place<FlowToken>(names.entryIn(path, entry.id));
   const transitions: Transition[] = [];
   if (cancel !== undefined) transitions.push(sweep(names.entryTransition(path, entry.id, 'cancel'), inPlace, cancel, exits, entry.id, viewPath));
@@ -86,23 +87,23 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
     const retry =
       attempt < retries ? place<FlowToken>(names.entryPlace(path, entry.id, `retry-${attempt + 1}`)) : undefined;
 
-    const outcomes: Out[] = [
-      outPlace(next),
-      outPlace(exits.failed),
-      outPlace(exits.bailed),
-      outPlace(exits.suspended),
-      outPlace(exits.paused),
-    ];
-    if (retry !== undefined) outcomes.push(outPlace(retry));
+    // With a budget, every branch is its outcome *and* the permit back ([ADR 0006]): an Xor of
+    // Ands, so each structural branch is exactly a runtime outcome and the verifier sees the permit
+    // returned on every one of them — the P-invariant `permits + in flight = k` is in the arcs.
+    const branch = (to: Place<unknown>): Out => (permits === undefined ? outPlace(to) : and(outPlace(to), outPlace(permits)));
+    const outcomes: Out[] = [next, exits.failed, exits.bailed, exits.suspended, exits.paused].map(branch);
+    if (retry !== undefined) outcomes.push(branch(retry));
 
     const run = Transition.builder(
       attempt === 0 ? names.entryRun(path, entry.id) : names.entryTransition(path, entry.id, `run-${attempt}`),
     )
-      .inputs(one(attemptIn))
+      .inputs(...(permits === undefined ? [one(attemptIn)] : [one(attemptIn), one(permits)]))
       .outputs(xor(...outcomes))
-      .action(stepAction({ stepId: entry.id, path: viewPath, source, attempt, from: attemptIn, next, exits, retry }));
+      .action(stepAction({ stepId: entry.id, path: viewPath, source, attempt, from: attemptIn, next, exits, retry, permits }));
     if (attempt === 0 && cancel !== undefined) run.inhibitor(cancel);
-    transitions.push(run.build());
+    const built = run.build();
+    ctx.stepAttempt(built.name);
+    transitions.push(built);
 
     if (retry !== undefined) {
       const nextAttempt = place<FlowToken>(names.entryPlace(path, entry.id, `attempt-${attempt + 1}`));
@@ -368,6 +369,8 @@ interface StepActionSpec {
   readonly exits: Exits;
   /** Where a retryable failure goes; absent on the final attempt. */
   readonly retry: Place<FlowToken> | undefined;
+  /** The run's permits, handed back with every outcome; absent when the run is unbounded. */
+  readonly permits: Place<null> | undefined;
 }
 
 const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bailed', 'suspended', 'paused']);
@@ -381,9 +384,13 @@ const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bai
  * duplicate tokens and satisfy none of the `xor`'s branches.
  */
 export function stepAction(spec: StepActionSpec): TransitionAction {
-  const { stepId, path, source, attempt, from, next, exits, retry } = spec;
+  const { stepId, path, source, attempt, from, next, exits, retry, permits } = spec;
   return async (tctx) => {
     const incoming = tctx.input(from) as RetryToken;
+    // The permit goes back with whichever branch is written — the same firing, never later.
+    const release = (): void => {
+      if (permits !== undefined) tctx.output(permits, null);
+    };
     const scope = scopeOf(tctx);
     // Stamped once, by the first attempt, and carried on the retry token: Mastra takes the step's
     // start before its retry loop (`handlers/step.ts:166,174`).
@@ -409,11 +416,18 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     if (outcome.status === 'failed' && retry !== undefined && outcome.nonRetryable !== true) {
       const carry: RetryToken = { ...incoming, startedAt };
       tctx.output(retry, carry);
+      release();
       return;
     }
 
+    // Carry-over (`docs/divergences.md` row 48): Mastra starts a step's record from the prior record
+    // under the same id minus its completion fields (`handlers/step.ts:170-178`,
+    // `utils.ts:759-775`), and replaces `metadata` only when the call has an iteration count. So a
+    // loop's `iterationCount` survives a later `.then(s)` of the same step, and the next loop over
+    // it continues from there.
+    const prior = scope.getStepResult(stepId)?.metadata;
     const metadata = {
-      ...(incoming.iteration === undefined ? {} : { iterationCount: incoming.iteration }),
+      ...(incoming.iteration === undefined ? (prior?.iterationCount === undefined ? {} : { iterationCount: prior.iterationCount }) : { iterationCount: incoming.iteration }),
       ...(incoming.foreachIndex === undefined ? {} : { foreachIndex: incoming.foreachIndex }),
     };
     // A suspended or paused step has not ended: Mastra stamps `suspendedAt` and no `endedAt`
@@ -431,12 +445,19 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     });
 
     const origin = withIndex({ stepId, path }, incoming);
-    const stepPayload = 'payload' in outcome ? { stepPayload: outcome.payload } : {};
+    // A foreach's aggregate record takes the deciding item's payload and its own start
+    // (`handlers/step.ts:166,174`, kept by `handlers/control-flow.ts:1360-1369,1406`), which is not
+    // the item's dispatch when a run budget held it in its lane.
+    const stepPayload = {
+      ...('payload' in outcome ? { stepPayload: outcome.payload } : {}),
+      ...(incoming.foreachIndex === undefined ? {} : { stepStartedAt: startedAt }),
+    };
     switch (outcome.status) {
       case 'success':
         // The item's index and the iteration ride on, so the combinator that started the step can
         // tell its results apart without trusting the step's output.
         tctx.output(next, { ...carried(incoming), data: outcome.output });
+        release();
         return;
       case 'failed':
         tctx.output(exits.failed, {
@@ -446,15 +467,19 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
           ...(outcome.tripwire === undefined ? {} : { tripwire: outcome.tripwire }),
           ...(outcome.nonRetryable === true ? { nonRetryable: true as const } : {}),
         });
+        release();
         return;
       case 'bailed':
         tctx.output(exits.bailed, { ...origin, ...stepPayload, output: outcome.output });
+        release();
         return;
       case 'suspended':
         tctx.output(exits.suspended, { ...origin, payload: outcome.suspendPayload });
+        release();
         return;
       case 'paused':
         tctx.output(exits.paused, { ...origin, ...stepPayload });
+        release();
         return;
     }
   };

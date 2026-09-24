@@ -8,6 +8,7 @@ import {
 } from 'libpetri/verification';
 import type { CompiledWorkflow } from '../compiler/types.js';
 import { cancelStructureViolations } from './structure.js';
+import { budgetStructureViolations } from './budget.js';
 
 /**
  * Which runs a proof covers.
@@ -100,6 +101,10 @@ export async function verifyWorkflow(
     if (violations.length > 0) {
       throw new Error(`cancellation structure is unsound:\n  ${violations.join('\n  ')}`);
     }
+    const budgetViolations = budgetStructureViolations(compiled);
+    if (budgetViolations.length > 0) {
+      throw new Error(`step budget structure is unsound:\n  ${budgetViolations.join('\n  ')}`);
+    }
   }
 
   const t = compiled.terminals;
@@ -110,11 +115,12 @@ export async function verifyWorkflow(
       .initialMarking((m) => {
         m.tokens(compiled.entryPlace, 1);
         if (segment === 'cancel') m.tokens(compiled.cancelRequest, 1);
+        if (compiled.budget) m.tokens(compiled.budget.permits, compiled.budget.k);
       })
       // The cancel place is a sink: once marked it stays. That blinds `terminatesAtSink` to a
       // stranded run in the cancel segment — a marked cancel place satisfies it — which is one
       // more reason `exactlyOneTerminal` is in the set.
-      .sinkPlaces(...terminals, compiled.cancel)
+      .sinkPlaces(...terminals, compiled.cancel, ...(compiled.budget ? [compiled.budget.permits] : []))
       // P-invariants are what make these queries converge; without them a chain of xor
       // branches is where a proof stops landing.
       .semiflowInvariants(true)
@@ -132,6 +138,12 @@ export async function verifyWorkflow(
     // it sees a transient state too. It is what catches a cancel finisher that lost its read arc
     // on the signal: that net still drains to exactly one terminal, only sometimes the wrong one.
     if (segment === 'closed') await run('neverCanceled', placeBound(t.canceled, 0));
+    // The step budget ([ADR 0006]): no transition ever mints a permit, and every one is back when
+    // the run comes to rest — so steps in flight never exceed `k` and none is lost.
+    if (compiled.budget) {
+      await run('permitsBounded', placeBound(compiled.budget.permits, compiled.budget.k));
+      await run('permitsReturned', quiescentCount([compiled.budget.permits], compiled.budget.k, compiled.budget.k));
+    }
   }
   return reports;
 }

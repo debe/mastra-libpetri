@@ -2,6 +2,7 @@ import { MastraError, ErrorDomain, ErrorCategory } from '@mastra/core/error';
 import { ExecutionEngine, type ExecutionEngineOptions, type WorkflowRunStatus } from '@mastra/core/workflows';
 import { StepExecutor } from '@mastra/core/workflows/evented';
 import type { Mastra } from '@mastra/core/mastra';
+import type { Clock } from 'libpetri';
 import { compile } from '../compiler/compile.js';
 import type { CompiledWorkflow, WorkflowDescription } from '../compiler/types.js';
 import { runWorkflowDetailed, type RunReport } from '../engine/kernel.js';
@@ -24,6 +25,19 @@ export interface PetriEngineOptions {
   readonly options?: Partial<ExecutionEngineOptions>;
   /** The loop bound this engine requires and Mastra does not have (`docs/divergences.md` row 13). */
   readonly iterationBound?: number;
+  /**
+   * At most this many step attempts in flight at once within one run ([ADR 0006]) — a place with
+   * that many permits, so the bound is proven, not merely enforced. Mastra has no run-level bound;
+   * omitted, steps run unbounded, as Mastra's do, and a workflow means the same either way.
+   * Budgets are per run: a nested workflow on its own engine has its own.
+   */
+  readonly concurrency?: number;
+  /**
+   * The clock the net runs on ([TIME-015]) — for deterministic tests. Mastra's own step code still
+   * reads the machine clock; only the net's timing (fixed sleeps, retry delays, record stamps)
+   * follows this.
+   */
+  readonly clock?: Clock;
 }
 
 const DEFAULTS: ExecutionEngineOptions = { validateInputs: true, shouldPersistSnapshot: () => true };
@@ -91,6 +105,8 @@ export class StrandedRunError extends Error {
  */
 export class PetriExecutionEngine extends ExecutionEngine {
   readonly #iterationBound: number | undefined;
+  readonly #concurrency: number | undefined;
+  readonly #clock: Clock | undefined;
   /**
    * Compiled nets keyed by the adapter's description, serialised. A description is plain data and
    * `compile` a pure function of it, so equal keys give equal nets; `structuralHash` is itself
@@ -101,6 +117,8 @@ export class PetriExecutionEngine extends ExecutionEngine {
   constructor(options: PetriEngineOptions = {}) {
     super({ ...(options.mastra ? { mastra: options.mastra } : {}), options: { ...DEFAULTS, ...options.options } });
     this.#iterationBound = options.iterationBound;
+    this.#concurrency = options.concurrency;
+    this.#clock = options.clock;
   }
 
   async execute<_TState, _TInput, TOutput>(params: ExecuteParams): Promise<TOutput> {
@@ -178,6 +196,7 @@ export class PetriExecutionEngine extends ExecutionEngine {
       // Mastra has no run timeout (`default.ts:720-1130`). A stranded run with a signal would then
       // wait forever; the proven `exactlyOneTerminal` rules that out, not a timer.
       timeoutMs: null,
+      ...(this.#clock ? { clock: this.#clock } : {}),
     });
 
     const outcome = report.outcome;
@@ -267,10 +286,11 @@ export class PetriExecutionEngine extends ExecutionEngine {
   }
 
   #compiled(description: WorkflowDescription): CompiledWorkflow {
-    const key = JSON.stringify(description);
+    // The budget is part of the key: `k` lives in the compiled workflow's initial marking.
+    const key = JSON.stringify([description, this.#concurrency ?? null]);
     const hit = this.#cache.get(key);
     if (hit) return hit;
-    const compiled = compile(description);
+    const compiled = compile(description, this.#concurrency === undefined ? {} : { concurrency: this.#concurrency });
     this.#cache.set(key, compiled);
     return compiled;
   }

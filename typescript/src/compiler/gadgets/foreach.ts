@@ -94,7 +94,7 @@ const MAX_ITEMS = 2 ** 32 - 1;
  *
  * ```text
  *   sweep          in, ?cancel                 -> exits.canceled                        (given a signal)
- *   split          in              ¬cancel     -> xor( frame + cursor + permit.* | next [no items] | exits.failed )
+ *   split          in              ¬cancel     -> xor( frame + cursor + permit.* | frame + permit.* [no items] | exits.failed )
  *   start.l        cursor, permit.l ¬cancel    -> xor( body.l + slot.l + cursor | body.l + slot.l )
  *                  inhibited by every *other* lane's failed/bailed/suspended/paused
  *   refuse.l       cursor, permit.l ?cancel    -> permit.l                              (given a signal)
@@ -106,6 +106,7 @@ const MAX_ITEMS = 2 ** 32 - 1;
  *   suspend.l      suspended.l, slot.l, reset(cursor) -> suspensions + permit.l
  *
  *   join     all(results), frame, permit.*  ¬cancel ¬cursor ¬faults ¬exits ¬suspensions  -> next
+ *   join-empty           frame, permit.*    ¬cancel ¬cursor ¬faults ¬exits ¬suspensions ¬results -> next
  *   fail     all(faults), frame, permit.*   ¬cancel reset(exits, suspensions, results)   -> exits.failed
  *   exit     all(exits), frame, permit.*    ¬cancel ¬faults reset(suspensions, results)  -> exits.bailed | exits.paused
  *   suspend  all(suspensions), frame, permit.* ¬cancel ¬faults ¬exits reset(results)     -> exits.suspended
@@ -206,9 +207,12 @@ const MAX_ITEMS = 2 ** 32 - 1;
  *   is no other metadata.
  * - *failed*: `{...finalErrorResult, suspendPayload}` (`:1360-1369`) — the **failing item's own
  *   result**, so its payload is the item, its times the item's, and `tripwire` / `nonRetryable`
- *   ride along. Rebuilt from the slot, because by the time the finisher fires a sibling still in
- *   flight may have overwritten the leaf's record. `metadata.foreachIndex` is kept as the leaf
- *   wrote it.
+ *   ride along. Rebuilt from the outcome token and the slot, because by the time the finisher
+ *   fires a sibling still in flight may have overwritten the leaf's record. `metadata.foreachIndex`
+ *   is kept as the leaf wrote it. `startedAt` is **not** the foreach's: the item's `executeStep`
+ *   takes its own (`handlers/step.ts:166,174`; `stepInfo` of `executeForeach` is never written
+ *   into `stepResults` before items run, so nothing carries over on a fresh run), stamped before
+ *   its first attempt — the leaf's `startedAt`, carried on the token as `stepStartedAt`.
  * - *bailed / paused*: `exitResult` returned verbatim (`:1406`) — again the item's own result.
  * - *suspended*: `{...stepInfo, suspendedAt, status, suspendPayload}` (`:1432-1450`) — the
  *   foreach's payload and start, no `endedAt`.
@@ -334,9 +338,20 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
    * Opens the foreach: seeds the frame, the cursor **and** every permit in one firing, so no
    * marking exists with permits and no cursor (outputs of a firing land together, [EXEC-001]).
    *
-   * Three declared branches for three outcomes: items to run; no items at all (Mastra enqueues
-   * nothing and returns `[]`, `:1228`, `:1488-1494`); and an input Mastra cannot iterate either
-   * (see {@link itemsOf}), where Mastra's `execute()` rejects and we fail the run.
+   * Three declared branches for three outcomes: items to run; no items at all; and an input
+   * Mastra cannot iterate either (see {@link itemsOf}), where Mastra's `execute()` rejects and we
+   * fail the run.
+   *
+   * **No items still opens the foreach** — frame and permits, no cursor — and a finisher decides
+   * it, exactly as the non-empty case is decided (row 49). Mastra enqueues nothing (`:1228`), skips
+   * the wait (`:1276`) and still runs its check after the drain (`:1298-1312`) before it returns
+   * `[]` (`:1486-1494`): an abort that lands anywhere between the check before the entry
+   * (`default.ts:815`) and that check — while `executeForeach` awaits its span and its
+   * `workflow-step-start` publish (`:998-1027`), or while it reads `prevOutput.length` (`:1053`) —
+   * makes an empty foreach `canceled` with `output: []`, not `success []`. Deciding it here, inside
+   * this firing, would give that window no marking to land in. Opened, the empty foreach is
+   * decided by `join-empty` (¬cancel) or `canceled-empty` (?cancel), the same pair of arcs that
+   * decides every other foreach — no action ever reads the signal.
    */
   transitions.push(
     unlessCanceled(Transition.builder(t('split')))
@@ -344,7 +359,7 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
       .outputs(
         xor(
           and(outPlace(frame), outPlace(cursor), ...laneList.map((l) => outPlace(l.permit))),
-          outPlace(next),
+          and(outPlace(frame), ...laneList.map((l) => outPlace(l.permit))),
           outPlace(exits.failed),
         ),
       )
@@ -373,19 +388,9 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
           tctx.output(exits.failed, { stepId: bodyId, path: viewPath, error });
           return;
         }
-        if (items.length === 0) {
-          scope.recordStepResult(bodyId, {
-            status: 'success',
-            output: [],
-            payload: incoming.data,
-            startedAt,
-            endedAt: scope.epochNow(),
-          });
-          tctx.output(next, { data: [] });
-          return;
-        }
         tctx.output(frame, { input: incoming.data, startedAt });
-        tctx.output(cursor, { items, next: 0 });
+        // No items: no cursor, so no lane can start and `join-empty` / `canceled-empty` decide.
+        if (items.length > 0) tctx.output(cursor, { items, next: 0 });
         for (const l of laneList) tctx.output(l.permit, null);
       })
       .build(),
@@ -419,12 +424,20 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
         .reset(cursor)
         .outputs(and(outPlace(into), outPlace(l.permit)))
         .action(async (tctx) => {
-          const token = tctx.input(from);
+          const arrived = tctx.input(from);
           const s = tctx.input(l.slot);
           // The item as the step validated it, when the runner said: Mastra's aggregate record
           // for a deciding item takes that item's own payload (`handlers/step.ts:173`).
+          // ... and that item's own start, `handlers/step.ts:166,174`, which `{...finalErrorResult}`
+          // and `return exitResult` hand on unchanged (`:1360-1369`, `:1406`; row 49). The slot's
+          // stamp is the *dispatch*, which a run budget ([ADR 0006]) can hold apart from the
+          // item's first attempt; it stands in only while the leaf does not report the start.
+          // The start is the aggregate record's alone, so it goes no further than this settle.
+          const { stepStartedAt: reported, ...rest } = arrived as T & { stepStartedAt?: unknown };
+          const token = rest as T;
           const item = 'stepPayload' in (token as object) ? (token as { stepPayload?: unknown }).stepPayload : s.item;
-          tctx.output(into, record(token, { item, startedAt: s.startedAt, endedAt: scopeOf(tctx).epochNow() }));
+          const startedAt = typeof reported === 'number' ? reported : s.startedAt;
+          tctx.output(into, record(token, { item, startedAt, endedAt: scopeOf(tctx).epochNow() }));
           tctx.output(l.permit, null);
         })
         .build();
@@ -504,14 +517,22 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
    * permit consumed), nothing recorded against the foreach (¬faults ¬exits ¬suspensions) and no
    * cancel (Mastra's check after the drain, `:1298`). `all(results)` is honest: the domain really
    * is "take every result", and nothing can add to it while this firing holds every permit.
+   *
+   * Two transitions, as the cancel finishers are, because `all()` needs at least one token:
+   * `join` with results, `join-empty` inhibited by them — the foreach that had no items
+   * (`:1486-1494` with nothing enqueued). Every dispatched item leaves exactly one token in
+   * `results`, `faults`, `exits` or `suspensions`, and only a canceled run refuses one, so
+   * `join-empty` can fire only for a foreach that never dispatched.
    */
-  transitions.push(
-    unlessCanceled(Transition.builder(t('join')))
-      .inputs(all(results), one(frame), ...everyPermit)
+  const joined = (role: string, withResults: boolean): Transition => {
+    const b = unlessCanceled(Transition.builder(t(role)))
+      .inputs(...(withResults ? [all(results)] : []), one(frame), ...everyPermit)
       .inhibitors(cursor, faults, exited, suspensions)
-      .outputs(outPlace(next))
+      .outputs(outPlace(next));
+    if (!withResults) b.inhibitor(results);
+    return b
       .action(async (tctx) => {
-        const output = assemble(tctx.inputs(results));
+        const output = withResults ? assemble(tctx.inputs(results)) : [];
         const f = tctx.input(frame);
         const scope = scopeOf(tctx);
         scope.recordStepResult(bodyId, {
@@ -523,8 +544,9 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
         });
         tctx.output(next, { data: output });
       })
-      .build(),
-  );
+      .build();
+  };
+  transitions.push(joined('join', true), joined('join-empty', false));
 
   /** A failure was recorded: the first in time wins, and outranks every outcome but a cancel. */
   transitions.push(

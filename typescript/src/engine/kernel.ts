@@ -157,6 +157,9 @@ export async function runWorkflowDetailed(
   // allows. (The `cancel` proof segment seeds the request on purpose: there the arrival may land
   // anywhere, including after the first start.)
   if (signal?.aborted) initial.set(compiled.cancel, [seed(null)]);
+  // The run's step budget ([ADR 0006]): `k` permits in the initial marking, never deposited by an
+  // action, so the analyses see exactly `k` — the multiplicity lives where [IO-016] models it.
+  if (compiled.budget) initial.set(compiled.budget.permits, Array.from({ length: compiled.budget.k }, () => seed(null)));
 
   const context = new Map<string, unknown>([[RUN_SCOPE_KEY, scope]]);
   // At runtime the environment writes to the SIGNAL directly, not to the request place. The net's
@@ -277,8 +280,17 @@ export function classify(compiled: CompiledWorkflow, marking: Marking): RunOutco
   const { terminals } = compiled;
   const counts = new Map<string, number>();
   for (const p of compiled.net.places) {
-    // The cancellation signal stays marked once injected — it is the environment's, not work.
+    // The cancellation signal stays marked once injected — it is the environment's, not work — and
+    // the step permits are *supposed* to be all back at rest; a missing one is a leak, not residue
+    // (`permitsReturned` proves it cannot happen).
     if (p.name === compiled.cancel.name) continue;
+    if (p.name === compiled.budget?.permits.name) {
+      // Exactly k at rest: every branch returns its permit in the same firing. Any other count is a
+      // minted or leaked permit, and reported rather than hidden.
+      const n = marking.tokenCount(p);
+      if (n !== compiled.budget.k) counts.set(`${p.name} (k=${compiled.budget.k})`, n);
+      continue;
+    }
     const count = marking.tokenCount(p);
     if (count > 0) counts.set(p.name, count);
   }

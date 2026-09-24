@@ -45,6 +45,15 @@ export interface GadgetContext {
    * action that checks a flag ([ADR 0003], CLAUDE.md: cancellation is structural).
    */
   readonly cancel: Place<null> | undefined;
+  /**
+   * The run's step permits ([ADR 0006]), or `undefined` when the run is unbounded. Only a step
+   * consumes one — a step attempt is the unit of work the budget bounds — and it hands it back in
+   * every outcome branch of the same firing, so no permit is held across a wait, a join or a retry
+   * delay and the budget cannot deadlock the net. Combinators pass it through untouched.
+   */
+  readonly permits: Place<null> | undefined;
+  /** Registers a step-attempt transition by name — the leaf calls it for every attempt it emits. */
+  readonly stepAttempt: (transitionName: string) => void;
   readonly names: NameVocabulary;
   /**
    * Where this entry's non-success outcomes go. At the top level these are the workflow's

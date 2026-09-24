@@ -10,6 +10,7 @@ import {
   WF_DONE,
   WF_FAILED,
   WF_PAUSED,
+  WF_PERMITS,
   WF_SUSPENDED,
   type EntryPath,
 } from './names.js';
@@ -56,7 +57,15 @@ export const MAX_NET_PLACES = 4096;
 export interface CompileOptions {
   /** Override or extend the gadget registry — used by tests to compile one gadget in isolation. */
   readonly gadgets?: Partial<Record<EntryDescription['kind'], Gadget>>;
+  /**
+   * At most this many step attempts in flight at once, across the whole run ([ADR 0006]).
+   * Omitted, steps run unbounded, as Mastra's do. A whole number in [1, MAX_CONCURRENCY].
+   */
+  readonly concurrency?: number;
 }
+
+/** The largest run budget: well past any real fan-out, and small enough to seed as tokens. */
+export const MAX_CONCURRENCY = 1024;
 
 /** One gadget per entry kind. */
 export function defaultGadgets(): Record<EntryDescription['kind'], Gadget> {
@@ -105,10 +114,16 @@ export function compile(description: WorkflowDescription, options: CompileOption
     canceled: place<CanceledToken>(names.reserve(WF_CANCELED, 'workflow cancel terminal')),
   };
   const cancel = place<null>(names.reserve(WF_CANCEL, 'cancellation signal'));
+  const k = options.concurrency;
+  if (k !== undefined && (!Number.isInteger(k) || k < 1 || k > MAX_CONCURRENCY)) {
+    throw new Error(`concurrency must be a whole number in [1, ${MAX_CONCURRENCY}], got ${String(k)}`);
+  }
+  const permits = k === undefined ? undefined : place<null>(names.reserve(WF_PERMITS, 'step permits'));
   const cancelRequest = place<null>(names.reserve(WF_CANCEL_REQUEST, 'cancellation arrival'));
 
   const extraPlaces: Place<unknown>[] = [];
   const transitions: Transition[] = [];
+  const stepAttempts: string[] = [];
 
   // **The arrival is part of the net.** Registering `wf.cancel` itself as an environment place
   // would be the direct model, but libpetri routes any net with an environment place away from
@@ -191,6 +206,10 @@ export function compile(description: WorkflowDescription, options: CompileOption
       path,
       viewPath: nested.viewPath ?? path,
       cancel: nested.cancel,
+      permits,
+      stepAttempt: (transitionName) => {
+        stepAttempts.push(transitionName);
+      },
       names,
       exits,
       nextIsResult,
@@ -228,6 +247,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
       terminals.canceled,
       cancel,
       cancelRequest,
+      ...(permits ? [permits] : []),
       ...extraPlaces,
     )
     .transitions(...transitions)
@@ -248,6 +268,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
     terminals,
     cancel,
     cancelRequest,
+    ...(permits && k !== undefined ? { budget: { permits, k } } : {}),
+    stepAttempts,
     structuralHash: structuralHash(description, names.names()),
   };
 }

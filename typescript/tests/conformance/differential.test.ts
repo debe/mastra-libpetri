@@ -6,7 +6,9 @@ import { z } from 'zod';
 import { createWorkflow } from '@mastra/core/workflows';
 import {
   compareObservations,
+  formatDifferentialReport,
   formatVerdicts,
+  peakInFlight,
   matches,
   normalise,
   runBoth,
@@ -15,62 +17,118 @@ import {
   type TraceEvent,
   type Verdict,
 } from '../../src/conformance/differential.js';
-import { FIXTURES, observe, toCase, type MastraFixture } from '../fixtures/mastra-workflows.js';
+import { binds, BUDGETS, FIXTURES, observe, toCase, widthOf, type MastraFixture } from '../fixtures/mastra-workflows.js';
 
 const DIVERGENCES = resolve(dirname(fileURLToPath(import.meta.url)), '../../../docs/divergences.md');
 const documentedRows = new Set(
   [...readFileSync(DIVERGENCES, 'utf8').matchAll(/^\| (\d+) \|/gm)].map((m) => Number(m[1])),
 );
 
-/** Label patterns a fixture declared independent, or none: at k = 1 no weakening is expected. */
+/** Label patterns a fixture declared independent, or none: then no weakening is allowed. */
 const independentOf = (f: MastraFixture) => f.independent ?? [];
 
-describe('the corpus, both engines, concurrency k = 1', () => {
-  const verdicts: Verdict[] = [];
-  afterAll(() => {
-    // The report, every fixture: its verdict and rows, each difference with its row or as a FINDING, and the ordering.
-    const report = formatVerdicts(verdicts);
-    console.log(report);
-    const out = process.env['DIFFERENTIAL_REPORT'];
-    if (out !== undefined && out !== '') writeFileSync(out, `${report}\n`);
+const budgetName = (k: number | undefined) => (k === undefined ? 'unbounded' : String(k));
+
+/** Every verdict, at every budget: the M3 differential report is written from these. */
+const ALL: Verdict[] = [];
+afterAll(() => {
+  const report = formatDifferentialReport(ALL);
+  console.log(report);
+  const out = process.env['DIFFERENTIAL_REPORT'];
+  if (out !== undefined && out !== '') writeFileSync(out, `${report}\n`);
+});
+
+for (const k of BUDGETS) {
+  describe(`the corpus, both engines, candidate budget k = ${budgetName(k)}`, () => {
+    for (const fixture of FIXTURES) {
+      it(fixture.name, async () => {
+        const verdict = await runBoth(toCase(fixture, k));
+        ALL.push(verdict);
+        expect(verdict.oracleOutcome).toBe(fixture.expected);
+        expect(verdict.ordering.oracleStarts.length).toBeGreaterThan(0);
+
+        // Engine identity: the oracle never touched ours, the candidate never touched Mastra's,
+        // and every workflow — nested ones included — ran as often on each side.
+        expect(verdict.identity).toEqual([]);
+        expect(verdict.executions.oracle.petri).toBe(0);
+        expect(verdict.executions.candidate.default).toBe(0);
+        expect(verdict.executions.oracle.default).toBeGreaterThanOrEqual(1);
+        expect(verdict.executions.candidate.petri).toBe(verdict.executions.oracle.default);
+
+        for (const d of verdict.differences) if (d.row !== undefined) expect(documentedRows.has(d.row)).toBe(true);
+        expect(verdict.unusedAttributions).toEqual([]);
+
+        // Happens-before: nothing reversed, nothing inverted; a weakening only on a declared pair.
+        // A strengthening is allowed and lands in the report.
+        expect(verdict.ordering.reversed).toEqual([]);
+        expect(verdict.ordering.inverted).toEqual([]);
+        if (independentOf(fixture).length === 0) expect(verdict.ordering.weakened).toEqual([]);
+        // Where the budget does not bind, the candidate keeps every oracle order, declared or not.
+        if (!binds(fixture, k)) expect(verdict.ordering.weakened).toEqual([]);
+
+        // The budget: never more than k steps in flight on the candidate.
+        expect(verdict.budget).toEqual([]);
+        expect(verdict.measurements.concurrency).toBe(k ?? 'unbounded');
+        if (k !== undefined) expect(verdict.measurements.peakInFlight.candidate).toBeLessThanOrEqual(k);
+        expect(verdict.measurements.wallMs.oracle).not.toBeNull();
+        expect(verdict.measurements.wallMs.candidate).not.toBeNull();
+
+        expect(verdict.verdict).not.toBe('fail');
+      });
+    }
   });
+}
 
-  for (const fixture of FIXTURES) {
-    it(fixture.name, async () => {
-      const verdict = await runBoth(toCase(fixture));
-      verdicts.push(verdict);
-      expect(verdict.oracleOutcome).toBe(fixture.expected);
-      expect(verdict.ordering.oracleStarts.length).toBeGreaterThan(0);
-
-      // Engine identity: the oracle never touched ours, the candidate never touched Mastra's,
-      // and every workflow — nested ones included — ran as often on each side.
-      expect(verdict.identity).toEqual([]);
-      expect(verdict.executions.oracle.petri).toBe(0);
-      expect(verdict.executions.candidate.default).toBe(0);
-      expect(verdict.executions.oracle.default).toBeGreaterThanOrEqual(1);
-      expect(verdict.executions.candidate.petri).toBe(verdict.executions.oracle.default);
-
-      for (const d of verdict.differences) if (d.row !== undefined) expect(documentedRows.has(d.row)).toBe(true);
-      expect(verdict.unusedAttributions).toEqual([]);
-
-      // Happens-before: nothing reversed, nothing inverted; a weakening only on a declared pair.
-      expect(verdict.ordering.reversed).toEqual([]);
-      expect(verdict.ordering.inverted).toEqual([]);
-      if (independentOf(fixture).length === 0) expect(verdict.ordering.weakened).toEqual([]);
-
-      expect(verdict.verdict).not.toBe('fail');
-    });
+describe('the budget binds where the corpus is wide', () => {
+  // Peak steps in flight on the candidate, per budget: exactly min(k, width) where Mastra overlaps
+  // `width` steps. Without these, a corpus that never overlapped would pass the <= k gate vacuously.
+  // The timer-driven wide fixtures: every overlapped step waits on a timer, so Mastra's overlap is
+  // the fixture's width and not an accident of microtask order.
+  for (const name of ['parallel-wide', 'foreach-c5', 'foreach-c3']) {
+    const f = FIXTURES.find((x) => x.name === name)!;
+    const width = widthOf(f);
+    for (const k of BUDGETS) {
+      const peak = k === undefined ? width : Math.min(k, width);
+      it(`${name} at k = ${budgetName(k)}: candidate peak ${peak}, oracle ${width}`, async () => {
+        expect(width).toBeGreaterThan(1);
+        const v = await runBoth(toCase(f, k));
+        expect(v.verdict).toBe('pass');
+        expect(v.measurements.peakInFlight.oracle).toBe(width);
+        expect(v.measurements.peakInFlight.candidate).toBe(peak);
+        // Serialising what Mastra overlapped is a strengthening, and it is reported, never silent.
+        if (binds(f, k)) {
+          expect(v.ordering.strengthened.length).toBeGreaterThan(0);
+          expect(formatDifferentialReport([v])).toContain(`${name} k=${k} (${v.ordering.strengthened.length}):`);
+        } else {
+          expect(v.ordering.strengthened).toEqual([]);
+        }
+      });
+    }
   }
 
-  it('the nested fixtures ran their inner workflow on the petri engine too', async () => {
-    for (const name of ['nested-workflow', 'nested-suspend']) {
-      const f = FIXTURES.find((x) => x.name === name)!;
-      const petri = await observe(f, 'petri', f.input);
-      const def = await observe(f, 'default', f.input);
-      expect(petri.executions.length).toBe(2);
-      expect(petri.executions.every((e) => e.engine === 'petri')).toBe(true);
-      expect(def.executions.every((e) => e.engine === 'default')).toBe(true);
-      expect(new Set(petri.executions.map((e) => e.workflowId))).toEqual(new Set(def.executions.map((e) => e.workflowId)));
+  it('the wide parallel returns the same sum at every budget', async () => {
+    const f = FIXTURES.find((x) => x.name === 'parallel-wide')!;
+    for (const k of BUDGETS) {
+      const o = await observe(f, 'petri', f.input, k);
+      expect(o.kind).toBe('resolved');
+      // pre: 2; arms 2*1 .. 2*6 sum to 42.
+      expect(o.kind === 'resolved' ? (o.result as { result?: unknown }).result : undefined).toEqual({ n: 42 });
+    }
+  });
+});
+
+describe('the nested fixtures', () => {
+  it('ran their inner workflow on the petri engine too, at every budget', async () => {
+    for (const k of BUDGETS) {
+      for (const name of ['nested-workflow', 'nested-suspend']) {
+        const f = FIXTURES.find((x) => x.name === name)!;
+        const petri = await observe(f, 'petri', f.input, k);
+        const def = await observe(f, 'default', f.input);
+        expect(petri.executions.length).toBe(2);
+        expect(petri.executions.every((e) => e.engine === 'petri')).toBe(true);
+        expect(def.executions.every((e) => e.engine === 'default')).toBe(true);
+        expect(new Set(petri.executions.map((e) => e.workflowId))).toEqual(new Set(def.executions.map((e) => e.workflowId)));
+      }
     }
   });
 });
@@ -270,6 +328,68 @@ describe('the harness itself', () => {
     it('a rejection on one engine and a result on the other is a difference of kind', () => {
       const v = compareObservations('x', { kind: 'rejected', error: new Error('x'), trace: [], executions: DEFAULT }, cand({ status: 'failed' }), []);
       expect(v.differences.map((d) => d.path)).toEqual(['kind']);
+    });
+  });
+
+  describe('the run budget', () => {
+    const overlapping = (labels: string[]): TraceEvent[] => [...labels.map(s), ...labels.map(e)];
+
+    it('peak in flight counts open spans, closing each end against an open start of its label', () => {
+      expect(peakInFlight([])).toBe(0);
+      expect(peakInFlight(traceOf(['a', 'b', 'c']))).toBe(1);
+      expect(peakInFlight(overlapping(['a', 'b', 'c']))).toBe(3);
+      expect(peakInFlight([s('a'), s('a'), e('a'), s('b'), e('a'), e('b')])).toBe(2);
+      // An end with no open start is not a negative: it closes nothing.
+      expect(peakInFlight([e('x'), s('a'), s('b')])).toBe(2);
+    });
+
+    it('a candidate above its budget fails, and no attribution can rescue it', () => {
+      const at = [{ row: 70, paths: ['**'], reason: 'test' }];
+      const v = compareObservations('x', withTrace(ora(1), overlapping(['a', 'b'])), withTrace(cand(1), overlapping(['a', 'b'])), at, [], { concurrency: 1 });
+      expect(v.budget).toEqual(['candidate had 2 steps in flight at once, above its budget of 1']);
+      expect(v.measurements.peakInFlight).toEqual({ oracle: 2, candidate: 2 });
+      expect(v.verdict).toBe('fail');
+      expect(formatVerdicts([v])).toContain('BUDGET: candidate had 2 steps in flight at once');
+    });
+
+    it('the oracle is never held to the budget: it has none', () => {
+      const v = compareObservations('x', withTrace(ora(1), overlapping(['a', 'b'])), cand(1, ['a', 'b']), [], [], { concurrency: 1 });
+      expect(v.budget).toEqual([]);
+      expect(v.ordering.strengthened).toEqual([['a#0', 'b#0']]);
+      expect(v.verdict).toBe('pass');
+    });
+
+    it('unbounded gates nothing and says so', () => {
+      const v = compareObservations('x', ora(1), withTrace(cand(1), overlapping(['a', 'b', 'c'])), [], [['a', 'b'], ['a', 'c'], ['b', 'c']]);
+      expect(v.budget).toEqual([]);
+      expect(v.measurements.concurrency).toBe('unbounded');
+      expect(v.measurements.wallMs).toEqual({ oracle: null, candidate: null });
+    });
+
+    it('runBoth times each side and carries the case budget', async () => {
+      const v = await runBoth({
+        name: 'timed',
+        input: 0,
+        concurrency: 2,
+        run: async (engine) => (engine === 'default' ? ora(1, ['a']) : cand(1, ['a'])),
+      });
+      expect(v.measurements.concurrency).toBe(2);
+      expect(v.measurements.wallMs.oracle).toBeGreaterThanOrEqual(0);
+      expect(v.measurements.wallMs.candidate).toBeGreaterThanOrEqual(0);
+    });
+
+    it('the differential report lists every strengthening per fixture and budget, and every verdict in the table', () => {
+      const parallelOracle = withTrace(ora(1), overlapping(['a', 'b']));
+      const at1 = compareObservations('fx', parallelOracle, cand(1, ['a', 'b']), [], [], { concurrency: 1 });
+      const atInf = compareObservations('fx', parallelOracle, withTrace(cand(1), overlapping(['a', 'b'])), []);
+      const broken = compareObservations('gx', ora(1), cand(2), [], [], { concurrency: 1 });
+      const report = formatDifferentialReport([at1, atInf, broken]);
+      expect(report).toContain('fx k=1 (1): a#0<b#0');
+      expect(report).not.toContain('fx k=inf (');
+      expect(report).toMatch(/^fx\s+pass 1\/2\s+pass 2\/2/m);
+      expect(report).toMatch(/^gx\s+fail 0\/0/m);
+      expect(report).toContain('k=1: 1 pass, 0 divergent, 1 fail');
+      expect(report).toContain('FINDING: result');
     });
   });
 

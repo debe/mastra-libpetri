@@ -245,14 +245,42 @@
   `mastra/persist.ts` builds the snapshot one way, at start and terminal
 
 ## M3 — Concurrency + differential report
-- [ ] k > 1 under the structural budget; differ runs both engines in one process on one fake
-      host; every ordering difference attributed to a divergence row or it is a finding
-- [ ] Differential runs under injected clocks, one per executor. Correlate events on our own
-      run handle, never `executionId()`, which collides when two executors start at the same
-      virtual time. Copy libpetri's sharpest clock test: a virtual clock that only resolves on
-      abort, so anything the net achieves it achieves through the executor's own wake sources
-- [ ] Record the hole: action timeouts still use a real `setTimeout`, so step timeouts are not
-      virtualized. Small values in tests; revisit if upstream closes it
+- [x] **k defined, and it is a bound** ([ADR 0006]). The plan inherited "k > 1" from n8n, where the
+      host runs nodes one at a time; a Layer 1 Mastra workflow has no concurrency for the net to
+      add, since `.parallel`, `.branch` and `.foreach` already run concurrently in Mastra. What
+      Mastra lacks is a bound. `PetriExecutionEngine({ concurrency: k })` compiles a place of `k`
+      permits every step attempt takes and returns in every outcome branch; `k` lives in the
+      initial marking, so every budget shares one net. Proven in both segments as
+      `permitsBounded` and `permitsReturned`; checked on the arcs by `budgetStructureViolations`,
+      which `verifyWorkflow` runs before any proof — including the rule that every step attempt
+      takes a permit, added after a mutant compiling a body with no permit passed all eleven
+      proofs. A permit count other than `k` at rest is reported as residue
+- [x] **The differential at k ∈ {1, 2, 4, ∞}**, the whole corpus (39 fixtures) against Mastra's
+      unbounded oracle: 0 failures, 0 reversed and 0 inverted pairs at every k; every
+      strengthening — an order the budget imposes that Mastra overlaps — listed in the M3
+      report. Candidate peak in flight = min(k, width) in every cell where the budget binds
+      (`parallel-wide` 6/1, 6/2, 6/4, 6/6). Wall time grows as the budget binds (`foreach-c5`
+      123 / 60 / 30 / 24 ms at k = 1 / 2 / 4 / ∞), as a bound should
+- [x] **Found and recorded, not hidden: a budget is not data-neutral for racy state.** At k = 1
+      `workflow-state` differs from Mastra. Mastra's parallel arms share one live state object
+      merged in place as each finishes, so overlapping read-modify-writes lose all but the last
+      write; serialised, none is lost. The race is the workflow's and the budget selects an
+      interleaving Mastra itself produces when timing differs (row 71). ADR 0006's "identical at
+      every k" is narrowed to say so; snapshotting state at the fork would have hidden it and
+      diverged from Mastra elsewhere. Rows 70, 73 and 74 record the other effects of a budget
+- [x] Deterministic clocks: libpetri's sharpest clock test — a clock that resolves only on abort —
+      applied to our nets: every untimed shape completes through the executor's own wake
+      sources, and timed ones stay pending until aborted. Two executors on independent virtual
+      clocks give identical records. `PetriExecutionEngine({ clock })` runs a 60-second Mastra
+      sleep instantly. Nothing correlates on `executionId()` (asserted); runs correlate by
+      `runId`. Mastra's own step code still reads the machine clock (row 72)
+- [x] The "action timeout hole" does not exist: Mastra 1.67 steps have no timeout option and the
+      compiler emits no `Out.Timeout` (row 6 withdrawn)
+- [x] Rows 48 (record carry-over across uses of one step id) and 49 (foreach aggregate records)
+      fixed; conformance `loop-then-loop` records `iterationCount` 5 on both engines at every k
+- [x] Final integration: `npm run check` clean; `npm test` **1,533 passed** across 39 files; 4
+      opt-in slow proofs proven (`SLOW_PROOFS=1`); `npm run build` clean — libpetri 6.1.0 and
+      @mastra/core 1.67.0 from npm. 74 register rows, none open for M3 or earlier
 
 ## M4 — Suspend, resume, durability
 - [ ] `_suspend` place + terminal-marking classification (success / failed / suspended /

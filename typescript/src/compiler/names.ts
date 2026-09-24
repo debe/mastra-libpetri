@@ -44,6 +44,8 @@ export const WF_BAILED = 'wf.bailed';
 export const WF_SUSPENDED = 'wf.suspended';
 export const WF_PAUSED = 'wf.paused';
 export const WF_CANCELED = 'wf.canceled';
+/** The run's step budget ([ADR 0006]): `k` permit tokens, one per step attempt in flight. */
+export const WF_PERMITS = 'wf.permits';
 /**
  * The cancellation signal, an environment place. Not a terminal: it stays marked once injected,
  * and the terminal a canceled run reaches is `wf.canceled`.

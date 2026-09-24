@@ -1,4 +1,4 @@
-export { compile, defaultGadgets, MAX_NET_PLACES } from './compile.js';
+export { compile, defaultGadgets, MAX_CONCURRENCY, MAX_NET_PLACES } from './compile.js';
 export type { CompileOptions } from './compile.js';
 export { stepGadget, sleepGadget, stepAction, unimplemented, MAX_RETRIES, MAX_WAIT_MS } from './gadgets/leaf.js';
 export { parallelGadget } from './gadgets/parallel.js';
@@ -16,6 +16,7 @@ export {
   WF_DONE,
   WF_FAILED,
   WF_PAUSED,
+  WF_PERMITS,
   WF_SUSPENDED,
 } from './names.js';
 export type { EntryPath } from './names.js';
