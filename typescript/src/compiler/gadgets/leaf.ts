@@ -170,18 +170,28 @@ export const sleepGadget: Gadget = (entry, next, ctx) => {
   const extra: Transition[] =
     cancel === undefined ? [] : [sweep(ctx.names.entryTransition(ctx.path, entry.id, 'cancel'), inPlace, cancel, ctx.exits, entry.id, viewPath)];
 
-  const record = (scope: RunScope, incoming: FlowToken, startedAt: number): void =>
-    scope.recordStepResult(entry.id, {
+  // Each write is followed by its lifecycle event ([ADR 0008]), awaited only when there is an
+  // observer, so a run without one fires as it always did.
+  const record = async (scope: RunScope, incoming: FlowToken, startedAt: number): Promise<void> => {
+    const done: StepRecord = {
       status: 'success',
       output: incoming.data,
       payload: incoming.data,
       startedAt,
       endedAt: scope.epochNow(),
-    });
+    };
+    scope.recordStepResult(entry.id, done);
+    const observed = scope.observe({ kind: 'sleep-settled', stepId: entry.id, path: viewPath, record: done });
+    if (observed !== undefined) await observed;
+  };
   // What Mastra writes when a sleep begins, and leaves if the run is canceled mid-wait
   // (`handlers/entry.ts:602-609`). The wait's end overwrites it with `success`.
-  const recordWaiting = (scope: RunScope, incoming: FlowToken, startedAt: number): void =>
-    scope.recordStepResult(entry.id, { status: 'waiting', payload: incoming.data, startedAt });
+  const recordWaiting = async (scope: RunScope, incoming: FlowToken, startedAt: number): Promise<void> => {
+    const waiting: StepRecord = { status: 'waiting', payload: incoming.data, startedAt };
+    scope.recordStepResult(entry.id, waiting);
+    const observed = scope.observe({ kind: 'sleep-waiting', stepId: entry.id, path: viewPath, record: waiting });
+    if (observed !== undefined) await observed;
+  };
 
   if (entry.kind === 'sleep' && 'fixed' in wait) {
     // `begin` fires at once and records the wait; the token then waits in `waiting` for the
@@ -195,7 +205,7 @@ export const sleepGadget: Gadget = (entry, next, ctx) => {
         const incoming = tctx.input(inPlace);
         const scope = scopeOf(tctx);
         const startedAt = scope.epochNow();
-        recordWaiting(scope, incoming, startedAt);
+        await recordWaiting(scope, incoming, startedAt);
         const started: RetryToken = { ...incoming, startedAt };
         tctx.output(waiting, started);
       });
@@ -206,7 +216,7 @@ export const sleepGadget: Gadget = (entry, next, ctx) => {
       .action(async (tctx) => {
         const done = tctx.input(waiting);
         const scope = scopeOf(tctx);
-        record(scope, done, done.startedAt ?? scope.epochNow());
+        await record(scope, done, done.startedAt ?? scope.epochNow());
         tctx.output(next, { ...carried(done), data: done.data });
       });
     if (cancel !== undefined) {
@@ -236,7 +246,7 @@ export const sleepGadget: Gadget = (entry, next, ctx) => {
     const incoming = tctx.input(inPlace);
     const scope = scopeOf(tctx);
     const startedAt = scope.epochNow();
-    recordWaiting(scope, incoming, startedAt);
+    await recordWaiting(scope, incoming, startedAt);
 
     // Decide, then emit: resolve and wait first, where a throw writes no success record and leaves
     // the `waiting` one, as Mastra's does (`handlers/entry.ts:604-608`). `threw` is a
@@ -276,7 +286,7 @@ export const sleepGadget: Gadget = (entry, next, ctx) => {
     .outputs(outPlace(next))
     .action(async (tctx) => {
       const done = tctx.input(waited);
-      record(scopeOf(tctx), done, done.startedAt ?? scopeOf(tctx).epochNow());
+      await record(scopeOf(tctx), done, done.startedAt ?? scopeOf(tctx).epochNow());
       tctx.output(next, { ...carried(done), data: done.data });
     });
   if (cancel !== undefined) {
@@ -435,6 +445,8 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
         // The attempt a resume feeds ([ADR 0007]); every retry of it too, as `executeStepWithRetry`
         // re-calls with the same params (`default.ts:455-511`).
         ...(resumed ? { resumed: true as const } : {}),
+        ...(incoming.iteration === undefined ? {} : { iteration: incoming.iteration }),
+        startedAt: fresh,
       });
       if (outcome === null || typeof outcome !== 'object' || !OUTCOME_STATUSES.has((outcome as { status: unknown }).status as string)) {
         throw new Error(`runner returned an unrecognised outcome for step '${stepId}': ${describe(outcome)}`);
@@ -503,14 +515,19 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
         : 'payload' in outcome
           ? outcome.payload
           : incoming.data;
-    scope.recordStepResult(stepId, {
+    const record = {
       ...kept,
       ...reported,
       payload,
       ...(startedAt === undefined ? {} : { startedAt }),
       ...when,
       ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
-    } as StepRecord);
+    } as StepRecord;
+    scope.recordStepResult(stepId, record);
+    // The step's final record, for its result event ([ADR 0008]) — after the write, before the
+    // outputs, as Mastra publishes before it returns the step's result (`handlers/step.ts:531-545`).
+    const observed = scope.observe({ kind: 'step-settled', stepId, path, ...withIndex({}, incoming), record });
+    if (observed !== undefined) await observed;
 
     const origin = withIndex({ stepId, path }, incoming);
     // A foreach's aggregate record takes the deciding item's payload and its own start

@@ -121,12 +121,24 @@ export interface RunOptions {
    * restored from a marking.
    */
   readonly resume?: ResumeSeed;
+  /**
+   * A second event store every net event is also appended to — the libpetri debug UI's
+   * `DebugAwareEventStore` tee ([ADR 0008]). Observation only: the kernel's own watcher still sees
+   * every event first, and a throw from this store is kept on the report, not raised in the
+   * executor, where it would fail the firing that emitted the event.
+   */
+  readonly eventStore?: EventStore;
 }
 
 export interface RunReport {
   readonly outcome: RunOutcome;
   /** Every step's latest record, keyed by step id — Mastra's `stepResults`. */
   readonly stepResults: ReadonlyMap<string, StepRecord>;
+  /**
+   * The first error a lifecycle observer (`StepRunner.observe`) or the tee'd `eventStore` threw.
+   * Present only when one did. It changed nothing about the run ([ADR 0008]); the host reports it.
+   */
+  readonly observerError?: { readonly error: unknown };
 }
 
 /**
@@ -207,10 +219,11 @@ export async function runWorkflowDetailed(
     },
   );
 
+  let teeError: { readonly error: unknown } | undefined;
   executor = new PrecompiledNetExecutor(compiled.net, initial, {
     executionContextProvider: () => context,
     program: compiled.program,
-    eventStore: watcher,
+    eventStore: options.eventStore === undefined ? watcher : tee(watcher, options.eventStore, (error) => (teeError ??= { error })),
     ...(options.clock ? { clock: options.clock, deadlineToleranceMs: 0 } : {}),
     ...(signal ? { environmentPlaces: new Set([cancelPlace]) } : {}),
   });
@@ -232,7 +245,11 @@ export async function runWorkflowDetailed(
   if (failure !== undefined) {
     // Stranded whatever else the marking holds: a terminal a sibling reached is not this run's
     // outcome once one of its tokens was lost. Every marked place is named, terminals included.
-    return { outcome: { status: 'stranded', places: markedPlaces(compiled, marking), failure }, stepResults: scope.stepResults() };
+    return {
+      outcome: { status: 'stranded', places: markedPlaces(compiled, marking), failure },
+      stepResults: scope.stepResults(),
+      ...observerErrorOf(scope, teeError),
+    };
   }
   const outcome = classify(compiled, marking);
 
@@ -254,7 +271,36 @@ export async function runWorkflowDetailed(
       });
     }
   }
-  return { outcome, stepResults: scope.stepResults() };
+  return { outcome, stepResults: scope.stepResults(), ...observerErrorOf(scope, teeError) };
+}
+
+/** `observerError` for the report, only when an observer or the tee threw — the observer's first. */
+function observerErrorOf(scope: KernelRunScope, teeError: { readonly error: unknown } | undefined): Pick<RunReport, 'observerError'> {
+  const first = scope.observerError ?? teeError;
+  return first === undefined ? {} : { observerError: first };
+}
+
+/**
+ * `primary` first, then `secondary`, on every append. `primary` is the kernel's watcher, whose
+ * `isEnabled()` is always true, so the executor never skips building an event the tee wants. A
+ * throw from `secondary` goes to `onError` and no further: inside `append` it would fail the
+ * firing that emitted the event.
+ */
+function tee(primary: EventStore, secondary: EventStore, onError: (error: unknown) => void): EventStore {
+  return {
+    append(event: NetEvent): void {
+      primary.append(event);
+      try {
+        secondary.append(event);
+      } catch (error) {
+        onError(error);
+      }
+    },
+    events: () => primary.events(),
+    isEnabled: () => true,
+    size: () => primary.size(),
+    isEmpty: () => primary.isEmpty(),
+  };
 }
 
 /**

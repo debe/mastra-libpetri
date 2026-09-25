@@ -1,4 +1,5 @@
 import type { Clock } from 'libpetri';
+import type { DebugSessionRegistry } from 'libpetri/debug';
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { z } from 'zod';
 import { Mastra } from '@mastra/core/mastra';
@@ -324,7 +325,8 @@ describe('init() — the PetriEngineType brand', () => {
 
   it('keeps Mastra-facing options in Mastra\'s words', () => {
     expectTypeOf<Parameters<typeof init>[0]>().toEqualTypeOf<
-      { readonly iterationBound?: number; readonly concurrency?: number; readonly clock?: Clock } | undefined
+      | { readonly iterationBound?: number; readonly concurrency?: number; readonly clock?: Clock; readonly debug?: DebugSessionRegistry }
+      | undefined
     >();
     const typeOnly = () => {
       // @ts-expect-error — the engine is init()'s to set

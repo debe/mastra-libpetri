@@ -234,7 +234,71 @@ export interface StepCall extends RunView {
    * the stored suspend data, and records it as a resumed step (`resumePayload`, `resumedAt`).
    */
   readonly resumed?: true;
+  /**
+   * The 1-based loop iteration this call runs, when a `.dowhile` / `.dountil` started it — Mastra's
+   * `iterationCount` (`handlers/control-flow.ts:773,847`), which a step's start event carries as
+   * `metadata.iterationCount` (`handlers/step.ts:176`).
+   */
+  readonly iteration?: number;
+  /**
+   * When the step's first attempt started, on the run's clock — the stamp its record takes as
+   * `startedAt` unless the record is a resumed one. Mastra's start event and record share one
+   * `startTime` (`handlers/step.ts:166,172`), so a runner publishing a start reads this rather than
+   * the clock. The same on every attempt of the step.
+   */
+  readonly startedAt?: number;
 }
+
+/**
+ * What the net tells the host about a step's life, at the points where Mastra's default engine
+ * publishes a step event ([ADR 0008]). A step's **start** is not here: it is the runner's first
+ * call for the step (`attempt === 0`), which Mastra's start event precedes (`handlers/step.ts:207-216`).
+ *
+ * **Observation only.** No arc, guard or branch reads what an observer does; an observer cannot
+ * fail a firing (the scope swallows its throw, see `RunScope.observe`); and the net, its proofs and
+ * its outcomes are the same with or without one. Each event is raised in the firing that writes
+ * the record it carries, after the write and before the firing's outputs, so an observer sees the
+ * record the run's store holds at that moment.
+ */
+export type LifecycleEvent =
+  /** A sleep began waiting: its `waiting` record was just written (`handlers/entry.ts:586-609,694-711`). */
+  | { readonly kind: 'sleep-waiting'; readonly stepId: string; readonly path: EntryPath; readonly record: StepRecord }
+  /** A sleep's wait ended and its `success` record was written (`handlers/entry.ts:656-690,768-802`). */
+  | { readonly kind: 'sleep-settled'; readonly stepId: string; readonly path: EntryPath; readonly record: StepRecord }
+  /**
+   * A step's final record, after every retry — never a retried attempt's (`handlers/step.ts:531-545`
+   * emits once, after `executeStepWithRetry`). With `foreachIndex`, it is one `.foreach()` item's
+   * (`handlers/control-flow.ts:1117-1152`, where Mastra publishes progress, not a step result).
+   */
+  | {
+      readonly kind: 'step-settled';
+      readonly stepId: string;
+      readonly path: EntryPath;
+      readonly foreachIndex?: number;
+      readonly record: StepRecord;
+    }
+  /**
+   * A `.foreach()` began — at `split` on a fresh run, at `re-enter` on a resume — before any item
+   * starts (`handlers/control-flow.ts:990-1027`). `stepId` is the body's. `input` is the foreach's
+   * input as it arrived, `startedAt` its start (absent on a resume whose stored aggregate had none),
+   * `kept` a resumed foreach's stored aggregate less its completion fields, and `items` the number
+   * of items — `undefined` when the input is not an array, which fails the foreach next.
+   */
+  | {
+      readonly kind: 'foreach-entered';
+      readonly stepId: string;
+      readonly path: EntryPath;
+      readonly input: unknown;
+      readonly startedAt?: number;
+      readonly kept?: Readonly<Record<string, unknown>>;
+      readonly items: number | undefined;
+      readonly resumed: boolean;
+    }
+  /**
+   * A `.foreach()`'s aggregate record was written — success, failed, bailed, paused, suspended or
+   * canceled (`handlers/control-flow.ts:1298-1480`). `stepId` is the body's.
+   */
+  | { readonly kind: 'foreach-settled'; readonly stepId: string; readonly path: EntryPath; readonly record: StepRecord };
 
 /**
  * How a step actually runs. The compiler emits actions that delegate here, and the kernel
@@ -263,6 +327,13 @@ export interface StepRunner {
    * computed from the previous step's output. Required only when one is present.
    */
   resolveWait?(entryId: string, input: unknown, view: RunView): Promise<number>;
+
+  /**
+   * A step's lifecycle, as it happens ([ADR 0008]). Optional, and observation only: the firing
+   * awaits it, so what the observer publishes precedes what the firing enables, as Mastra awaits
+   * its publish before moving on — but nothing it does, throws or returns changes the run.
+   */
+  observe?(event: LifecycleEvent): void | Promise<void>;
 }
 
 /**

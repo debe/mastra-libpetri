@@ -1,6 +1,6 @@
 import { systemClock, type Clock } from 'libpetri';
 import type { RunScope } from '../compiler/scope.js';
-import type { StepRecord, StepRunner } from '../compiler/types.js';
+import type { LifecycleEvent, StepRecord, StepRunner } from '../compiler/types.js';
 
 export interface RunScopeOptions {
   readonly runner: StepRunner;
@@ -41,6 +41,26 @@ export class KernelRunScope implements RunScope {
 
   recordStepResult(stepId: string, record: StepRecord): void {
     this.#results.set(stepId, record);
+  }
+
+  /** The first error an observer threw or rejected with, for the run's report ([ADR 0008]). */
+  get observerError(): { readonly error: unknown } | undefined {
+    return this.#observerError;
+  }
+  #observerError: { readonly error: unknown } | undefined;
+
+  observe(event: LifecycleEvent): Promise<void> | undefined {
+    const observe = this.runner.observe;
+    if (observe === undefined) return undefined;
+    const kept = (error: unknown): void => {
+      this.#observerError ??= { error };
+    };
+    try {
+      return Promise.resolve(observe.call(this.runner, event)).then(undefined, kept);
+    } catch (error) {
+      kept(error);
+      return undefined;
+    }
   }
 
   /** Every record, in first-recorded order. */

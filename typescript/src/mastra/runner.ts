@@ -7,19 +7,34 @@ import {
   createStepFromTool,
   validateStepRequestContext,
   validateStepStateData,
+  validateStepInput,
   validateStepSuspendData,
   type ExecutionGraph,
+  type OutputWriter,
   type StepFlowEntry,
   type StepResult,
 } from '@mastra/core/workflows';
 import type { StepExecutor } from '@mastra/core/workflows/evented';
+import { ToolStream } from '@mastra/core/tools';
+import { MastraError, ErrorDomain, ErrorCategory, getErrorFromUnknown } from '@mastra/core/error';
+import type { IMastraLogger } from '@mastra/core/logger';
+import { createObservabilityContext, executeWithContext, wrapMastra, type AnySpan } from '@mastra/core/observability';
 import { HostPreconditionError } from '../compiler/gadgets/leaf.js';
 import type { EntryPath } from '../compiler/names.js';
 import { UnresumablePositionError } from '../compiler/resume.js';
-import type { RunView, StepCall, StepOutcome, StepRecord, StepRunner } from '../compiler/types.js';
+import type { LifecycleEvent, RunView, StepCall, StepOutcome, StepRecord, StepRunner } from '../compiler/types.js';
+import type { StepEvents } from './events.js';
 import { entryId } from './host.js';
 import type { RunnerResume } from './resume-codec.js';
+import { runScorersForStep, type RunScorersParams } from './scorers.js';
+import type { StepSpans } from './spans.js';
 import { toMastraStepResult } from './step-result.js';
+
+/** `validateStepInput`'s result: the input every attempt uses, and the error that fails them all. */
+interface ValidatedInput {
+  readonly inputData: unknown;
+  readonly validationError?: Error | undefined;
+}
 
 type SingleStepEntry = Extract<StepFlowEntry, { type: 'step' | 'agent' | 'tool' | 'mapping' }>;
 /** The one entry kind `StepExecutor` is handed: every firing is resolved to a plain step first. */
@@ -82,6 +97,30 @@ export interface MastraStepRunnerOptions {
    * a resumed record's `resumedAt`. Defaults to the machine clock.
    */
   readonly now?: (() => number) | undefined;
+  /**
+   * The run's step events ([ADR 0008]): a step's start is published here before its first attempt,
+   * and every lifecycle event the net raises is handed to it. Absent, the runner publishes nothing
+   * and observes nothing.
+   */
+  readonly events?: StepEvents | undefined;
+  /**
+   * `Run.stream()`'s output writer — the only thing that makes a step's `writer.write()` reach a
+   * reader (`workflow.ts:4128-4136`). A plain `start()` has none, and the default engine's
+   * `ToolStream` then drops every chunk (`tools/stream.ts:45-47`); so does this runner's.
+   */
+  readonly outputWriter?: OutputWriter | undefined;
+  /**
+   * The run's spans (`src/mastra/spans.ts`): a step's span is created before its first attempt,
+   * handed to the step as its tracing context, and ended by the net's lifecycle events. Absent, no
+   * span is created and steps see Mastra's empty tracing context.
+   */
+  readonly spans?: StepSpans | undefined;
+  /** `Run.start({ actor })`, which the default engine hands every step and condition (`handlers/step.ts:364`, `handlers/control-flow.ts:420,841`). */
+  readonly actor?: unknown;
+  /** `Run.start({ disableScorers })`, forwarded as the default engine forwards it (`handlers/step.ts:458,501-514`). */
+  readonly disableScorers?: boolean | undefined;
+  /** The engine's logger: a failing branch condition is tracked and logged on it (`handlers/control-flow.ts:477-478`), as are scorer failures. */
+  readonly logger?: (() => IMastraLogger | undefined) | undefined;
 }
 
 /**
@@ -156,6 +195,8 @@ export class MastraStepRunner implements StepRunner {
    * change it.
    */
   readonly #itemPrior = new Map<string, StepRecord | undefined>();
+  /** Each step call's `validateStepInput` result, by position, from its first attempt: see {@link #validatedInput}. */
+  readonly #validated = new Map<string, ValidatedInput>();
 
   constructor(options: MastraStepRunnerOptions) {
     this.#o = options;
@@ -201,8 +242,8 @@ export class MastraStepRunner implements StepRunner {
    *
    * **The payload** is what the default engine records, `inputData` after `validateStepInput`
    * (`handlers/step.ts:111,173`): a schema's defaults and coercions applied, the raw input when
-   * validation failed. `StepExecutor` records the whole sparse array for an item (`:110`), so the
-   * runner takes the validated input from the context `execute` is called with.
+   * validation failed. The runner validates once per step call and records that value;
+   * `StepExecutor` records the whole sparse array for an item (`:110`), and sees no schema to validate.
    *
    * **A suspension** is recorded as the default engine records it (`handlers/step.ts:385-415,518`):
    * the suspend data after `validateStepSuspendData`, bare. `StepExecutor` wraps it in a
@@ -233,24 +274,63 @@ export class MastraStepRunner implements StepRunner {
       throw new HostPreconditionError(stepId, call.path, error);
     }
 
+    // Mastra's `stepCallId` (`handlers/step.ts:106`): one per step call, every retry sharing it — the
+    // start event's, the result's and the writer's.
+    const stepCallId = this.#o.events?.callId(stepId, call.path, call.attempt, foreachIndex) ?? randomUUID();
+    const publishes = call.attempt === 0 && foreachIndex === undefined && this.#o.events?.enabled === true;
+    // `validateStepInput` (`handlers/step.ts:111-126`), **once per step call**: before the retry
+    // loop in Mastra, so every attempt uses the one result. Its `inputData` is the span's input, the
+    // start's payload, the record's and what the step sees; a schema with a transform or a
+    // generated default runs once. Its `validationError` fails every attempt, as Mastra throws it
+    // inside the retry loop (`:238-241`). The executor is told not to validate again.
+    const { inputData, validationError } = await this.#validatedInput(stepId, input, call, step);
+    // The step's span, before its start event and its first attempt (`handlers/step.ts:182-216`);
+    // every retry shares it. Observation only: `StepSpans` keeps its own throws.
+    const stepSpan: AnySpan | undefined = await this.#o.spans?.step({ stepId, path: call.path, attempt: call.attempt, foreachIndex, iteration: call.iteration }, entry, inputData, input);
+    if (publishes) {
+      // Observation only: whatever building or publishing the start throws is kept, and the step runs.
+      await this.#publishStart(stepId, inputData, call, feed, stepCallId).catch((error: unknown) => this.#o.events?.keep(error));
+    }
+    const writer = new ToolStream(
+      { prefix: 'workflow-step', callId: stepCallId, name: step.id, runId: this.#o.runId },
+      this.#o.outputWriter,
+    );
+
     let stateUpdate: Record<string, unknown> | undefined;
-    // Set once `StepExecutor` has validated the input and called `execute` with it.
-    let validated: { readonly input: unknown } | undefined;
     // The last `suspend` call's validated data: Mastra keeps the last (`handlers/step.ts:414`).
     let suspension: { readonly data: unknown } | undefined;
+    // What `step.execute` returned — Mastra's `durableResult.output`, which scorers see (`handlers/step.ts:506`).
+    let returned: { readonly value: unknown } | undefined;
+    // The step's tracing context (`handlers/step.ts:352-356,382`): `mastra` wrapped with the step's
+    // span — a nested workflow gets it raw and wraps it for its own steps — and the span as the
+    // context `tracingContext`, which a nested workflow's run span is created under.
+    const observability = createObservabilityContext({ currentSpan: stepSpan });
+    const mastraForStep = this.#mastra ? (nested ? this.#mastra : wrapMastra(this.#mastra, { currentSpan: stepSpan })) : undefined;
+    // The executor sees no input or suspend schema: the input was validated once above, and the
+    // step's `suspend` below validates its data. Its `validateInputs` is still the run's.
     const wrapped = overlay(step, {
+      inputSchema: undefined,
+      suspendSchema: undefined,
       execute: async (ctx: Context): Promise<unknown> => {
-        validated = { input: ctx['inputData'] };
-        const { validationError } = await validateStepRequestContext({
+        // Input validation takes precedence over the request context's (`handlers/step.ts:126`).
+        if (validationError) throw validationError;
+        const { validationError: requestContextError } = await validateStepRequestContext({
           requestContext: this.#o.requestContext,
           step,
           validateInputs: this.#o.validateInputs,
         });
-        if (validationError) throw validationError;
+        if (requestContextError) throw requestContextError;
         const executorSuspend = ctx['suspend'] as (data: unknown) => Promise<unknown>;
-        return step.execute({
+        // `executeWithContext({ span: stepSpan, … })` (`handlers/step.ts:302-311`): the span is the
+        // ambient current span while the step runs. With no span it calls the step as it is
+        // (`observability/context-storage.ts:58-69`), so the call is made directly: no added turns.
+        const call = (): Promise<unknown> => step.execute({
           ...ctx,
-          mastra: this.#mastra,
+          ...observability,
+          mastra: mastraForStep,
+          ...(this.#o.actor === undefined ? {} : { actor: this.#o.actor }),
+          // "Disable scorers must be explicitly set to false they are on by default" (`handlers/step.ts:457-458`).
+          scorers: this.#o.disableScorers === false ? undefined : step.scorers,
           // The default engine's two, not the executor's: see {@link #resumeFeed}.
           resumeData: feed.resumeData,
           suspendData: feed.suspendData,
@@ -268,6 +348,10 @@ export class MastraStepRunner implements StepRunner {
             await executorSuspend(data);
           },
           ...(nestedRunId === undefined ? {} : { runId: nestedRunId }),
+          // The default engine's writer and output writer (`handlers/step.ts:445-454`), not the
+          // executor's, which publishes every chunk to the run's topic whether or not anyone streams.
+          writer,
+          outputWriter: this.#o.outputWriter,
           ...(this.#o.resourceId === undefined ? {} : { resourceId: this.#o.resourceId }),
           validateInputs: this.#o.validateInputs,
           setState: async (next: unknown): Promise<void> => {
@@ -279,7 +363,10 @@ export class MastraStepRunner implements StepRunner {
             if (stateError) throw stateError;
             stateUpdate = stateData as Record<string, unknown> | undefined;
           },
-        } as unknown as Parameters<MastraStep['execute']>[0]);
+        } as unknown as Parameters<MastraStep['execute']>[0]) as Promise<unknown>;
+        const running = stepSpan === undefined ? call() : executeWithContext({ span: stepSpan, fn: call });
+        // The returned value is kept only for scorers, which read it (`handlers/step.ts:506`).
+        return step.scorers ? running.then((value) => ((returned = { value }), value)) : running;
       },
     });
 
@@ -287,7 +374,9 @@ export class MastraStepRunner implements StepRunner {
       workflowId: this.#o.workflowId,
       runId: this.#o.runId,
       entry: { type: 'step', step: wrapped },
-      input: foreachIndex === undefined ? input : itemAt(input, foreachIndex),
+      // The once-validated input: with the schemas hidden, the executor neither validates it again
+      // nor the suspend data, which the step's `suspend` above validates (`handlers/step.ts:385-393`).
+      input: foreachIndex === undefined ? inputData : itemAt(inputData, foreachIndex),
       stepResults: this.#stepResults(call),
       state: this.#state,
       requestContext: this.#o.requestContext,
@@ -302,11 +391,28 @@ export class MastraStepRunner implements StepRunner {
     // default engine applies `contextMutations.stateUpdate` whenever the attempt returned.
     if (raw['status'] !== 'failed' && stateUpdate !== undefined) Object.assign(this.#state, stateUpdate);
     if (raw['status'] === 'success' && foreachIndex !== undefined) this.#itemSucceeded(stepId, foreachIndex);
+    if (raw['status'] !== 'failed' && step.scorers) {
+      // After the attempt that did not fail, before its record (`handlers/step.ts:501-514`). The hook
+      // it fires is Mastra's fire-and-forget; a throw here is the scorers', and must not fail the step.
+      await runScorersForStep({
+        mastra: this.#mastra,
+        logger: this.#o.logger?.(),
+        scorers: step.scorers as RunScorersParams['scorers'],
+        runId: this.#o.runId,
+        input: inputData,
+        output: returned?.value,
+        workflowId: this.#o.workflowId,
+        stepId: step.id,
+        requestContext: this.#o.requestContext,
+        disableScorers: this.#o.disableScorers,
+        span: stepSpan,
+      }).catch((error: unknown) => this.#o.logger?.()?.error(`Error running scorers for step ${step.id}`, { error }));
+    }
 
     if (raw['status'] === 'suspended' && suspension === undefined) {
       throw new Error(`step '${stepId}' suspended without calling the suspend it was given`);
     }
-    const payload = validated === undefined ? input : validated.input;
+    const payload = inputData;
     const host: Record<string, unknown> = {
       ...raw,
       // A resumed record keeps the prior record's payload (`handlers/step.ts:170-171`).
@@ -319,6 +425,41 @@ export class MastraStepRunner implements StepRunner {
     // keeps the suspended record's start; absent, the record is a fresh start (`handlers/step.ts:166-175`).
     const outcome = toOutcome(host);
     return feed.record === undefined ? outcome : { ...outcome, resumedAt: feed.record.resumedAt };
+  }
+
+  /**
+   * The step's `workflow-step-start`, before its first attempt (`handlers/step.ts:111-216`): the
+   * input as `validateStepInput` leaves it — validated, or raw when validation fails, which then
+   * fails the attempt — the prior record under the id, and on a resumed record the resume payload
+   * and `resumedAt`, the same stamp the record gets. Not for a `.foreach()` item: Mastra runs those
+   * with `skipEmits` (`handlers/control-flow.ts:1111`).
+   */
+  async #publishStart(stepId: string, inputData: unknown, call: StepCall, feed: ResumeFeed, stepCallId: string): Promise<void> {
+    const stored = call.getStepResult(stepId);
+    await this.#o.events!.stepStarted(
+      {
+        stepId,
+        path: call.path,
+        input: inputData,
+        prior: stored === undefined ? undefined : (toMastraStepResult(stored, { now: this.#now() }) as unknown as Record<string, unknown>),
+        resumed: feed.record === undefined ? undefined : { payload: feed.resumeData, resumedAt: feed.record.resumedAt },
+        iteration: call.iteration,
+        startedAt: call.startedAt,
+      },
+      stepCallId,
+    );
+  }
+
+  /** A lifecycle event from the net ([ADR 0008]), published as Mastra's step events. */
+  observe(event: LifecycleEvent): Promise<void> | void {
+    const events = this.#o.events;
+    const spans = this.#o.spans;
+    if (events === undefined && spans === undefined) return;
+    // The events first, then the spans: Mastra publishes a step's result before it ends the step's
+    // span (`handlers/step.ts:531-560`). `StepSpans` never rejects.
+    const published = events?.observe(event, (id) => this.#lastView?.getStepResult(id) ?? this.#o.resume?.records?.get(id));
+    if (spans === undefined) return published;
+    return (published ?? Promise.resolve()).finally(() => spans.observe(event));
   }
 
   /**
@@ -433,6 +574,20 @@ export class MastraStepRunner implements StepRunner {
   }
 
   /**
+   * `validateStepInput` for a step call: run at its first attempt, the result kept for every retry
+   * (`handlers/step.ts:111-115`, before `executeStepWithRetry`). A retry with nothing kept — none is
+   * expected — validates afresh.
+   */
+  async #validatedInput(stepId: string, input: unknown, call: StepCall, step: MastraStep): Promise<ValidatedInput> {
+    const key = `${call.path.join('.')}\u0000${stepId}\u0000${call.foreachIndex ?? ''}`;
+    const kept = this.#validated.get(key);
+    if (call.attempt > 0 && kept !== undefined) return kept;
+    const validated: ValidatedInput = await validateStepInput({ prevOutput: input, step, validateInputs: this.#o.validateInputs });
+    this.#validated.set(key, validated);
+    return validated;
+  }
+
+  /**
    * Each condition on its own, a throw or a rejection read as falsy — the default engine's
    * behaviour (`handlers/control-flow.ts:395-492`). `StepExecutor.evaluateConditions` catches only
    * a synchronous throw, so an async condition that rejects would reject the whole selection.
@@ -441,24 +596,55 @@ export class MastraStepRunner implements StepRunner {
    */
   async selectBranches(entryId: string, input: unknown, view: RunView): Promise<readonly number[]> {
     const entry = this.#top(view.path, 'conditional', entryId) as ConditionalEntry;
+    const index = view.path[0]!;
+    const spans = this.#o.spans;
+    // The conditional's span before any condition, one eval span per condition (`:378-412`).
+    spans?.conditional(index, entry, input);
     const verdicts = await Promise.all(
-      entry.conditions.map((condition) =>
-        this.#o.executor
-          .evaluateCondition({
-            workflowId: this.#o.workflowId,
-            condition: this.#condition(condition as Condition, false),
-            runId: this.#o.runId,
-            inputData: input,
-            stepResults: this.#stepResults(view),
-            state: this.#state,
-            requestContext: this.#o.requestContext,
-            abortController: this.#o.abortController,
-            iterationCount: 0,
-          })
-          .then(Boolean, () => false),
-      ),
+      entry.conditions.map(async (condition, i) => {
+        const evalSpan = await spans?.conditionEval(index, i, input);
+        try {
+          const selected = Boolean(
+            await this.#o.executor.evaluateCondition({
+              workflowId: this.#o.workflowId,
+              condition: this.#condition(condition as Condition, false, {
+                ...(this.#o.actor === undefined ? {} : { actor: this.#o.actor }),
+                ...createObservabilityContext({ currentSpan: evalSpan }),
+              }),
+              runId: this.#o.runId,
+              inputData: input,
+              stepResults: this.#stepResults(view),
+              state: this.#state,
+              requestContext: this.#o.requestContext,
+              abortController: this.#o.abortController,
+              iterationCount: 0,
+            }),
+          );
+          await spans?.conditionEvaluated(evalSpan, index, i, selected);
+          return selected;
+        } catch (e) {
+          // `handlers/control-flow.ts:465-492`: tracked, logged, the eval span errored, read as falsy.
+          const errorInstance = getErrorFromUnknown(e, { serializeStack: false });
+          const mastraError = new MastraError(
+            {
+              id: 'WORKFLOW_CONDITION_EVALUATION_FAILED',
+              domain: ErrorDomain.MASTRA_WORKFLOW,
+              category: ErrorCategory.USER,
+              details: { workflowId: this.#o.workflowId, runId: this.#o.runId },
+            },
+            errorInstance,
+          );
+          const logger = this.#o.logger?.();
+          logger?.trackException(mastraError);
+          logger?.error('Error evaluating condition: ' + errorInstance.stack);
+          await spans?.conditionFailed(evalSpan, index, i, mastraError);
+          return false;
+        }
+      }),
     );
-    return verdicts.flatMap((v, i) => (v ? [i] : []));
+    const truthy = verdicts.flatMap((v, i) => (v ? [i] : []));
+    await spans?.selected(index, entry, truthy);
+    return truthy;
   }
 
   /**
@@ -469,19 +655,25 @@ export class MastraStepRunner implements StepRunner {
    */
   async evaluateLoopCondition(entryId: string, output: unknown, iteration: number, view: RunView): Promise<boolean> {
     const entry = this.#top(view.path, 'loop', entryId) as LoopEntry;
-    return Boolean(
-      await this.#o.executor.evaluateCondition({
-        workflowId: this.#o.workflowId,
-        condition: this.#condition(entry.condition as Condition, true),
-        runId: this.#o.runId,
-        inputData: output,
-        stepResults: this.#stepResults(view),
-        state: this.#state,
-        requestContext: this.#o.requestContext,
-        abortController: this.#o.abortController,
-        iterationCount: iteration,
+    const index = view.path[0]!;
+    // The condition's eval span under the loop's (`:820-833`), ended with the verdict as returned.
+    const evalSpan = await this.#o.spans?.loopEval(index, entry, iteration, output);
+    const verdict: unknown = await this.#o.executor.evaluateCondition({
+      workflowId: this.#o.workflowId,
+      condition: this.#condition(entry.condition as Condition, true, {
+        ...(this.#o.actor === undefined ? {} : { actor: this.#o.actor }),
+        ...createObservabilityContext({ currentSpan: evalSpan }),
       }),
-    );
+      runId: this.#o.runId,
+      inputData: output,
+      stepResults: this.#stepResults(view),
+      state: this.#state,
+      requestContext: this.#o.requestContext,
+      abortController: this.#o.abortController,
+      iterationCount: iteration,
+    });
+    await this.#o.spans?.loopVerdict(index, entry, evalSpan, verdict, iteration, output);
+    return Boolean(verdict);
   }
 
   /**
@@ -507,7 +699,7 @@ export class MastraStepRunner implements StepRunner {
     let captured: { readonly value: unknown } | { readonly error: unknown } | undefined;
     const capture = (fn: (ctx: Context) => unknown) => async (ctx: Context): Promise<Date> => {
       try {
-        captured = { value: await fn(this.#sideContext(ctx, { retryCount: -1, suspend: async () => {} }, true)) };
+        captured = { value: await fn(this.#sideContext(ctx, { retryCount: -1, suspend: async () => {} }, true, top?.type === 'sleepUntil' ? 'sleepUntil' : 'sleep')) };
       } catch (error) {
         captured = { error };
       }
@@ -548,22 +740,29 @@ export class MastraStepRunner implements StepRunner {
 
   /**
    * A condition as the default engine calls it: `retryCount: -1`, a `bail` that does nothing,
-   * the registered `mastra` or none, and — for a branch — no `iterationCount`.
+   * the registered `mastra` or none, and — for a branch — no `iterationCount`. `extra` carries the
+   * run's `actor` and the eval span's tracing context (`handlers/control-flow.ts:414-424,836-846`).
    */
-  #condition(condition: Condition, loop: boolean): Condition {
+  #condition(condition: Condition, loop: boolean, extra: Context = {}): Condition {
     const wrapped = (ctx: Context): Promise<boolean> =>
-      (condition as unknown as (c: Context) => Promise<boolean>)(this.#sideContext(ctx, { retryCount: -1 }, loop));
+      (condition as unknown as (c: Context) => Promise<boolean>)(this.#sideContext(ctx, { retryCount: -1, ...extra }, loop, loop ? 'loop' : 'conditional'));
     return wrapped as unknown as Condition;
   }
 
-  /** The context of a condition or a sleep function, with the default engine's differences. */
-  #sideContext(ctx: Context, extra: Context, keepIterationCount: boolean): Context {
+  /**
+   * The context of a condition or a sleep function, with the default engine's differences — its
+   * writer among them: named `conditional`, `loop`, `sleep` or `sleepUntil`, over the run's output
+   * writer (`handlers/control-flow.ts:435-443,858-866`, `handlers/sleep.ts:110-118,244-252`), where
+   * the executor's is named `condition` and publishes whether or not anyone streams.
+   */
+  #sideContext(ctx: Context, extra: Context, keepIterationCount: boolean, writerName: string): Context {
     const { iterationCount, ...rest } = ctx;
     return {
       ...rest,
       ...(keepIterationCount && iterationCount !== undefined ? { iterationCount } : {}),
       mastra: this.#mastra,
       bail: () => {},
+      writer: new ToolStream({ prefix: 'workflow-step', callId: randomUUID(), name: writerName, runId: this.#o.runId }, this.#o.outputWriter),
       ...extra,
       ...(ctx['setState'] === undefined
         ? {}

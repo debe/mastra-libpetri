@@ -1,6 +1,6 @@
 import type { TransitionContext } from 'libpetri';
 import type { EntryPath } from './names.js';
-import type { RunView, StepRecord, StepRunner } from './types.js';
+import type { LifecycleEvent, RunView, StepRecord, StepRunner } from './types.js';
 
 /**
  * The key under which the kernel hands each firing its run scope, through libpetri's
@@ -37,6 +37,13 @@ export interface RunScope {
    * relative to enablement, so only a fixed `.sleep` is one.
    */
   wait(ms: number): Promise<void>;
+  /**
+   * Hands a lifecycle event to the runner's `observe` ([ADR 0008]). `undefined` when the runner has
+   * none, so an action awaits nothing and a run without an observer fires exactly as before. The
+   * promise never rejects: an observer's throw or rejection is kept for the run's report, never
+   * turned into a failed firing that would strand the tokens it consumed ([EXEC-031]).
+   */
+  observe(event: LifecycleEvent): Promise<void> | undefined;
 }
 
 /** The run scope of the firing in progress. Throws if the kernel did not supply one. */

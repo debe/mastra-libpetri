@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { createWorkflow } from '@mastra/core/workflows';
 import {
   compareObservations,
+  eventModel,
   formatDifferentialReport,
   formatVerdicts,
   peakInFlight,
@@ -114,6 +115,135 @@ describe('the budget binds where the corpus is wide', () => {
       // pre: 2; arms 2*1 .. 2*6 sum to 42.
       expect(o.kind === 'resolved' ? (o.result as { result?: unknown }).result : undefined).toEqual({ n: 42 });
     }
+  });
+});
+
+describe('the events dimension on real runs', () => {
+  const types = (o: Observation) => (o.events ?? []).map((e) => `${(e as { type: string }).type}:${(e as { payload?: { id?: string; stepName?: string } }).payload?.id ?? (e as { payload?: { stepName?: string } }).payload?.stepName ?? ''}`);
+  const lifecycle = (id: string) => [`workflow-step-start:${id}`, `workflow-step-result:${id}`, `workflow-step-finish:${id}`];
+
+  it('positive control: the oracle publishes each step lifecycle, and a candidate missing one fails', async () => {
+    const linear = FIXTURES.find((f) => f.name === 'linear')!;
+    const o = await observe(linear, 'default', linear.input);
+    const c = await observe(linear, 'petri', linear.input);
+    expect(types(o)).toEqual([...lifecycle('a'), ...lifecycle('b'), ...lifecycle('c')]);
+    const mutant = { ...c, events: (c.events ?? []).filter((e) => !((e as { type: string }).type === 'workflow-step-finish' && (e as { payload: { id: string } }).payload.id === 'b')) };
+    const v = compareObservations('linear', o, mutant, []);
+    expect(v.differences.map((d) => d.path)).toEqual(['events.b.length']);
+    expect(v.verdict).toBe('fail');
+  });
+
+  it('the stream fixture sees writer chunks, the custom chunk and the stream bracket; the watch fixture sees none of the chunks', async () => {
+    const streamed = FIXTURES.find((f) => f.name === 'writer-stream')!;
+    const o = await observe(streamed, 'default', streamed.input);
+    expect(types(o)).toEqual([
+      'workflow-start:',
+      'workflow-step-start:w',
+      'workflow-step-output:w',
+      'data-progress:',
+      'workflow-step-output:w',
+      'workflow-step-result:w',
+      'workflow-step-start:after',
+      'workflow-step-result:after',
+      'workflow-finish:',
+    ]);
+    const watched = FIXTURES.find((f) => f.name === 'writer')!;
+    expect(types(await observe(watched, 'default', watched.input))).toEqual([...lifecycle('w'), ...lifecycle('after')]);
+  });
+
+  type Ev = { type: string; payload: Record<string, unknown> };
+  const ev = (o: Observation) => (o.events ?? []) as Ev[];
+  const at = (xs: readonly Ev[], type: string, id: string) => xs.findIndex((e) => e.type === type && (e.payload['id'] ?? e.payload['stepName']) === id);
+  /** `xs` with the event at `from` moved to just before index `to` of the original list. */
+  const move = (xs: readonly Ev[], from: number, to: number): Ev[] => {
+    const out = xs.filter((_, i) => i !== from);
+    out.splice(to > from ? to - 1 : to, 0, xs[from]!);
+    return out;
+  };
+
+  it("positive control: a real candidate whose successor starts before its predecessor's result is an inversion across groups", async () => {
+    const linear = FIXTURES.find((f) => f.name === 'linear')!;
+    const o = await observe(linear, 'default', linear.input);
+    const c = await observe(linear, 'petri', linear.input);
+    expect(compareObservations('linear', o, c, []).verdict).toBe('pass');
+    const xs = ev(c);
+    const mutant = { ...c, events: move(xs, at(xs, 'workflow-step-start', 'b'), at(xs, 'workflow-step-result', 'a')) };
+    const v = compareObservations('linear', o, mutant, []);
+    expect(v.differences.map((d) => d.path)).toEqual(['events.$order.a#0.b#0']);
+    expect(v.verdict).toBe('fail');
+  });
+
+  it("positive control: a real writer chunk moved after its step's result is outside the step", async () => {
+    const streamed = FIXTURES.find((f) => f.name === 'writer-stream')!;
+    const o = await observe(streamed, 'default', streamed.input);
+    const c = await observe(streamed, 'petri', streamed.input);
+    expect(compareObservations('writer-stream', o, c, []).verdict).toBe('pass');
+    const xs = ev(c);
+    // The last chunk: the group's own order is unchanged, so only its place against the step shows.
+    const last = xs.map((e) => e.type === 'workflow-step-output' && e.payload['stepName'] === 'w').lastIndexOf(true);
+    const mutant = { ...c, events: move(xs, last, at(xs, 'workflow-step-result', 'w') + 1) };
+    const v = compareObservations('writer-stream', o, mutant, []);
+    expect(v.differences.map((d) => d.path)).toEqual(['events.$within.w@output#1']);
+    expect(v.verdict).toBe('fail');
+  });
+
+  it("positive control: a real nested child's events moved after the parent step's result are outside it", async () => {
+    const nested = FIXTURES.find((f) => f.name === 'nested-workflow')!;
+    const o = await observe(nested, 'default', nested.input);
+    const c = await observe(nested, 'petri', nested.input);
+    expect(compareObservations('nested-workflow', o, c, []).verdict).toBe('pass');
+    const children = [...eventModel(ev(c)).within.entries()].filter(([k]) => k.includes('/'));
+    expect(children.length).toBeGreaterThan(0);
+    const [key, { owner }] = children[0]!;
+    const xs = ev(c);
+    const prefix = `${owner}.`;
+    const child = xs.filter((e) => typeof e.payload['id'] === 'string' && (e.payload['id'] as string).startsWith(prefix));
+    const rest = xs.filter((e) => !child.includes(e));
+    const r = at(rest, 'workflow-step-result', owner);
+    const mutant = { ...c, events: [...rest.slice(0, r + 1), ...child, ...rest.slice(r + 1)] };
+    const v = compareObservations('nested-workflow', o, mutant, []);
+    expect(v.differences.map((d) => d.path)).toContain(`events.$within.${key}`);
+    expect(v.verdict).toBe('fail');
+  });
+
+  it('positive control: a real clock stamp or step call id the candidate drops, or a call id it does not correlate, fails', async () => {
+    const linear = FIXTURES.find((f) => f.name === 'linear')!;
+    const o = await observe(linear, 'default', linear.input);
+    const c = await observe(linear, 'petri', linear.input);
+    const xs = ev(c);
+    const without = (i: number, key: string) => xs.map((e, j) => (j === i ? { ...e, payload: Object.fromEntries(Object.entries(e.payload).filter(([k]) => k !== key)) } : e));
+    const start = at(xs, 'workflow-step-start', 'a');
+    const result = at(xs, 'workflow-step-result', 'a');
+    expect(compareObservations('linear', o, { ...c, events: without(start, 'startedAt') }, []).differences.map((d) => d.path)).toEqual(['events.a.0.payload.startedAt']);
+    expect(compareObservations('linear', o, { ...c, events: without(result, 'stepCallId') }, []).differences.map((d) => d.path)).toEqual(['events.a.1.payload.stepCallId']);
+    const recalled = xs.map((e, j) => (j === result ? { ...e, payload: { ...e.payload, stepCallId: '00000000-0000-4000-8000-000000000000' } } : e));
+    const v = compareObservations('linear', o, { ...c, events: recalled }, []);
+    expect(v.differences.map((d) => d.path)).toEqual(['events.a.1.payload.stepCallId', 'events.$calls.a#0']);
+    expect(v.verdict).toBe('fail');
+  });
+
+  it('the corpus cannot be switched to reporting event differences: toCase takes no mode and reads no environment', async () => {
+    const prior = process.env['DIFFERENTIAL_EVENTS'];
+    process.env['DIFFERENTIAL_EVENTS'] = 'report';
+    try {
+      const linear = FIXTURES.find((f) => f.name === 'linear')!;
+      const kase = toCase(linear);
+      expect('events' in kase).toBe(false);
+      const o = await kase.run('default', kase.input);
+      const c = await kase.run('petri', kase.input);
+      const mutant = { ...c, events: ev(c).filter((e) => !(e.type === 'workflow-step-finish' && e.payload['id'] === 'b')) };
+      expect(compareObservations(kase.name, o, mutant, []).verdict).toBe('fail');
+    } finally {
+      if (prior === undefined) delete process.env['DIFFERENTIAL_EVENTS'];
+      else process.env['DIFFERENTIAL_EVENTS'] = prior;
+    }
+  });
+
+  it('emitStepEvents: false silences the oracle, so the fixture pins that the candidate is silent too', async () => {
+    const off = FIXTURES.find((f) => f.name === 'emit-step-events-off')!;
+    const o = await observe(off, 'default', off.input);
+    expect(o.kind).toBe('resolved');
+    expect(o.events).toEqual([]);
   });
 });
 
@@ -238,6 +368,18 @@ describe('the harness itself', () => {
       const v = compareObservations('x', ora(a), cand(c), []);
       expect(v.verdict).toBe('fail');
       expect(v.differences.map((d) => d.path)).toEqual(['result.steps.s.output']);
+    });
+
+    it("a step record's clock stamps are masked, not dropped: present on one side only is a difference", () => {
+      const a = { status: 'success', steps: { s: { status: 'success', output: 1, startedAt: 1, endedAt: 2 } } };
+      const b = { status: 'success', steps: { s: { status: 'success', output: 1, startedAt: 7 } } };
+      const v = compareObservations('x', ora(a), cand(b), []);
+      expect(v.differences).toEqual([{ path: 'result.steps.s.endedAt', oracle: '<clock:number>', candidate: '<absent>' }]);
+      expect(v.verdict).toBe('fail');
+      const suspended = (extra: Record<string, unknown>) => ({ status: 'suspended', steps: { g: { status: 'suspended', startedAt: 1, ...extra } } });
+      expect(compareObservations('x', ora(suspended({ suspendedAt: 3 })), cand(suspended({ suspendedAt: '3' })), []).differences.map((d) => [d.path, d.candidate])).toEqual([
+        ['result.steps.g.suspendedAt', '<clock:string>'],
+      ]);
     });
 
     it('the same keys inside user data are compared', () => {

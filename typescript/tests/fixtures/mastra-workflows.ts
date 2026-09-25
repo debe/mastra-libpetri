@@ -9,6 +9,13 @@
  * Every observation also records which engine's `execute()` ran it: both engines' prototypes are
  * wrapped for the duration of one observation (observations never overlap), so a nested workflow
  * shows up as a second call, on whichever engine actually ran it.
+ *
+ * And every event the run publishes: `run.watch()` is subscribed after `createRun()` and before
+ * `start()` / `resume()`, and unsubscribed a macrotask after the run settles, so an event published
+ * with `void publish(...)` (a writer chunk on a stream, `workflow.ts:4135-4141`) is still caught. A
+ * fixture observed `via: 'stream'` runs through `run.stream()` instead and records the chunks of its
+ * `fullStream` — what a streaming caller sees, the stream's own `workflow-start` / `workflow-finish`
+ * included (`stream/RunOutput.ts:69-150`).
  */
 import { z } from 'zod';
 import { createStep, createWorkflow, DefaultExecutionEngine } from '@mastra/core/workflows';
@@ -41,6 +48,38 @@ export const ITERATION_BOUND = 20;
 interface StartedRun {
   start(args: Record<string, unknown>): Promise<unknown>;
   cancel(): Promise<void>;
+  /** `Run.watch` (`workflow.ts:4298-4362`): every event on the run's topic, nested runs' relayed. */
+  watch(cb: (event: unknown) => void): () => void;
+}
+
+/** `Run.stream` (`workflow.ts:4039-4180`), read structurally: the chunks, then the result. */
+interface StreamingRun {
+  stream(args: Record<string, unknown>): { readonly fullStream: ReadableStream<unknown>; readonly result: Promise<unknown> };
+}
+
+/** Subscribes to the run's events; the returned function waits a macrotask, unsubscribes and returns what arrived. */
+function watchEvents(run: StartedRun): () => Promise<unknown[]> {
+  const events: unknown[] = [];
+  const unwatch = run.watch((event) => {
+    events.push(event);
+  });
+  return async () => {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    unwatch();
+    return [...events];
+  };
+}
+
+/** Runs through `run.stream()`: drains `fullStream` to its end, then awaits the result. */
+async function streamRun(run: StartedRun, args: Record<string, unknown>, sink: unknown[]): Promise<unknown> {
+  const output = (run as unknown as StreamingRun).stream({ ...args, closeOnSuspend: true });
+  const reader = output.fullStream.getReader();
+  for (;;) {
+    const next = await reader.read();
+    if (next.done) break;
+    sink.push(next.value);
+  }
+  return output.result;
 }
 
 /** Collects step boundaries in the order step code crossed them, and lets step code cancel its run. */
@@ -129,6 +168,11 @@ export interface MastraFixture {
    * stops showing one is a stale attribution.
    */
   readonly boundDivergences?: readonly Attribution[];
+  /**
+   * How the run is observed: `watch` (the default) runs `start()` and records `run.watch()`;
+   * `stream` runs `run.stream()` and records its `fullStream` chunks.
+   */
+  readonly via?: 'watch' | 'stream';
 }
 
 /** The fixture's width: 1 unless it declares one. */
@@ -167,19 +211,29 @@ export async function observe(fixture: MastraFixture, engine: EngineName, input:
     probeExecute(PetriExecutionEngine.prototype, 'petri', executions),
     probeExecute(DefaultExecutionEngine.prototype, 'default', executions),
   ];
+  const streamed: unknown[] = [];
+  let collect: (() => Promise<unknown[]>) | undefined;
+  const events = async () => (collect === undefined ? [...streamed] : [...streamed, ...(await collect())]);
   try {
     const wf = fixture.build(engineConfig(engine, concurrency), rec);
     const run = await wf.createRun();
     rec.bind(run);
-    const result = await run.start({
+    const args = {
       inputData: input,
       outputOptions: { includeState: true },
       // A structured clone per engine: the default engine merges state into the object it is handed.
       ...(fixture.initialState === undefined ? {} : { initialState: structuredClone(fixture.initialState) }),
-    });
-    return { kind: 'resolved', result, trace: [...rec.events], executions: [...executions] };
+    };
+    let result: unknown;
+    if (fixture.via === 'stream') {
+      result = await streamRun(run, args, streamed);
+    } else {
+      collect = watchEvents(run);
+      result = await run.start(args);
+    }
+    return { kind: 'resolved', result, trace: [...rec.events], executions: [...executions], events: await events() };
   } catch (error) {
-    return { kind: 'rejected', error, trace: [...rec.events], executions: [...executions] };
+    return { kind: 'rejected', error, trace: [...rec.events], executions: [...executions], events: await events() };
   } finally {
     for (const u of undo.reverse()) u();
   }
@@ -442,7 +496,8 @@ export const FIXTURES: readonly MastraFixture[] = [
     boundDivergences: [
       {
         row: 71,
-        paths: ['result.result', 'result.state.seen.**', 'result.steps.s2.output'],
+        // The step's result event carries the same output (handlers/step.ts:661-690).
+        paths: ['result.result', 'result.state.seen.**', 'result.steps.s2.output', 'events.s2.*.payload.output'],
         reason:
           "overlapping arms that read-modify-write workflow state lose an update in Mastra (each arm's state is the context's at its start, handlers/control-flow.ts:249); serialised by a budget, neither is lost",
       },
@@ -836,8 +891,12 @@ export const FIXTURES: readonly MastraFixture[] = [
     // Row 49: the abort lands inside Mastra's empty foreach — after the entry's abort check, before
     // its final one (`handlers/control-flow.ts:1291-1306`) — so Mastra records `canceled []`. With
     // no item there is no await to land in, only microtasks: the window is depths 25-26 after the
-    // preceding step returns, measured on the pinned @mastra/core. The petri run has finished by
-    // then (row 52), so it records `success []` and the run succeeds.
+    // preceding step returns, measured on the pinned @mastra/core. Through M4, and again since the
+    // M5 publish fix, the petri foreach has completed before the abort lands, so it records
+    // `success []` and publishes its -result and -finish; the abort still reaches the petri run
+    // before its terminal, so the run is `canceled` on both engines and row 52 (the run succeeding)
+    // does not apply at the time of writing. A microtask-depth fixture: which side of the window
+    // each engine lands on is not by construction.
     build: (cfg, rec) =>
       wf('foreach-empty-cancel-inside', cfg)
         .then(emptyItems(rec, () => afterMicrotasks(INSIDE_EMPTY_FOREACH, () => void rec.cancel())))
@@ -846,19 +905,104 @@ export const FIXTURES: readonly MastraFixture[] = [
     divergences: [
       {
         row: 49,
-        paths: ['result.steps.item.status'],
+        paths: ['result.steps.item.status', 'events.item.length'],
         reason:
-          "a cancel inside an empty foreach: Mastra's final abort check records canceled [] (handlers/control-flow.ts:1291-1306); the petri foreach completes with no await to land in, so success []",
-      },
-      {
-        row: 52,
-        paths: ['result.status', 'result.result'],
-        reason:
-          'the abort arrives 26 microtasks after the step returns: still inside the run on Mastra, which has several awaits per entry; after the petri run has already succeeded',
+          "a cancel inside an empty foreach: Mastra's final abort check records canceled [] (handlers/control-flow.ts:1291-1306) and publishes nothing after the foreach's -start (the -result/-finish at :1331-1351 are past that return); the petri foreach completes with no await to land in, so success [] with its -result and -finish",
       },
     ],
   },
+  {
+    name: 'sleep-until',
+    expected: 'success',
+    input: { n: 4 },
+    // A `.sleepUntil()` with a date fn: its own `-waiting` / `-result` / `-finish` events
+    // (handlers/entry.ts:695-800), beside the fixed and fn `.sleep()`s above.
+    build: (cfg, rec) =>
+      wf('sleep-until', cfg)
+        .then(nStep(rec, 'a', (n) => n + 1))
+        .sleepUntil(async ({ inputData }) => new Date(Date.now() + (inputData as N).n))
+        .then(nStep(rec, 'b', (n) => n * 2))
+        .commit(),
+  },
+  {
+    name: 'emit-step-events-off',
+    width: 2,
+    expected: 'success',
+    input: { n: 2 },
+    // `createWorkflow({ options: { emitStepEvents: false } })`: Mastra publishes no step, sleep or
+    // foreach event (handlers/step.ts:104, handlers/entry.ts:28, handlers/control-flow.ts:47), so
+    // the oracle's watch sees nothing. The petri engine is handed the workflow's options as `init()`
+    // hands them (src/mastra/init.ts:232-234); a workflow built with `executionEngine` never passes
+    // them itself (workflow.ts:1819-1827).
+    build: (cfg, rec) =>
+      withWorkflowOptions(
+        cfg,
+        wf('emit-step-events-off', cfg, { options: { emitStepEvents: false } })
+          .then(nStep(rec, 'a', (n) => n + 1))
+          .sleep(1)
+          .then(
+            createStep({
+              id: 'explode',
+              inputSchema: N,
+              outputSchema: z.array(N),
+              execute: async ({ inputData }) => rec.around('explode', () => Array.from({ length: inputData.n }, (_, i) => ({ n: i + 1 }))),
+            }),
+          )
+          .foreach(echoItem(rec), { concurrency: 2 })
+          .commit(),
+      ),
+  },
+  {
+    name: 'writer',
+    expected: 'success',
+    input: { n: 1 },
+    // `writer.write()` and `writer.custom()` under `start()`: the default engine's outputWriter is
+    // unset there (workflow.ts:3781-3797), so its watch sees neither chunk, only the lifecycle. A
+    // candidate that publishes them anyway (row 58) shows as `events.w@output` / `events.$data-progress`.
+    build: (cfg, rec) => writerWorkflow('writer', cfg, rec),
+  },
+  {
+    name: 'writer-stream',
+    expected: 'success',
+    input: { n: 1 },
+    via: 'stream',
+    // The same workflow observed through `run.stream()`: writer chunks, the custom `data-*` chunk,
+    // the step events as the stream re-shapes them (workflow.ts:4083-4105; `-finish` dropped,
+    // stream/RunOutput.ts:84), and the stream's own start and finish.
+    build: (cfg, rec) => writerWorkflow('writer-stream', cfg, rec),
+  },
 ];
+
+/**
+ * Hands the petri engine the workflow's normalised options, as `init()` does
+ * (src/mastra/init.ts:232-234): a workflow built with an `executionEngine` keeps its options to
+ * itself (workflow.ts:1805-1827). The default engine is built by the workflow with them already.
+ */
+function withWorkflowOptions<W extends { readonly options: unknown }>(cfg: EngineConfig, workflow: W): W {
+  if ('executionEngine' in cfg) (cfg.executionEngine as { options: unknown }).options = workflow.options;
+  return workflow;
+}
+
+/** `w` writes two chunks and a custom `data-progress` chunk, then `after` runs. */
+function writerWorkflow(id: string, cfg: EngineConfig, rec: Recorder) {
+  return wf(id, cfg)
+    .then(
+      createStep({
+        id: 'w',
+        inputSchema: N,
+        outputSchema: N,
+        execute: async ({ inputData, writer }) =>
+          rec.around('w', async () => {
+            await writer.write({ progress: inputData.n });
+            await writer.custom({ type: 'data-progress', data: { n: inputData.n } });
+            await writer.write({ progress: inputData.n + 1 });
+            return { n: inputData.n + 1 };
+          }),
+      }),
+    )
+    .then(nStep(rec, 'after', (n) => n * 2))
+    .commit();
+}
 
 
 /**
@@ -947,9 +1091,10 @@ function foreachFixtures(concurrency: number, count = 3): MastraFixture[] {
             boundDivergences: [
               {
                 row: 70,
-                paths: ['trace.*', 'result.steps.item.suspendPayload.__workflow_meta.foreachOutput.**'],
+                // An item never dispatched publishes no progress event either (handlers/control-flow.ts:1117-1147).
+                paths: ['trace.*', 'result.steps.item.suspendPayload.__workflow_meta.foreachOutput.**', ...labels.map((_, i) => `events.item[${i}]`)],
                 reason:
-                  "a budget below the foreach concurrency changes which items were dispatched when the failing item stopped dispatch (handlers/control-flow.ts:1082-1107), and so which items the failed aggregate's foreachOutput lists; the run result is the same",
+                  "a budget below the foreach concurrency changes which items were dispatched when the failing item stopped dispatch (handlers/control-flow.ts:1082-1107), and so which items the failed aggregate's foreachOutput lists and which publish progress; the run result is the same",
               },
             ],
           }
@@ -1071,10 +1216,12 @@ export async function observeResume(fixture: ResumeFixture, route: ResumeRoute, 
       probeExecute(DefaultExecutionEngine.prototype, 'default', executions),
     ];
     let outcome: PhaseObservation['outcome'];
+    let collect: (() => Promise<unknown[]>) | undefined;
     try {
       const wf = same ? (shared ??= register(storage, fixture.build(engineConfig(engine, concurrency), rec))) : register(storage, fixture.build(engineConfig(engine, concurrency), rec));
       const run = await wf.createRun({ runId });
       rec.bind(run);
+      collect = watchEvents(run);
       const call = fixture.resumes[i - 1];
       const result =
         call === undefined
@@ -1092,7 +1239,8 @@ export async function observeResume(fixture: ResumeFixture, route: ResumeRoute, 
     } finally {
       for (const u of undo.reverse()) u();
     }
-    phases.push({ outcome, stored: await storedRuns(storage), trace: rec.events.slice(from), executions });
+    const events = collect === undefined ? [] : await collect();
+    phases.push({ outcome, stored: await storedRuns(storage), trace: rec.events.slice(from), executions, events });
   }
   return { phases };
 }
@@ -1484,6 +1632,9 @@ export const RESUME_FIXTURES: readonly ResumeFixture[] = [
           'phases.1.stored.rs-same-id.0.stepExecutionPath.length',
           'phases.1.stored.rs-same-id.0.tracingContext',
           'phases.1.stored.rs-same-id.0.context.g.**',
+          // The same two entries in the phase's events: the later 'g' starts on its own input and
+          // suspends, where Mastra's starts on the stale input and succeeds (handlers/step.ts:166-178,661-690).
+          'phases.1.events.g.**',
         ],
         reason:
           'a later entry of the resumed step id: Mastra feeds it the resume data and its stale stored input and skips its stepExecutionPath push (entry.ts:306-316, step.ts:140-142); resume data here goes to the resumed position only, so the later entry suspends',

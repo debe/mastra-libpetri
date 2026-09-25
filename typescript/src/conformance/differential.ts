@@ -1,6 +1,6 @@
 /**
  * The differential harness: one fixture, run on Mastra's `DefaultExecutionEngine` (the oracle) and
- * on `PetriExecutionEngine` (the candidate) in one process, compared four ways.
+ * on `PetriExecutionEngine` (the candidate) in one process, compared five ways.
  *
  * 0. **Engine identity — the gate, never attributable.** Each observation carries the
  *    `execute()` calls every engine received while it ran, nested workflows included. The oracle
@@ -11,9 +11,11 @@
  *    tripwire, every step record (status, output, payload, suspendPayload, error …), the workflow
  *    state, the execution path, and a rejected `start()` when there is one. Excluded, and nothing
  *    else:
- *    - the paths in {@link EXCLUDED_PATHS} — timestamps and run/trace/span ids, **at the positions
- *      where Mastra writes them** (the result's top level, a step record's top level, a suspend
- *      stamp). The same key inside user data — an output, a payload, the state — is compared.
+ *    - the paths in {@link EXCLUDED_PATHS} — run/trace/span ids, **at the positions where Mastra
+ *      writes them** (the result's top level, a suspend stamp) — and the *values* of its clock
+ *      stamps (a step record's `startedAt`, `endedAt`, …): those are masked, their presence and kind
+ *      still compared, so a stamp one engine writes and the other omits is a difference. The same
+ *      key inside user data — an output, a payload, the state — is compared.
  *    - UUIDs inside strings and keys, replaced by an ordinal placeholder per observation (`<uuid#0>`,
  *      `<uuid#1>`, … in first-seen order). Mastra mints `sleep_<uuid>` step ids per build, and each
  *      engine needs its own build; the ordinal keeps two distinct UUIDs distinct, so two sleeps'
@@ -36,6 +38,18 @@
  *    steps it may have in flight at once. The peak is read off each side's trace (open spans at
  *    once); a candidate peak above k fails the fixture, and no attribution can rescue it. Each
  *    side's wall time is measured too — reported, never gated.
+ * 5. **Events — the gate.** Everything the run's `watch()` delivered (or its `stream()` enqueued),
+ *    grouped by step ({@link eventGroup}) and compared group by group, in order within a group
+ *    (`events.<group>.<n>.<…>`). Across groups, which is not a total order (`docs/divergences.md`
+ *    row 4), as happens-before over spans ({@link eventModel}): an oracle order between two steps,
+ *    or between a step and a run-level event, the candidate reverses or inverts
+ *    (`events.$order.<a>.<b>`, weakened only on a declared independent pair); a progress event,
+ *    writer chunk or nested step outside its owner step's span (`events.$within.<key>`); a step
+ *    occurrence whose events carry more than one call id on one side only (`events.$calls.<key>`).
+ *    Excluded: run ids ({@link EVENT_EXCLUDED_PATHS}), and UUIDs as ordinals, continuing the
+ *    result's numbering. Clock stamps are masked — presence compared, value not
+ *    ({@link EVENT_MASKED_PATHS}); step call ids are numbered per group. Attributable like any
+ *    other path, and always gated: no option or environment variable turns the dimension off.
  *
  * A difference is `divergent` only when an {@link Attribution} naming a `docs/divergences.md` row
  * covers its path; an unattributed difference makes the fixture `fail`.
@@ -74,12 +88,15 @@ export type Observation =
       readonly result: unknown;
       readonly trace: readonly TraceEvent[];
       readonly executions: readonly Execution[];
+      /** Every event the run's `watch()` (or `stream()`) delivered, in arrival order; absent, not observed. */
+      readonly events?: readonly unknown[];
     }
   | {
       readonly kind: 'rejected';
       readonly error: unknown;
       readonly trace: readonly TraceEvent[];
       readonly executions: readonly Execution[];
+      readonly events?: readonly unknown[];
     };
 
 /**
@@ -88,7 +105,8 @@ export type Observation =
  * a trailing `**` any rest (including none).
  *
  * Paths: `kind` (resolved on one engine, rejected on the other), `result.<…>` (the formatted
- * result), `error.<…>` (a rejection), `trace.<label>` (a step that ran on one engine only),
+ * result), `error.<…>` (a rejection), `events.<group>…` (the watch events, see {@link groupEvents}),
+ * `trace.<label>` (a step that ran on one engine only),
  * `order.<a>.<b>` (an oracle ordering the candidate reversed or inverted). A trace label may not
  * contain a dot. Engine identity is never attributable.
  *
@@ -158,6 +176,11 @@ export interface OrderingReport {
   readonly reversed: readonly (readonly [string, string])[];
   /** Candidate orderings the oracle does not have, and whose reverse it does not have either. */
   readonly strengthened: readonly (readonly [string, string])[];
+  /**
+   * Oracle event orderings (`a -> b` over {@link eventModel}'s spans) the candidate lacks, on a pair
+   * declared independent: reported, not gated. Prefixed with the phase (`phases.<i>.`) on a resume.
+   */
+  readonly eventsWeakened?: readonly (readonly [string, string])[];
 }
 
 export type VerdictKind = 'pass' | 'divergent' | 'fail';
@@ -177,7 +200,7 @@ export interface Verdict {
     readonly oracle: Readonly<Record<EngineName, number>>;
     readonly candidate: Readonly<Record<EngineName, number>>;
   };
-  /** Every gated difference, attributed or not. */
+  /** Every difference, attributed or not, event differences included: all gated. */
   readonly differences: readonly Difference[];
   readonly ordering: OrderingReport;
   /**
@@ -192,7 +215,9 @@ export interface Verdict {
 
 /**
  * The only positions excluded from comparison: timestamps and run/trace/span ids where Mastra
- * writes them. Patterns as {@link matches}, over the normalised path.
+ * writes them. Patterns as {@link matches}, over the normalised path. The comparisons mask the
+ * clock-stamp positions among them rather than drop them ({@link clockMasked}): value hidden,
+ * presence and kind compared. {@link normalise} on its own still drops every listed path.
  *
  * - `result.runId` — spread into every result (`default.ts:1050-1058`); `traceId`/`spanId` beside
  *   it when tracing is on.
@@ -208,8 +233,454 @@ export const EXCLUDED_PATHS: readonly string[] = [
   'result.steps.*.suspendPayload.__workflow_meta.runId',
 ];
 
+/**
+ * An exclusion list split for {@link normalise}: its clock-stamp positions (a last segment in
+ * {@link CLOCK}) masked — value dropped, presence and kind compared — and the rest excluded.
+ */
+function clockMasked(paths: readonly string[]): [excluded: string[], masked: string[]] {
+  const isClock = (p: string) => (CLOCK as readonly string[]).includes(p.slice(p.lastIndexOf('.') + 1));
+  return [paths.filter((p) => !isClock(p)), paths.filter(isClock)];
+}
+
 /** A UUID inside a string — minted per build or per run, so an id. */
 export const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
+// ---------------------------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------------------------
+
+const CLOCK = ['startedAt', 'endedAt', 'suspendedAt', 'resumedAt', 'pausedAt'] as const;
+
+/**
+ * The positions an event comparison excludes, over `events.<group>.<n>.<…>` — each event as
+ * `run.watch()` hands it (`workflow.ts:4323-4327`: the published `data`), or as `run.stream()`
+ * enqueues it. Run ids, where Mastra writes them, and nothing else: the same key inside an output,
+ * a payload or a writer chunk's `output` is compared.
+ *
+ * - `runId` on the chunk — a writer chunk's (`tools/stream.ts:47-50`), every `run.stream()` chunk
+ *   (`workflow.ts:4088-4105`), and the stream's own `workflow-start` / `workflow-finish`
+ *   (`stream/RunOutput.ts:72-79,125-128`).
+ * - `payload.runId` — a writer chunk's (`tools/stream.ts:52-56`); the legacy stream's
+ *   `workflow-start` / `workflow-finish` (`workflow.ts:3938,3957`).
+ * - `payload.suspendPayload.__workflow_meta.runId` — a suspended nested workflow's stamp, the
+ *   child's run id (`workflow.ts:3076-3084`), carried by the parent step's `-suspended`; excluded on a fresh run as {@link EXCLUDED_PATHS} excludes it in
+ *   the result. {@link RESUME_EVENT_EXCLUDED_PATHS} compares it, as {@link RESUME_EXCLUDED_PATHS} does.
+ *
+ * Clock stamps are not excluded but masked ({@link EVENT_MASKED_PATHS}): their value is dropped,
+ * their presence and kind compared. A step call id is neither: {@link groupEvents} numbers it.
+ */
+export const EVENT_EXCLUDED_PATHS: readonly string[] = [
+  'events.*.*.runId',
+  'events.*.*.payload.runId',
+  'events.*.*.payload.suspendPayload.__workflow_meta.runId',
+];
+
+/** {@link EVENT_EXCLUDED_PATHS} on a suspend-then-resume phase: the suspend stamp's run id is compared. */
+export const RESUME_EVENT_EXCLUDED_PATHS: readonly string[] = EVENT_EXCLUDED_PATHS.filter((p) => !p.endsWith('.__workflow_meta.runId'));
+
+/**
+ * The positions whose value an event comparison masks and whose presence it compares, over
+ * `events.<group>.<n>.<…>`: the clock stamps `{startedAt,endedAt,suspendedAt,resumedAt,pausedAt}`
+ * where Mastra writes them. A masked value is its kind (`<clock:number>`), so a stamp one engine
+ * writes and the other omits, or writes as another kind, is a difference.
+ *
+ * - `payload.<clock>` — a step's `-start` spreads its running record (`default.ts:226-233`, the
+ *   record at `handlers/step.ts:169-178`), its `-result` / `-suspended` the final one
+ *   (`handlers/step.ts:515-545`, emitted at `:661-690`); a sleep's `-waiting` and `-result`
+ *   (`handlers/entry.ts:588-601,669-680`, the `sleepUntil` twins at `:700-712,781-792`); a
+ *   foreach's `-start`, `-result` and `-suspended` (`handlers/control-flow.ts:1015-1024,1331-1341,1420-1430,1454-1465`).
+ * - `payload.suspendPayload.__workflow_meta.foreachOutput.*.<clock>` — a suspended or failed
+ *   foreach's per-item entries (`handlers/control-flow.ts:1194-1198,1360-1370`).
+ */
+export const EVENT_MASKED_PATHS: readonly string[] = [
+  ...CLOCK.map((k) => `events.*.*.payload.${k}`),
+  ...CLOCK.map((k) => `events.*.*.payload.suspendPayload.__workflow_meta.foreachOutput.*.${k}`),
+];
+
+/** The group of events whose step has no id: run-level events (`workflow-paused`, `workflow-canceled`, a stream's start and finish). */
+export const RUN_EVENTS = '$run';
+
+/**
+ * Which group an event belongs to — the unit whose order is compared event by event. Order *within*
+ * a group is deterministic in Mastra (one step's start precedes its result, which precedes its
+ * finish; a foreach's progress events follow its start); order *across* groups is not a total order
+ * (`docs/divergences.md` row 4: independent steps interleave), so it is compared as happens-before
+ * over spans instead ({@link eventModel}).
+ *
+ * - `payload.id` — every step, sleep and foreach event (`default.ts:229`, `handlers/step.ts:663`,
+ *   `handlers/entry.ts:597`, `handlers/control-flow.ts:1021,1076`). A nested workflow's events
+ *   reach the parent's watch with the id prefixed `<workflowId>.<id>` (`workflow.ts:4330-4346`), so
+ *   they form their own group beside the nested step's own (`<workflowId>`).
+ * - `<stepName>@output` — a writer chunk, `workflow-step-output` (`tools/stream.ts:46-58`), in a
+ *   group of its own per writing step: ordered against the step's other chunks, not against its
+ *   lifecycle. Where a chunk goes depends on how the run is observed — the default engine drops it
+ *   under `start()`, whose `outputWriter` is unset (`workflow.ts:3781-3797` against `:4135`), and
+ *   the petri engine publishes it (`docs/divergences.md` row 58) — so a separate group keeps the
+ *   step's lifecycle comparable on its own, and lets a routing difference be attributed without
+ *   masking one in the lifecycle. A nested step's chunk is not prefixed (the relay prefixes
+ *   `payload.id` only, `workflow.ts:4340-4346`), so it groups under the bare step id.
+ * - `$<type>` for a custom `data-*` chunk (`tools/stream.ts:68-72`, relayed as is,
+ *   `workflow.ts:4330-4337`): it carries no step, so each type is its own ordered group.
+ * - {@link RUN_EVENTS} for anything else.
+ *
+ * A foreach's progress events (`workflow-step-progress`, `handlers/control-flow.ts:1064-1084`)
+ * are grouped per item by {@link groupEvents}, not here: `<id>[<currentIndex>]`. Mastra emits them
+ * as items complete (`:1117-1147`), so their order across items is completion order — order across
+ * independent steps (row 4), which a sliding window of lanes or a run budget changes. Each item's
+ * own progress is deterministic, but its `completedCount` is not: it is the running count of
+ * items that finished before it, suspended ones not counted (`:1119-1135,1146`), so it is the
+ * item's rank in that same order. {@link groupEvents} therefore replaces it with the item's own
+ * contribution, `$completedIncrement` — its count minus the count on the foreach's previous
+ * progress event since its last `workflow-step-start` (1 for a finished item, 0 for a suspended
+ * one) — which is order-free and still catches a counter that skips, repeats or never moves.
+ *
+ * A group name is one path segment: a `.` in it (a nested prefix) is written `/`, so `inner.i1`'s
+ * events are at `events.inner/i1.<n>`. UUIDs in it become ordinals like any other string.
+ */
+export function eventGroup(event: unknown): string {
+  const payload = isRecord(event) ? event['payload'] : undefined;
+  const id = isRecord(payload) ? payload['id'] : undefined;
+  if (typeof id === 'string') return id;
+  const type = isRecord(event) ? event['type'] : undefined;
+  const stepName = isRecord(payload) ? payload['stepName'] : undefined;
+  if (typeof stepName === 'string') return `${stepName}@output`;
+  if (typeof type === 'string' && type.startsWith('data-')) return `$${type}`;
+  return RUN_EVENTS;
+}
+
+/**
+ * One side's events, grouped by {@link eventGroup} and normalised (as {@link normalise}, at
+ * `events.<group>.<n>`, under `excluded`, clock stamps masked by {@link EVENT_MASKED_PATHS}): each
+ * group's events in arrival order, groups keyed by name. `uuids` continues the side's ordinals, so
+ * pass the map its result was normalised with.
+ *
+ * A step call id (`payload.stepCallId`: a `randomUUID()` per call, `default.ts:226-233`,
+ * `handlers/step.ts:660-690`) becomes `<call#k>`, `k` its first-seen rank among the call ids of its
+ * group: its presence is compared (a foreach's `-start` has none in Mastra,
+ * `handlers/control-flow.ts:1015-1024`), and so is which events share a call — a `-result` whose id
+ * is not its `-start`'s reads `<call#1>` where Mastra has `<call#0>`. It consumes no UUID ordinal.
+ */
+export function groupEvents(
+  events: readonly unknown[],
+  uuids: Map<string, number> = new Map(),
+  excluded: readonly string[] = EVENT_EXCLUDED_PATHS,
+): Record<string, unknown[]> {
+  const groups: Record<string, unknown[]> = {};
+  const calls = new Map<string, Map<string, number>>();
+  const push = (group: string, event: unknown) => {
+    const key = groupKey(group, uuids);
+    const list = (groups[key] ??= []);
+    list.push(normalise(numberCall(event, key, calls), ['events', key, String(list.length)], uuids, excluded, EVENT_MASKED_PATHS));
+  };
+  /** Per foreach id, the counter on its last progress event since its last start. */
+  const counters = new Map<string, number>();
+  for (const event of events) {
+    const progress = foreachProgress(event);
+    if (progress === undefined) {
+      const group = eventGroup(event);
+      if (isRecord(event) && event['type'] === 'workflow-step-start') counters.delete(group);
+      push(group, event);
+      continue;
+    }
+    const { completedCount, ...payload } = progress.payload;
+    const before = counters.get(progress.id) ?? 0;
+    const increment = typeof completedCount === 'number' ? completedCount - before : completedCount;
+    if (typeof completedCount === 'number') counters.set(progress.id, completedCount);
+    push(`${progress.id}[${progress.index}]`, { ...(event as Record<string, unknown>), payload: { ...payload, $completedIncrement: increment } });
+  }
+  return groups;
+}
+
+/** A group name as one path segment: UUIDs as ordinals, a `.` (a nested prefix) written `/`. */
+function groupKey(group: string, uuids: Map<string, number>): string {
+  return ordinal(group, uuids).replaceAll('.', '/');
+}
+
+/** The event with its top-level `payload.stepCallId` replaced by its `<call#k>` within `group`. */
+function numberCall(event: unknown, group: string, calls: Map<string, Map<string, number>>): unknown {
+  const payload = isRecord(event) ? event['payload'] : undefined;
+  if (!isRecord(payload) || Array.isArray(payload) || !Object.hasOwn(payload, 'stepCallId')) return event;
+  const id = payload['stepCallId'];
+  if (typeof id !== 'string') return event;
+  const seen = calls.get(group) ?? new Map<string, number>();
+  calls.set(group, seen);
+  let k = seen.get(id);
+  if (k === undefined) {
+    k = seen.size;
+    seen.set(id, k);
+  }
+  return { ...(event as Record<string, unknown>), payload: { ...payload, stepCallId: `<call#${k}>` } };
+}
+
+/** A foreach progress event's parts (`handlers/control-flow.ts:1064-1084`), or `undefined`. */
+function foreachProgress(event: unknown): { type: string; id: string; index: number; payload: Record<string, unknown> } | undefined {
+  if (!isRecord(event) || event['type'] !== 'workflow-step-progress') return undefined;
+  const payload = event['payload'];
+  if (!isRecord(payload) || Array.isArray(payload)) return undefined;
+  const id = payload['id'];
+  const index = payload['currentIndex'];
+  if (typeof id !== 'string' || typeof index !== 'number') return undefined;
+  return { type: event['type'], id, index, payload };
+}
+
+/** An event's `type`, or `?`: how a report names an event it does not print whole. */
+function typeOf(event: unknown): string {
+  const t = isRecord(event) ? event['type'] : undefined;
+  return typeof t === 'string' ? t : '?';
+}
+
+/** Where a point must lie on one side, and whether it did: inside `owner`'s open, unsettled span. */
+export interface Containment {
+  readonly owner: string;
+  readonly inside: boolean;
+}
+
+/**
+ * One side's events as happens-before material, over the group names of {@link groupEvents}:
+ *
+ * - `spans` — each step occurrence `<group>#<n>` (its `n`th run: a loop's iterations, a resumed
+ *   step's second start) from its first `-start` or `-waiting` to its `-finish` or `-suspended`,
+ *   or its last `-result` when neither follows; and each run-level event — `$run:<type>#<m>` (a
+ *   stream's `workflow-start`/`-finish`, `workflow-canceled`, `workflow-paused`) and a custom
+ *   chunk, `$data-<x>#<m>` — as a point span. Ordered against each other as
+ *   {@link compareOrder} orders a trace's spans.
+ * - `within` — every point that belongs to a step, and where it lay: a foreach's progress
+ *   (`<id>[<k>]#<m>`) and a writer chunk (`<step>@output#<m>`) inside their step's span *before
+ *   it settled* (its first `-result`, `-suspended` or `-finish`: Mastra publishes progress before
+ *   the aggregate's result, `handlers/control-flow.ts:1117-1147,1331-1341`, and a chunk while the
+ *   step runs, `tools/stream.ts:46-58`); a nested step's occurrence (`inner/i1#<n>`) wholly inside
+ *   an occurrence of its parent step (`inner`) before the parent settled. A writer chunk's step is
+ *   named bare even when nested (`workflow.ts:4340-4346`), so any group ending in `/<step>` owns it.
+ * - `calls` — per step occurrence, how many distinct step call ids its events carry: one when its
+ *   `-start`, `-result` and `-finish` correlate (`default.ts:226-233`, `handlers/step.ts:660-690`).
+ */
+export function eventModel(
+  events: readonly unknown[],
+  uuids: Map<string, number> = new Map(),
+): EventModel {
+  interface Occurrence {
+    readonly key: string;
+    readonly start: number;
+    end: number | undefined;
+    settle: number | undefined;
+    closed: boolean;
+    readonly calls: Set<string>;
+  }
+  const occurrences = new Map<string, Occurrence[]>();
+  const points = new Map<string, number>();
+  const spans = new Map<string, Span>();
+  const within = new Map<string, Containment>();
+  const pointKey = (label: string) => {
+    const m = points.get(label) ?? 0;
+    points.set(label, m + 1);
+    return `${label}#${m}`;
+  };
+  const list = (group: string) => occurrences.get(group) ?? [];
+  const unsettled = (o: Occurrence, i: number) => !o.closed && o.settle === undefined && o.start < i;
+  /** Whether some occurrence of `group` is running — opened, not yet settled — at index `i`. */
+  const running = (group: string, i: number) => list(group).some((o) => unsettled(o, i));
+  const open = (group: string, i: number): Occurrence => {
+    const list = occurrences.get(group) ?? [];
+    occurrences.set(group, list);
+    const o: Occurrence = { key: `${group}#${list.length}`, start: i, end: undefined, settle: undefined, closed: false, calls: new Set() };
+    list.push(o);
+    return o;
+  };
+
+  events.forEach((event, i) => {
+    const type = typeOf(event);
+    const progress = foreachProgress(event);
+    if (progress !== undefined) {
+      const owner = groupKey(progress.id, uuids);
+      within.set(pointKey(`${owner}[${progress.index}]`), { owner, inside: running(owner, i) });
+      return;
+    }
+    const raw = eventGroup(event);
+    const group = groupKey(raw, uuids);
+    if (group.startsWith('$')) {
+      const key = pointKey(group === RUN_EVENTS ? `${group}:${type}` : group);
+      spans.set(key, { start: i, end: i });
+      return;
+    }
+    if (group.endsWith('@output')) {
+      const step = group.slice(0, -'@output'.length);
+      const owners = [...occurrences.keys()].filter((g) => g === step || g.endsWith(`/${step}`));
+      within.set(pointKey(group), { owner: step, inside: owners.some((g) => running(g, i)) });
+      return;
+    }
+    // A settling event closes the oldest occurrence still open, as a trace's end closes the oldest
+    // open start of its label ({@link spans}): a loop's next run may start before the last finished.
+    let o: Occurrence | undefined;
+    switch (type) {
+      case 'workflow-step-start':
+      case 'workflow-step-waiting':
+        o = list(group).find((x) => !x.closed && x.settle === undefined) ?? open(group, i);
+        break;
+      case 'workflow-step-result':
+        o = list(group).find((x) => !x.closed && x.settle === undefined) ?? list(group).find((x) => !x.closed) ?? open(group, i);
+        o.settle ??= i;
+        o.end = i;
+        break;
+      case 'workflow-step-suspended':
+      case 'workflow-step-finish':
+        o = list(group).find((x) => !x.closed) ?? open(group, i);
+        o.settle ??= i;
+        o.end = i;
+        o.closed = true;
+        break;
+      default:
+        // Any other event a step publishes lies inside it, like a progress event.
+        within.set(pointKey(`${group}:${type}`), { owner: group, inside: running(group, i) });
+        return;
+    }
+    const payload = isRecord(event) ? event['payload'] : undefined;
+    const call = isRecord(payload) ? payload['stepCallId'] : undefined;
+    if (typeof call === 'string') o.calls.add(call);
+  });
+
+  const calls = new Map<string, number>();
+  for (const [group, list] of occurrences) {
+    for (const o of list) {
+      spans.set(o.key, { start: o.start, end: o.end });
+      calls.set(o.key, o.calls.size);
+      const slash = group.lastIndexOf('/');
+      if (slash < 0) continue;
+      const parent = group.slice(0, slash);
+      const parents = occurrences.get(parent);
+      if (parents === undefined) continue;
+      const inside = parents.some(
+        (p) => p.start < o.start && (p.settle === undefined || (o.end !== undefined && o.end < p.settle)),
+      );
+      within.set(o.key, { owner: parent, inside });
+    }
+  }
+  return { spans, within, calls };
+}
+
+/** {@link eventModel}'s result. */
+export interface EventModel {
+  readonly spans: Map<string, Span>;
+  readonly within: Map<string, Containment>;
+  readonly calls: Map<string, number>;
+}
+
+/** What {@link compareEvents} is told beyond the two sides' events. */
+export interface CompareEventsOptions {
+  readonly root?: string;
+  readonly oracleUuids?: Map<string, number>;
+  readonly candidateUuids?: Map<string, number>;
+  readonly excluded?: readonly string[];
+  /** Step pairs the fixture declares independent (row 4): an event order between them may weaken. */
+  readonly independent?: readonly IndependentPair[];
+}
+
+/**
+ * The event differences between two sides, pure, and the event orderings weakened on declared
+ * independent pairs (reported, not gated).
+ *
+ * Per group, in order: a group on one side only is one difference at `<root>.<group>`, its values
+ * the group's event types; a group on both is compared event by event, field by field
+ * (`<root>.<group>.<n>.<…>`), and a length mismatch is `<root>.<group>.length`, its values each
+ * side's event types in order.
+ *
+ * Across groups, over {@link eventModel} on each side, on keys both sides have:
+ * - `<root>.$order.<a>.<b>` — the oracle has `a` wholly before `b` and the candidate does not:
+ *   reversed or inverted, as {@link compareOrder} gates a trace; weakened, and not gated, only when
+ *   the fixture declares the two steps independent.
+ * - `<root>.$within.<point>` — the oracle has the point inside its owner's span and the candidate
+ *   does not.
+ * - `<root>.$calls.<occurrence>` — the two sides disagree on how many step call ids one step
+ *   occurrence carries (one: its events correlate).
+ *
+ * `$order`, `$within` and `$calls` never collide with a group: `$` names only `$run` and `$data-*`.
+ */
+export function compareEvents(
+  oracle: readonly unknown[],
+  candidate: readonly unknown[],
+  options: CompareEventsOptions = {},
+): { path: string; oracle: unknown; candidate: unknown }[] {
+  return compareEventsDetailed(oracle, candidate, options).differences;
+}
+
+function compareEventsDetailed(
+  oracle: readonly unknown[],
+  candidate: readonly unknown[],
+  options: CompareEventsOptions = {},
+): { differences: RawDifference[]; weakened: readonly (readonly [string, string])[] } {
+  const root = options.root ?? 'events';
+  const excluded = options.excluded ?? EVENT_EXCLUDED_PATHS;
+  const ou = options.oracleUuids ?? new Map<string, number>();
+  const cu = options.candidateUuids ?? new Map<string, number>();
+  const a = groupEvents(oracle, ou, excluded);
+  const b = groupEvents(candidate, cu, excluded);
+  const out: RawDifference[] = [];
+  for (const key of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) {
+    const x = a[key];
+    const y = b[key];
+    const at = `${root}.${key}`;
+    if (x === undefined || y === undefined) {
+      out.push({ path: at, oracle: x === undefined ? '<absent>' : x.map(typeOf), candidate: y === undefined ? '<absent>' : y.map(typeOf) });
+      continue;
+    }
+    if (x.length !== y.length) out.push({ path: `${at}.length`, oracle: x.map(typeOf), candidate: y.map(typeOf) });
+    for (let i = 0; i < Math.min(x.length, y.length); i++) diff(x[i], y[i], [...at.split('.'), String(i)], out);
+  }
+
+  const om = eventModel(oracle, ou);
+  const cm = eventModel(candidate, cu);
+  const order = compareSpanMaps(om.spans, cm.spans, options.independent ?? []);
+  for (const [x, y] of order.report.reversed) out.push({ path: `${root}.$order.${x}.${y}`, oracle: `${x} before ${y}`, candidate: `${y} before ${x}` });
+  for (const [x, y] of order.report.inverted) {
+    out.push({ path: `${root}.$order.${x}.${y}`, oracle: `${x} before ${y}`, candidate: `${y} started before ${x} ended` });
+  }
+  for (const [key, o] of om.within) {
+    const c = cm.within.get(key);
+    if (c === undefined || !o.inside || c.inside) continue;
+    out.push({ path: `${root}.$within.${key}`, oracle: `inside ${o.owner}`, candidate: `outside ${c.owner}` });
+  }
+  for (const [key, n] of om.calls) {
+    const m = cm.calls.get(key);
+    if (m === undefined || (n <= 1) === (m <= 1)) continue;
+    out.push({ path: `${root}.$calls.${key}`, oracle: `${n} step call id(s)`, candidate: `${m} step call id(s)` });
+  }
+  return { differences: out, weakened: order.report.weakened };
+}
+
+/** Whether a difference path is on the events dimension (`events.…`, or a phase's `phases.<i>.events.…`). */
+export function isEventPath(path: string): boolean {
+  return path.startsWith('events.') || /^phases\.\d+\.events\./.test(path);
+}
+
+/**
+ * A difference path with its group and indices made generic, for reports that count what an
+ * event implementation still lacks: `events.a.2.payload.status` -> `events.<group>.*.payload.status`,
+ * `phases.1.events.$run.length` -> `phases.*.events.$run.length` (the run group is kept by name).
+ */
+export function eventPattern(path: string): string {
+  const segs = path.split('.');
+  let i = 0;
+  const out: string[] = [];
+  if (segs[0] === 'phases') {
+    out.push('phases', '*');
+    i = 2;
+  }
+  out.push(segs[i] ?? '');
+  const group = segs[i + 1];
+  if (group !== undefined) {
+    out.push(
+      group.startsWith('$')
+        ? group
+        : group.endsWith('@output')
+          ? '<group>@output'
+          : /\[\d+\]$/.test(group)
+              ? '<group>[*]'
+              : '<group>',
+    );
+  }
+  const cross = group === '$order' || group === '$within' || group === '$calls';
+  for (const seg of segs.slice(i + 2)) out.push(cross ? '<key>' : /^\d+$/.test(seg) ? '*' : seg);
+  return out.join('.');
+}
 
 /** Runs the fixture on the oracle, then on the candidate — sequentially, never interleaved — timing each. */
 export async function runBoth<I>(fixture: DifferentialCase<I>, input: I = fixture.input): Promise<Verdict> {
@@ -233,6 +704,41 @@ export interface CompareOptions {
   readonly wallMs?: { readonly oracle: number; readonly candidate: number };
 }
 
+type RawDifference = { path: string; oracle: unknown; candidate: unknown };
+
+/**
+ * Attributes every raw difference and decides the verdict. `applies` says whether an attribution
+ * may attribute on this run. Every difference is gated: there is no mode that lists event
+ * differences without counting them.
+ */
+function settle(
+  raw: readonly RawDifference[],
+  attributions: readonly Attribution[],
+  applies: (at: Attribution) => boolean,
+  gatedElsewhere: boolean,
+): { differences: Difference[]; unused: Attribution[]; verdict: VerdictKind } {
+  const used = new Set<Attribution>();
+  const differences: Difference[] = raw.map((d) => {
+    const hit = attributions.find((at) => applies(at) && at.paths.some((p) => matches(p, d.path)));
+    if (hit === undefined) return d;
+    used.add(hit);
+    return { ...d, row: hit.row };
+  });
+  const verdict: VerdictKind = gatedElsewhere
+    ? 'fail'
+    : differences.length === 0
+      ? 'pass'
+      : differences.every((d) => d.row !== undefined)
+        ? 'divergent'
+        : 'fail';
+  return { differences, unused: attributions.filter((at) => applies(at) && !used.has(at)), verdict };
+}
+
+/** The events of one side, or `[]` when it observed none — compared only when either side observed some. */
+function eventsOf(o: { readonly events?: readonly unknown[] }): readonly unknown[] {
+  return o.events ?? [];
+}
+
 /** The whole comparison, pure: identity, data, happens-before, the budget, then the verdict. */
 export function compareObservations(
   name: string,
@@ -246,7 +752,9 @@ export function compareObservations(
   const k = options.concurrency;
   const peak = { oracle: peakInFlight(oracle.trace), candidate: peakInFlight(candidate.trace) };
   const budget = k !== undefined && peak.candidate > k ? [`candidate had ${peak.candidate} steps in flight at once, above its budget of ${k}`] : [];
-  const raw: { path: string; oracle: unknown; candidate: unknown }[] = [];
+  const raw: RawDifference[] = [];
+  const ou = new Map<string, number>();
+  const cu = new Map<string, number>();
 
   if (oracle.kind !== candidate.kind) {
     raw.push({ path: 'kind', oracle: oracle.kind, candidate: candidate.kind });
@@ -254,7 +762,14 @@ export function compareObservations(
     const root = oracle.kind === 'resolved' ? 'result' : 'error';
     const a = oracle.kind === 'resolved' ? oracle.result : oracle.error;
     const b = candidate.kind === 'resolved' ? candidate.result : candidate.error;
-    diff(normalise(a, [root]), normalise(b, [root]), [root], raw);
+    diff(normalise(a, [root], ou, ...clockMasked(EXCLUDED_PATHS)), normalise(b, [root], cu, ...clockMasked(EXCLUDED_PATHS)), [root], raw);
+  }
+  // Events: after the result, so a `sleep_<uuid>` id keeps the ordinal its record got there.
+  let eventsWeakened: readonly (readonly [string, string])[] = [];
+  if (oracle.events !== undefined || candidate.events !== undefined) {
+    const events = compareEventsDetailed(eventsOf(oracle), eventsOf(candidate), { oracleUuids: ou, candidateUuids: cu, independent });
+    raw.push(...events.differences);
+    eventsWeakened = events.weakened;
   }
 
   const ordering = compareOrder(oracle.trace, candidate.trace, independent);
@@ -265,22 +780,7 @@ export function compareObservations(
     raw.push({ path: `order.${a}.${b}`, oracle: `${a} before ${b}`, candidate: `${b} started before ${a} ended` });
   }
 
-  const used = new Set<Attribution>();
-  const differences: Difference[] = raw.map((d) => {
-    const hit = attributions.find((at) => at.routes === undefined && at.paths.some((p) => matches(p, d.path)));
-    if (hit === undefined) return d;
-    used.add(hit);
-    return { ...d, row: hit.row };
-  });
-
-  const verdict: VerdictKind =
-    identity.length > 0 || budget.length > 0
-      ? 'fail'
-      : differences.length === 0
-        ? 'pass'
-        : differences.every((d) => d.row !== undefined)
-          ? 'divergent'
-          : 'fail';
+  const { differences, unused, verdict } = settle(raw, attributions, (at) => at.routes === undefined, identity.length > 0 || budget.length > 0);
   return {
     fixture: name,
     verdict,
@@ -288,8 +788,8 @@ export function compareObservations(
     identity,
     executions: { oracle: countByEngine(oracle.executions), candidate: countByEngine(candidate.executions) },
     differences,
-    ordering: ordering.report,
-    unusedAttributions: attributions.filter((at) => at.routes === undefined && !used.has(at)),
+    ordering: { ...ordering.report, eventsWeakened },
+    unusedAttributions: unused,
     budget,
     measurements: {
       concurrency: k ?? 'unbounded',
@@ -380,10 +880,12 @@ export function formatVerdicts(verdicts: readonly Verdict[]): string {
     for (const p of v.budget) lines.push(`  BUDGET: ${p}`);
     for (const d of v.differences) {
       const who = d.row === undefined ? 'FINDING' : `row ${d.row}`;
-      lines.push(`  ${who}: ${d.path}  oracle=${show(d.oracle)}  petri=${show(d.candidate)}`);
+      lines.push(`  ${who}: ${d.path}  ${showPair(d)}`);
     }
     const o = v.ordering;
     if (o.weakened.length > 0) lines.push(`  weakened (independent): ${o.weakened.map(([a, b]) => `${a}<${b}`).join(', ')}`);
+    const ew = o.eventsWeakened ?? [];
+    if (ew.length > 0) lines.push(`  events weakened (independent): ${ew.map(([a, b]) => `${a}<${b}`).join(', ')}`);
     if (o.strengthened.length > 0) lines.push(`  strengthened: ${o.strengthened.map(([a, b]) => `${a}<${b}`).join(', ')}`);
     for (const at of v.unusedAttributions) lines.push(`  unused attribution: row ${at.row} (${at.paths.join(', ')})`);
   }
@@ -448,6 +950,8 @@ export function formatDifferentialReport(verdicts: readonly Verdict[]): string {
     lines.push(`${v.fixture} ${col(v.measurements.concurrency)} (${v.ordering.weakened.length}): ${v.ordering.weakened.map(([a, b]) => `${a}<${b}`).join(', ')}`);
   }
   if (weakened.length === 0) lines.push('none');
+
+  lines.push('', ...formatEventSummary(verdicts));
 
   lines.push('', 'per-fixture detail');
   for (const k of budgets) {
@@ -518,6 +1022,8 @@ export interface PhaseObservation {
   readonly stored: Readonly<Record<string, readonly unknown[]>>;
   readonly trace: readonly TraceEvent[];
   readonly executions: readonly Execution[];
+  /** Every event the run's `watch()` delivered during this phase, in arrival order; absent, not observed. */
+  readonly events?: readonly unknown[];
 }
 
 export interface ResumeObservation {
@@ -530,7 +1036,8 @@ export interface ResumeCase {
   readonly run: (route: ResumeRoute) => Promise<ResumeObservation>;
   /**
    * Paths `phases.<i>.kind`, `phases.<i>.result.<…>`, `phases.<i>.error.<…>`,
-   * `phases.<i>.stored.<workflow>.<n>.<…>`, `trace.<label>` and `order.<a>.<b>`.
+   * `phases.<i>.stored.<workflow>.<n>.<…>`, `phases.<i>.events.<group>.<n>.<…>`, `trace.<label>`
+   * and `order.<a>.<b>`.
    */
   readonly divergences?: readonly Attribution[];
   readonly independent?: readonly IndependentPair[];
@@ -626,6 +1133,7 @@ export function compareResume(
   const identity: string[] = [];
   const raw: { path: string; oracle: unknown; candidate: unknown }[] = [];
   const budget: string[] = [];
+  const eventsWeakened: [string, string][] = [];
   const k = options.concurrency;
   const ou = new Map<string, number>();
   const cu = new Map<string, number>();
@@ -647,12 +1155,23 @@ export function compareResume(
       const a = o.outcome.kind === 'resolved' ? o.outcome.result : o.outcome.error;
       const b = c.outcome.kind === 'resolved' ? c.outcome.result : c.outcome.error;
       const out: { path: string; oracle: unknown; candidate: unknown }[] = [];
-      diff(normalise(a, [root], ou, RESUME_EXCLUDED_PATHS), normalise(b, [root], cu, RESUME_EXCLUDED_PATHS), [root], out);
+      diff(normalise(a, [root], ou, ...clockMasked(RESUME_EXCLUDED_PATHS)), normalise(b, [root], cu, ...clockMasked(RESUME_EXCLUDED_PATHS)), [root], out);
       for (const d of out) raw.push({ ...d, path: `${at}.${d.path}` });
     }
     const out: { path: string; oracle: unknown; candidate: unknown }[] = [];
-    diff(normalise(o.stored, ['stored'], ou, RESUME_EXCLUDED_PATHS), normalise(c.stored, ['stored'], cu, RESUME_EXCLUDED_PATHS), ['stored'], out);
+    diff(normalise(o.stored, ['stored'], ou, ...clockMasked(RESUME_EXCLUDED_PATHS)), normalise(c.stored, ['stored'], cu, ...clockMasked(RESUME_EXCLUDED_PATHS)), ['stored'], out);
     for (const d of out) raw.push({ ...d, path: `${at}.${d.path}` });
+    if (o.events !== undefined || c.events !== undefined) {
+      const events = compareEventsDetailed(eventsOf(o), eventsOf(c), {
+        root: `${at}.events`,
+        oracleUuids: ou,
+        candidateUuids: cu,
+        excluded: RESUME_EVENT_EXCLUDED_PATHS,
+        independent,
+      });
+      raw.push(...events.differences);
+      for (const [x, y] of events.weakened) eventsWeakened.push([`${at}.${x}`, `${at}.${y}`]);
+    }
 
     if (k !== undefined && phaseEngine(route, i) === 'petri') {
       const peak = peakInFlight(c.trace);
@@ -670,21 +1189,7 @@ export function compareResume(
     raw.push({ path: `order.${a}.${b}`, oracle: `${a} before ${b}`, candidate: `${b} started before ${a} ended` });
   }
 
-  const used = new Set<Attribution>();
-  const differences: Difference[] = raw.map((d) => {
-    const hit = attributions.find((at) => appliesOn(at, route) && at.paths.some((p) => matches(p, d.path)));
-    if (hit === undefined) return d;
-    used.add(hit);
-    return { ...d, row: hit.row };
-  });
-  const verdict: VerdictKind =
-    identity.length > 0 || budget.length > 0
-      ? 'fail'
-      : differences.length === 0
-        ? 'pass'
-        : differences.every((d) => d.row !== undefined)
-          ? 'divergent'
-          : 'fail';
+  const { differences, unused, verdict } = settle(raw, attributions, (at) => appliesOn(at, route), identity.length > 0 || budget.length > 0);
   const phaseOutcome = (p: PhaseObservation) => outcomeOf(p.outcome.kind === 'resolved' ? { kind: 'resolved', result: p.outcome.result, trace: [], executions: [] } : { kind: 'rejected', error: p.outcome.error, trace: [], executions: [] });
   const oraclePhases = oracle.phases.map(phaseOutcome);
   const petriPhases = candidate.phases.filter((_, i) => phaseEngine(route, i) === 'petri');
@@ -700,8 +1205,8 @@ export function compareResume(
       candidate: countByEngine(candidate.phases.flatMap((p) => p.executions)),
     },
     differences,
-    ordering: ordering.report,
-    unusedAttributions: attributions.filter((at) => appliesOn(at, route) && !used.has(at)),
+    ordering: { ...ordering.report, eventsWeakened },
+    unusedAttributions: unused,
     budget,
     measurements: {
       concurrency: k ?? 'unbounded',
@@ -772,9 +1277,20 @@ export function normalise(
   at: readonly string[] = [],
   uuids: Map<string, number> = new Map(),
   excluded: readonly string[] = EXCLUDED_PATHS,
+  masked: readonly string[] = [],
 ): unknown {
   const patterns = excluded.map((p) => p.split('.'));
-  return norm(value, [...at], uuids, new WeakSet(), patterns);
+  return norm(value, [...at], uuids, new WeakSet(), patterns, masked.map((p) => p.split('.')));
+}
+
+/**
+ * A masked value: its kind, never its content — `<clock:number>`, `<clock:string>`, `<clock:null>`,
+ * … and `undefined` as itself — so a key present on one side and absent on the other, or holding
+ * another kind of value, is still a difference.
+ */
+function mask(v: unknown): unknown {
+  if (v === undefined) return undefined;
+  return `<clock:${v === null ? 'null' : v instanceof Date ? 'Date' : typeof v}>`;
 }
 
 function ordinal(s: string, uuids: Map<string, number>): string {
@@ -789,7 +1305,14 @@ function ordinal(s: string, uuids: Map<string, number>): string {
   });
 }
 
-function norm(value: unknown, path: string[], uuids: Map<string, number>, seen: WeakSet<object>, excluded: readonly (readonly string[])[]): unknown {
+function norm(
+  value: unknown,
+  path: string[],
+  uuids: Map<string, number>,
+  seen: WeakSet<object>,
+  excluded: readonly (readonly string[])[],
+  masked: readonly (readonly string[])[] = [],
+): unknown {
   if (typeof value === 'string') return ordinal(value, uuids);
   if (typeof value === 'symbol') return { $symbol: value.description ?? '' };
   if (typeof value === 'function') return { $function: value.name };
@@ -799,12 +1322,12 @@ function norm(value: unknown, path: string[], uuids: Map<string, number>, seen: 
   try {
     if (value instanceof Date) return { $date: Number.isNaN(value.getTime()) ? 'invalid' : value.toISOString() };
     if (Array.isArray(value)) {
-      return Array.from({ length: value.length }, (_, i) => (i in value ? norm(value[i], [...path, String(i)], uuids, seen, excluded) : HOLE));
+      return Array.from({ length: value.length }, (_, i) => (i in value ? norm(value[i], [...path, String(i)], uuids, seen, excluded, masked) : HOLE));
     }
     if (value instanceof Map) {
-      return { $map: [...value.entries()].map(([k, v], i) => [norm(k, [...path, '$map', String(i), '0'], uuids, seen, excluded), norm(v, [...path, '$map', String(i), '1'], uuids, seen, excluded)]) };
+      return { $map: [...value.entries()].map(([k, v], i) => [norm(k, [...path, '$map', String(i), '0'], uuids, seen, excluded, masked), norm(v, [...path, '$map', String(i), '1'], uuids, seen, excluded, masked)]) };
     }
-    if (value instanceof Set) return { $set: [...value].map((v, i) => norm(v, [...path, '$set', String(i)], uuids, seen, excluded)) };
+    if (value instanceof Set) return { $set: [...value].map((v, i) => norm(v, [...path, '$set', String(i)], uuids, seen, excluded, masked)) };
 
     const out: Record<string, unknown> = {};
     const put = (key: string, v: unknown) => {
@@ -819,18 +1342,22 @@ function norm(value: unknown, path: string[], uuids: Map<string, number>, seen: 
     if (value instanceof Error) {
       put('$error', value.name);
       put('$message', ordinal(value.message, uuids));
-      if (value.cause !== undefined) put('$cause', norm(value.cause, [...path, '$cause'], uuids, seen, excluded));
+      if (value.cause !== undefined) put('$cause', norm(value.cause, [...path, '$cause'], uuids, seen, excluded, masked));
     }
     for (const [k, v] of Object.entries(value)) {
       const key = ordinal(k, uuids);
       const next = [...path, key];
       if (excluded.some((p) => matchSegments(p, next))) continue;
-      put(key, norm(v, next, uuids, seen, excluded));
+      if (masked.some((p) => matchSegments(p, next))) {
+        put(key, mask(v));
+        continue;
+      }
+      put(key, norm(v, next, uuids, seen, excluded, masked));
     }
     for (const s of Object.getOwnPropertySymbols(value)) {
       if (!Object.prototype.propertyIsEnumerable.call(value, s)) continue;
       const key = `@@${s.description ?? ''}`;
-      put(key, norm((value as Record<symbol, unknown>)[s], [...path, key], uuids, seen, excluded));
+      put(key, norm((value as Record<symbol, unknown>)[s], [...path, key], uuids, seen, excluded, masked));
     }
     return out;
   } finally {
@@ -873,7 +1400,8 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 // Happens-before
 // ---------------------------------------------------------------------------------------------
 
-interface Span {
+/** A span over one side's sequence: indices of its opening and closing events; `end` undefined, never closed. */
+export interface Span {
   readonly start: number;
   end: number | undefined;
 }
@@ -926,8 +1454,19 @@ function compareOrder(
   candidateTrace: readonly TraceEvent[],
   independent: readonly IndependentPair[],
 ): { report: OrderingReport; onlyOracle: string[]; onlyCandidate: string[] } {
-  const o = spans(oracleTrace);
-  const c = spans(candidateTrace);
+  return compareSpanMaps(spans(oracleTrace), spans(candidateTrace), independent);
+}
+
+/**
+ * Happens-before over two sides' spans, keyed alike (`<label>#<n>`): every oracle `a -> b` the
+ * candidate lacks is weakened (a declared independent pair), reversed or inverted; every candidate
+ * ordering the oracle has neither way round is strengthened. Keys on one side only are listed apart.
+ */
+function compareSpanMaps(
+  o: ReadonlyMap<string, Span>,
+  c: ReadonlyMap<string, Span>,
+  independent: readonly IndependentPair[],
+): { report: OrderingReport; onlyOracle: string[]; onlyCandidate: string[] } {
   const common = [...o.keys()].filter((k) => c.has(k));
   const weakened: [string, string][] = [];
   const inverted: [string, string][] = [];
@@ -950,7 +1489,7 @@ function compareOrder(
       } else if (candAB && !oracleAB && !before(ob, oa)) strengthened.push([a, b]);
     }
   }
-  const startOrder = (m: Map<string, Span>) => [...m.entries()].sort((x, y) => x[1].start - y[1].start).map(([k]) => k);
+  const startOrder = (m: ReadonlyMap<string, Span>) => [...m.entries()].sort((x, y) => x[1].start - y[1].start).map(([k]) => k);
   return {
     report: { oracleStarts: startOrder(o), candidateStarts: startOrder(c), weakened, inverted, reversed, strengthened },
     onlyOracle: [...o.keys()].filter((k) => !c.has(k)),
@@ -976,6 +1515,42 @@ function matchSegments(p: readonly string[], s: readonly string[]): boolean {
     if (seg !== '*' && seg !== got) return false;
   }
   return p.length === s.length;
+}
+
+/**
+ * What the events dimension shows across verdicts: how many fixtures fail on events alone, and
+ * every unattributed event difference by {@link eventPattern} with the fixtures it appears in, so
+ * what an event implementation still lacks reads as a short list.
+ */
+export function formatEventSummary(verdicts: readonly Verdict[]): string[] {
+  const lines = ['event differences (unattributed), by pattern'];
+  const onlyEvents = verdicts.filter((v) => {
+    const findings = v.differences.filter((d) => d.row === undefined);
+    return findings.length > 0 && findings.every((d) => isEventPath(d.path)) && v.identity.length === 0 && v.budget.length === 0;
+  });
+  lines.push(`${onlyEvents.length} of ${verdicts.length} verdict(s) have findings on events only`);
+  const byPattern = new Map<string, Set<string>>();
+  for (const v of verdicts) {
+    const label = `${v.fixture} k=${v.measurements.concurrency === 'unbounded' ? 'inf' : v.measurements.concurrency}`;
+    for (const d of v.differences) {
+      if (d.row !== undefined || !isEventPath(d.path)) continue;
+      const set = byPattern.get(eventPattern(d.path)) ?? new Set<string>();
+      set.add(label);
+      byPattern.set(eventPattern(d.path), set);
+    }
+  }
+  for (const [pattern, where] of [...byPattern.entries()].sort((a, b) => b[1].size - a[1].size || (a[0] < b[0] ? -1 : 1))) {
+    lines.push(`${String(where.size).padStart(4)}  ${pattern}`);
+  }
+  if (byPattern.size === 0) lines.push('none');
+  return lines;
+}
+
+/** A difference's two sides, an event group's type sequence written `a > b > c`. */
+function showPair(d: Difference): string {
+  const side = (v: unknown) =>
+    isEventPath(d.path) && Array.isArray(v) && v.every((x) => typeof x === 'string') ? `[${v.join(' > ')}]` : show(v);
+  return `oracle=${side(d.oracle)}  petri=${side(d.candidate)}`;
 }
 
 function show(v: unknown): string {

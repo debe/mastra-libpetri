@@ -849,7 +849,7 @@ describe('PetriExecutionEngine.execute — a workflow registered with a Mastra',
     expect(unreg.seenMastra).toEqual(oracleUnreg.seenMastra);
   });
 
-  it('PINNED DIVERGENCE (open, M5): no workflow-step-start / -result / -finish watch events', async () => {
+  it('publishes workflow-step-start / -result / -finish watch events, as the default engine does (row 57, fixed in M5; payloads in events.test.ts)', async () => {
     const events = async (engine: Engine) => {
       const run = await failing(engine).createRun();
       const seen: string[] = [];
@@ -860,7 +860,7 @@ describe('PetriExecutionEngine.execute — a workflow registered with a Mastra',
     };
     const [oracle, ours] = await Promise.all([events('default'), events('petri')]);
     expect(oracle).toEqual(['workflow-step-start', 'workflow-step-result', 'workflow-step-finish']);
-    expect(ours).toEqual([]);
+    expect(ours).toEqual(oracle);
   });
 });
 

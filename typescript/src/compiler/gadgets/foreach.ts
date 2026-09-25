@@ -462,14 +462,29 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
           error = e;
         }
 
+        // Mastra publishes the foreach's start before it reads the input's length
+        // (`handlers/control-flow.ts:1015-1027,1053`), so a foreach over a non-array starts too.
+        const observed = scope.observe({
+          kind: 'foreach-entered',
+          stepId: bodyId,
+          path: viewPath,
+          input: incoming.data,
+          startedAt,
+          items: items?.length,
+          resumed: false,
+        });
+        if (observed !== undefined) await observed;
         if (items === undefined) {
-          scope.recordStepResult(bodyId, {
+          const failed: StepRecord = {
             status: 'failed',
             error,
             payload: incoming.data,
             startedAt,
             endedAt: scope.epochNow(),
-          });
+          };
+          scope.recordStepResult(bodyId, failed);
+          const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record: failed });
+          if (observed !== undefined) await observed;
           tctx.output(exits.failed, { stepId: bodyId, path: viewPath, error });
           return;
         }
@@ -735,12 +750,15 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
         const output = withResults ? assemble(tctx.inputs(results)) : [];
         const f = tctx.input(frame);
         const scope = scopeOf(tctx);
-        scope.recordStepResult(bodyId, {
+        const record = {
           ...stepInfo(f),
           status: 'success',
           output,
           endedAt: scope.epochNow(),
-        } as StepRecord);
+        } as StepRecord;
+        scope.recordStepResult(bodyId, record);
+        const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record });
+        if (observed !== undefined) await observed;
         tctx.output(next, { data: output });
       })
       .build();
@@ -768,7 +786,11 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
         // `foreachOutput` entry was made from, so the two agree on its payload and start (a
         // resumed item's payload is the stored aggregate's) — plus Mastra's meta.
         const { suspendPayload: _none, ...own } = first.entry as StepRecord & { readonly suspendPayload?: unknown };
-        scopeOf(tctx).recordStepResult(bodyId, { ...own, suspendPayload: { __workflow_meta: { foreachOutput } } } as StepRecord);
+        const record = { ...own, suspendPayload: { __workflow_meta: { foreachOutput } } } as StepRecord;
+        const scope = scopeOf(tctx);
+        scope.recordStepResult(bodyId, record);
+        const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record });
+        if (observed !== undefined) await observed;
         const meta: ForeachMeta = { foreachIndex: failure.foreachIndex ?? 0, foreachOutput: itemRecordsOf(foreachOutput) };
         tctx.output(exits.failed, { ...failure, foreach: meta });
       })
@@ -787,7 +809,10 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
         tctx.input(frame);
         // `return exitResult` (`:1406`): the item's own record — a paused one has no `endedAt`
         // (`handlers/step.ts:525`) — whose `foreachOutput` entry was made from the same record.
-        scopeOf(tctx).recordStepResult(bodyId, first.entry);
+        const scope = scopeOf(tctx);
+        scope.recordStepResult(bodyId, first.entry);
+        const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record: first.entry });
+        if (observed !== undefined) await observed;
         if (first.status === 'bailed') {
           tctx.output(exits.bailed, first.bail);
           return;
@@ -842,7 +867,7 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
         const foreachOutput = foreachOutputOf(f);
         const own = lowest.payload as { readonly __workflow_meta?: object } | null | undefined;
         const scope = scopeOf(tctx);
-        scope.recordStepResult(bodyId, {
+        const record = {
           ...stepInfo(f),
           status: 'suspended',
           // Spread exactly as Mastra spreads it: a primitive payload spreads as JS spreads it.
@@ -851,7 +876,10 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
             __workflow_meta: { ...(own ?? {})?.__workflow_meta, foreachIndex, foreachOutput },
           },
           suspendedAt: scope.epochNow(),
-        } as StepRecord);
+        } as StepRecord;
+        scope.recordStepResult(bodyId, record);
+        const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record });
+        if (observed !== undefined) await observed;
         const meta: ForeachMeta = { foreachIndex, foreachOutput: itemRecordsOf(foreachOutput) };
         tctx.output(exits.suspended, { ...lowest, foreach: meta });
       })
@@ -884,12 +912,15 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
           const output = withResults ? assemble(tctx.inputs(results)) : [];
           const f = tctx.input(frame);
           const scope = scopeOf(tctx);
-          scope.recordStepResult(bodyId, {
+          const record: StepRecord = {
             ...stepInfo(f),
             status: 'canceled',
             output,
             endedAt: scope.epochNow(),
-          });
+          };
+          scope.recordStepResult(bodyId, record);
+          const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record });
+          if (observed !== undefined) await observed;
           tctx.output(exits.canceled, { origin, output, started: true });
         })
         .build();
@@ -962,7 +993,19 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
             return;
           }
           const prior = scope.getStepResult(bodyId);
-          tctx.output(frame, resumedFrame(seed, prior));
+          const reopened = resumedFrame(seed, prior);
+          const observed = scope.observe({
+            kind: 'foreach-entered',
+            stepId: bodyId,
+            path: viewPath,
+            input: reopened.input,
+            ...(reopened.startedAt === undefined ? {} : { startedAt: reopened.startedAt }),
+            ...(reopened.kept === undefined ? {} : { kept: reopened.kept }),
+            items: seed.items.length,
+            resumed: true,
+          });
+          if (observed !== undefined) await observed;
+          tctx.output(frame, reopened);
           for (const l of laneList) tctx.output(l.permit, null);
           if (seed.order.length > 0) tctx.output(cursor, { items: seed.items, order: seed.order, next: 0 });
           for (const d of seed.done) tctx.output(results, { index: d.index, value: (d.record as { output?: unknown }).output });

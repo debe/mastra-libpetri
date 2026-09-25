@@ -337,16 +337,51 @@
       (row 55), `engineType` in Mastra's run registry (row 62), the restart halves of rows 40 and
       54. Reuses M4's sites and decoder. Restore timing is decided here, not for resume
 
-## M5 — Streaming and watch
-- [ ] `EventStore` adapter maps net events onto Mastra's step-event vocabulary and publishes to
-      `workflow.events.v2.${runId}`, so existing `.watch()` / `.stream()` observers keep working
-      unchanged; `DebugAwareEventStore` tee for the libpetri debug UI
-- [ ] **The live testbed, and browser e2e.** The plan listed a live testbed — a real Mastra app with
-      this engine registered, driven end to end — under verification but never gave it a
-      milestone; nothing drives a browser today. It lands here, where it becomes worth recording:
-      once step events flow (row 57), a run in Mastra Studio shows its steps progress, and the
-      libpetri debug UI shows the net's marking live. Recorded browser runs of both, against a
-      `.testbed/` app (gitignored), with its numbers kept apart from conformance numbers
+## M5 — Streaming and watch ([ADR 0008])
+- [x] Contract: an observation-only lifecycle hook, `StepRunner.observe(LifecycleEvent)` —
+      `step-settled`, `sleep-waiting` / `-settled`, `foreach-entered` / `-settled` — raised by the
+      firing that writes each record, awaited only when there is an observer; a step's start is the
+      runner's first call. `StepCall.iteration` / `.startedAt`. Kernel `RunOptions.eventStore` tee and
+      `RunReport.observerError`: an observer's throw never fails a firing. The plan's `EventStore`
+      adapter was not taken: transition names cannot tell a retried attempt from the last one, and
+      `append` cannot await a publish (ADR 0008)
+- [x] Step events (rows 57, 58): start / result / finish / suspended / waiting, foreach progress and
+      aggregate, `workflow-canceled` (row 89), gated on `emitStepEvents`, payloads equal the default
+      engine's; writers routed as Mastra's (`src/mastra/events.ts`, `runner.ts`)
+- [x] Spans, scorers, `actor`, `disableScorers` (row 59), a failing branch condition's log and span
+      (row 60), parallel / conditional / loop / foreach spans (row 30; sleep spans and one loop cancel
+      window stay open) — `src/mastra/spans.ts`, `scorers.ts`; built only under a workflow span
+- [x] Differential: watch events a gated dimension on every fixture and resume route — per step id in
+      order, happens-before across steps, progress and writer chunks inside their owner, clock keys by
+      presence, `stepCallId` correlation; no switch turns the gate off. New fixtures `sleep-until`,
+      `emit-step-events-off`, `writer`, `writer-stream`
+- [x] Adversarial verification against Mastra's source found no payload defect and five others, all
+      fixed: one publish queue per run serialised `.parallel()` arms behind a slow pubsub (5 arms at
+      20ms latency started 21ms apart); the start event validated input a second time (an impure
+      schema ran twice); the start's `startedAt` was a second clock read; a finish followed a rejected
+      result; `await undefined` gave an unobserved run an extra microtask. Four harness blind spots
+      closed, each with a unit test that shows it caught. A rejecting publish is recorded (row 88)
+- [x] Debug UI: engine option `debug` (a libpetri `DebugSessionRegistry`, also through `init`), one
+      session per segment (`<runId>`, `<runId>~resume-<n>`); a failing registry or store is logged
+      and changes nothing (row 90; tests/mastra/debug.test.ts)
+- [x] **The live testbed and browser e2e.** `testbed/` (committed) + `scripts/bootstrap-testbed.sh`
+      build a gitignored `.testbed/`: a Mastra 1.67.0 app (mastra CLI 1.30.0, LibSQL) with seven
+      workflows on this engine and the libpetri debug UI served beside it (`/debug/petri/ui/`,
+      WebSocket `/debug/petri`). Recorded with agent-browser: Studio shows a sleep run's steps
+      progress live and a suspend / resume through Studio's own form; the debug UI follows a live
+      run's marking (`docs/assets/m5/`, the rest under `.testbed/recordings/`). Testbed timings are in
+      `testbed/README.md`, kept apart from conformance figures
+- [x] Final integration (libpetri 6.1.0 from the registry, not linked; z3 on PATH): `npm run check`
+      exit 0; `npm run build` exit 0; `npm test` "Test Files 60 passed (60)", "Tests 2323 passed | 35
+      skipped (2358)". Differential: fresh k=1 37 pass / 6 divergent / 0 fail, k=2, 4, unbounded
+      38 / 5 / 0; resume k=1 80 / 12 / 0, k=2, 4, unbounded 79 / 13 / 0; 0 verdicts with an
+      unattributed event difference
+- [ ] Open after M5, none blocking: `WORKFLOW_SLEEP` spans and the loop span left open by a cancel
+      between a continuing verdict and the next body (both need a lifecycle event, row 30); the scorer
+      hook's owning `Mastra` (row 59); `foreach-empty-cancel-inside` agrees or not by microtask depth
+      (row 49); Studio's recent-runs icon stays stale until reload — untested whether engine-specific;
+      debug UI issues to raise upstream (no auto-fit for large nets, session list only on Refresh, a
+      `?sessionId=` link opens in replay mode, tokens logged as `[object Object]`)
 
 ## M6 — Verification
 - [ ] `verify(workflow)`: deadlock freedom with the complete sink list, termination at declared
@@ -440,6 +475,13 @@ bump not yet run):
       transition per execution). The loop gadget stands on specified behaviour
 - `4d7a9d9` — ν-join verification soundness, committed after the release. Not relevant: no
   compiled net uses `matchSpec` or `freshName`
+- [ ] U9 — **libpetri TypeScript 7.0.0 released 2026-09-25** (tag `typescript/v7.0.0`, reported by
+      the temporal-libpetri session). Carries U7 (commit `03f80db`), so `MAX_NET_PLACES` can be
+      lifted; adds terminal places (`PetriNet.builder(..).terminal(place)`, [EXEC-042]) and
+      `executor.terminationReason()` — the in-net replacement for the kernel's drain-on-terminal
+      watcher; breaking: `NodeCategory` gains `'terminal'`; verification soundness fixes. Not taken
+      mid-M5, so M5's figures stay attributable to 6.1.0: an upgrade of its own after M5, with every
+      gate and the differential re-run. `executionScope` pinning is moot while no net uses `freshName`
 
 **Not pursued, deliberately:**
 

@@ -2,17 +2,21 @@ import { MastraError, ErrorDomain, ErrorCategory } from '@mastra/core/error';
 import { ExecutionEngine, type ExecutionEngineOptions, type WorkflowRunStatus } from '@mastra/core/workflows';
 import { StepExecutor } from '@mastra/core/workflows/evented';
 import type { Mastra } from '@mastra/core/mastra';
+import type { AnySpan } from '@mastra/core/observability';
 import type { Clock } from 'libpetri';
+import type { DebugSessionRegistry } from 'libpetri/debug';
 import { compile } from '../compiler/compile.js';
 import { HostPreconditionError } from '../compiler/gadgets/leaf.js';
 import { resumeSeed, UnresumablePositionError, type ResumeSeed } from '../compiler/resume.js';
 import type { CompiledWorkflow, WorkflowDescription } from '../compiler/types.js';
 import { runWorkflowDetailed, type RunReport } from '../engine/kernel.js';
 import { adaptExecutionGraph } from './adapt.js';
+import { StepEvents } from './events.js';
 import { suspendTracingContext } from './host.js';
 import { persistRun, type PersistContext, type PersistGuard } from './persist.js';
 import { decodeResume, type DecodedResume } from './resume-codec.js';
 import { MastraStepRunner } from './runner.js';
+import { StepSpans, type SpanLifecycle } from './spans.js';
 import { formatWorkflowResult, withForeachHostFields, type FormattedResult, type ResumedFrom } from './result.js';
 
 type ExecuteParams = Parameters<ExecutionEngine['execute']>[0];
@@ -42,6 +46,14 @@ export interface PetriEngineOptions {
    * follows this.
    */
   readonly clock?: Clock;
+  /**
+   * The libpetri debug UI's session registry ([ADR 0008]). Given one, every run segment registers
+   * a session — its net, and every net event as it happens — so the debug UI shows the marking
+   * live. Observation only: the run is the same with or without it. The session id is the run id,
+   * and a resumed segment takes `<runId>~resume-<n>`; sessions are completed, never removed, so the
+   * registry's own `maxSessions` bounds what is kept.
+   */
+  readonly debug?: DebugSessionRegistry;
 }
 
 const DEFAULTS: ExecutionEngineOptions = { validateInputs: true, shouldPersistSnapshot: () => true };
@@ -130,10 +142,11 @@ export class StrandedRunError extends Error {
  * for a `paused` run (`default.ts:985`). `onStart` is not ours: `Run._start` invokes it before
  * calling `execute()` (`workflow.ts:3766`).
  */
-export class PetriExecutionEngine extends ExecutionEngine {
+export class PetriExecutionEngine extends ExecutionEngine implements SpanLifecycle {
   readonly #iterationBound: number | undefined;
   readonly #concurrency: number | undefined;
   readonly #clock: Clock | undefined;
+  readonly #debug: DebugSessionRegistry | undefined;
   /**
    * Compiled nets keyed by the adapter's description, serialised. A description is plain data and
    * `compile` a pure function of it, so equal keys give equal nets; `structuralHash` is itself
@@ -158,6 +171,7 @@ export class PetriExecutionEngine extends ExecutionEngine {
     this.#iterationBound = options.iterationBound;
     this.#concurrency = options.concurrency;
     this.#clock = options.clock;
+    this.#debug = options.debug;
   }
 
   async execute<_TState, _TInput, TOutput>(params: ExecuteParams): Promise<TOutput> {
@@ -209,6 +223,40 @@ export class PetriExecutionEngine extends ExecutionEngine {
     // (`workflow.ts:1819-1827`): `docs/divergences.md`, and the default engine's own contract.
     const validateInputs = this.options.validateInputs;
     const initialState = (params.initialState ?? {}) as Record<string, unknown>;
+    const now = (): number => (this.#clock === undefined ? Date.now() : this.#clock.epochNow());
+    // Mastra's step watch events ([ADR 0008]), gated per run as `publishStepEvent` is
+    // (`handlers/entry.ts:23-29`): `emitStepEvents` defaults to true (`workflow.ts:1807`).
+    let segmentStart: number | undefined;
+    const events = new StepEvents({
+      pubsub: params.pubsub,
+      runId,
+      enabled: this.options.emitStepEvents !== false,
+      now,
+      ...(resumed === undefined
+        ? {}
+        : {
+            resume: {
+              payload: resumed.decoded.runnerResume.payload,
+              resumedAt: () => segmentStart ?? now(),
+              records: resumed.decoded.records,
+            },
+          }),
+    });
+    // The run's step and control-flow spans under the run's span, which `Run` created
+    // (`workflow.ts:3735-3751`) — the default engine's, through this engine's span hooks. With no
+    // run span every span would be `undefined` (`default.ts:311`), so none is tracked.
+    const spans = params.workflowSpan === undefined ? undefined : new StepSpans({
+      lifecycle: this,
+      workflowSpan: params.workflowSpan as AnySpan | undefined,
+      graph: params.graph,
+      workflowId,
+      runId,
+      requestContext: params.requestContext,
+      tracingPolicy: this.options.tracingPolicy,
+      signal: params.abortController.signal,
+      initData: params.input,
+      resumedBlock: resumed?.seed.site.kind === 'arm' ? resumed.seed.site.path[0] : undefined,
+    });
     const runner = new MastraStepRunner({
       executor: this.#executorFor(params),
       graph: params.graph,
@@ -225,6 +273,12 @@ export class PetriExecutionEngine extends ExecutionEngine {
       validateInputs,
       ...(resumed === undefined ? {} : { resume: { ...resumed.decoded.runnerResume, records: resumed.decoded.records } }),
       ...(this.#clock === undefined ? {} : { now: () => this.#clock!.epochNow() }),
+      events,
+      ...(params.outputWriter === undefined ? {} : { outputWriter: params.outputWriter }),
+      ...(spans === undefined ? {} : { spans }),
+      ...(params.actor === undefined ? {} : { actor: params.actor }),
+      ...(params.disableScorers === undefined ? {} : { disableScorers: params.disableScorers }),
+      logger: () => this.getLogger(),
     });
 
     const persistBase = {
@@ -251,18 +305,36 @@ export class PetriExecutionEngine extends ExecutionEngine {
 
     // Mastra's `resumeTime` for a resumed `.foreach()`, taken as the segment enters it
     // (`handlers/control-flow.ts:987-988`).
-    const segmentStart = this.#clock === undefined ? Date.now() : this.#clock.epochNow();
-    const netReport: RunReport = await runWorkflowDetailed(compiled, params.input, {
-      runner,
-      signal: params.abortController.signal,
-      // Mastra has no run timeout (`default.ts:720-1130`). A stranded run with a signal would then
-      // wait forever; the proven `exactlyOneTerminal` rules that out, not a timer.
-      timeoutMs: null,
-      ...(this.#clock ? { clock: this.#clock } : {}),
-      // A resumed segment: one token at the site, and the stored records as the run's own
-      // (`default.ts:800-807`).
-      ...(resumed === undefined ? {} : { resume: resumed.seed, stepResults: resumed.decoded.records }),
-    });
+    segmentStart = now();
+    const debug = this.#debugSession(compiled, workflowId, runId, resumed !== undefined);
+    let netReport: RunReport;
+    try {
+      netReport = await runWorkflowDetailed(compiled, params.input, {
+        runner,
+        signal: params.abortController.signal,
+        // Mastra has no run timeout (`default.ts:720-1130`). A stranded run with a signal would then
+        // wait forever; the proven `exactlyOneTerminal` rules that out, not a timer.
+        timeoutMs: null,
+        ...(this.#clock ? { clock: this.#clock } : {}),
+        // A resumed segment: one token at the site, and the stored records as the run's own
+        // (`default.ts:800-807`).
+        ...(resumed === undefined ? {} : { resume: resumed.seed, stepResults: resumed.decoded.records }),
+        ...(debug === undefined ? {} : { eventStore: debug.eventStore }),
+      });
+    } finally {
+      if (debug !== undefined) this.#debug?.complete(debug.sessionId);
+      // Every step event is out before the run's outcome is: `Run` publishes `workflow-finish` once
+      // `execute()` resolves. Never rejects.
+      await events.flush();
+    }
+    const observerError = netReport.observerError ?? events.error ?? spans?.error;
+    if (observerError !== undefined) {
+      // An observer — step events, the debug tee — threw. The run is unaffected ([ADR 0008]); never silent.
+      this.getLogger().error(
+        `PetriExecutionEngine: an observer of run '${runId}' of workflow '${workflowId}' threw; the run is unaffected`,
+        { workflowId, runId, error: observerError.error },
+      );
+    }
 
     const site = resumed?.seed.site;
     // The host's fields on every `.foreach()` aggregate the net wrote: the run's resume labels and,
@@ -344,6 +416,20 @@ export class PetriExecutionEngine extends ExecutionEngine {
     else if (ending.error !== undefined) span.error(ending.error, formatted.status);
     else span.end({ output: ending.result, attributes: { status: formatted.status } });
 
+    // `workflow-canceled`: published where an entry that ran ends with the signal aborted
+    // (`handlers/entry.ts:815-837`), never by the loop-top branch (`default.ts:815-870`) — so for a
+    // canceled run exactly when the span above took the terminal branch, before the callbacks.
+    if (formatted.status === 'canceled' && !atLoopTop) {
+      await events.canceled();
+      if (events.error !== undefined && observerError === undefined) {
+        this.getLogger().error(`PetriExecutionEngine: publishing 'workflow-canceled' for run '${runId}' threw; the run is unaffected`, {
+          workflowId,
+          runId,
+          error: events.error.error,
+        });
+      }
+    }
+
     if (formatted.status === 'paused') {
       // No callbacks for a paused run; the watch event instead (`default.ts:985-1009`).
       await params.pubsub.publish(`workflow.events.v2.${runId}`, {
@@ -382,6 +468,62 @@ export class PetriExecutionEngine extends ExecutionEngine {
    */
   #executorFor(params: ExecuteParams): StepExecutor {
     return new StepExecutor({ mastra: runView(this.mastra, params.pubsub, () => this.getLogger()) });
+  }
+
+  /**
+   * Registers this segment with the debug registry, when there is one: the run id for a start,
+   * `<runId>~resume-<n>` for the n-th resumed segment this registry has seen of the run.
+   */
+  #debugSession(compiled: CompiledWorkflow, workflowId: string, runId: string, resumed: boolean) {
+    const registry = this.#debug;
+    if (registry === undefined) return undefined;
+    let sessionId = runId;
+    for (let n = 1; resumed || registry.getSession(sessionId) !== undefined; n++) {
+      sessionId = `${runId}~resume-${n}`;
+      if (registry.getSession(sessionId) === undefined) break;
+    }
+    try {
+      return registry.register(sessionId, compiled.net, { workflowId, runId, segment: resumed ? 'resume' : 'start' });
+    } catch (error) {
+      // Observation only ([ADR 0008]): a registry that cannot register runs the segment unobserved.
+      this.getLogger().error(
+        `PetriExecutionEngine: the debug registry refused run '${runId}' of workflow '${workflowId}'; the run is unaffected`,
+        { workflowId, runId, error },
+      );
+      return undefined;
+    }
+  }
+
+  // ---- Span hooks: `DefaultExecutionEngine`'s defaults (`default.ts:280-418`), overridable ----------
+
+  /** A step's span, as a child of `parentSpan` (`default.ts:294-312`). */
+  async createStepSpan(params: Parameters<SpanLifecycle['createStepSpan']>[0]): Promise<AnySpan | undefined> {
+    return params.parentSpan?.createChildSpan(params.options as never) as AnySpan | undefined;
+  }
+
+  /** `default.ts:322-332`. */
+  async endStepSpan(params: Parameters<SpanLifecycle['endStepSpan']>[0]): Promise<void> {
+    params.span?.end(params.endOptions as never);
+  }
+
+  /** `default.ts:342-352`. */
+  async errorStepSpan(params: Parameters<SpanLifecycle['errorStepSpan']>[0]): Promise<void> {
+    params.span?.error(params.errorOptions as never);
+  }
+
+  /** A control-flow span — parallel, conditional, loop (`default.ts:363-377`). */
+  async createChildSpan(params: Parameters<SpanLifecycle['createChildSpan']>[0]): Promise<AnySpan | undefined> {
+    return params.parentSpan?.createChildSpan(params.options as never) as AnySpan | undefined;
+  }
+
+  /** `default.ts:387-397`. */
+  async endChildSpan(params: Parameters<SpanLifecycle['endChildSpan']>[0]): Promise<void> {
+    params.span?.end(params.endOptions as never);
+  }
+
+  /** `default.ts:407-417`. */
+  async errorChildSpan(params: Parameters<SpanLifecycle['errorChildSpan']>[0]): Promise<void> {
+    params.span?.error(params.errorOptions as never);
   }
 
   #compiled(description: WorkflowDescription): CompiledWorkflow {

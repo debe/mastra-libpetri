@@ -178,6 +178,27 @@ describe('the suspend stamp\'s run id is compared on resume', () => {
   });
 });
 
+describe("a stored record's clock stamps on resume", () => {
+  it('are masked, not dropped: a stamp one side stores and the other omits is a difference; its value is not', () => {
+    const at = (context: Record<string, unknown>): ResumeObservation => ({
+      phases: [
+        {
+          outcome: { kind: 'resolved', result: { status: 'suspended', steps: { g: { status: 'suspended', ...context } } } },
+          stored: { w: [{ timestamp: 1, runId: 'r', context: { g: { status: 'suspended', ...context } } }] },
+          trace: [],
+          executions: [{ engine: 'default', workflowId: 'w' }],
+        },
+      ],
+    });
+    const route = { suspendOn: 'default', resumeOn: 'petri', process: 'fresh' } as const;
+    expect(compareResume('f', route, at({ startedAt: 1, suspendedAt: 2 }), at({ startedAt: 5, suspendedAt: 9 }), []).differences).toStrictEqual([]);
+    expect(compareResume('f', route, at({ startedAt: 1, suspendedAt: 2 }), at({ startedAt: 5 }), []).differences.map((d) => d.path)).toStrictEqual([
+      'phases.0.result.steps.g.suspendedAt',
+      'phases.0.stored.w.0.context.g.suspendedAt',
+    ]);
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // The PLAUSIBLE items, settled on real Mastra
 // ---------------------------------------------------------------------------------------------
