@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { PetriNet, Transition, one, outPlace, place, type Place } from 'libpetri';
 import { compile } from '../../src/compiler/index.js';
-import { cancelStructureViolations, describeReport, verifyWorkflow } from '../../src/verify/index.js';
+import {
+  cancelStructureViolations,
+  describeReport,
+  resumeGateViolations,
+  segmentLabel,
+  segmentsFor,
+  verifyWorkflow,
+} from '../../src/verify/index.js';
 import type { CompiledWorkflow, EntryDescription, FlowToken, WorkflowDescription } from '../../src/compiler/types.js';
 
 /**
@@ -293,17 +300,23 @@ describe('verifyWorkflow runs the structural check first', () => {
 
   it("structure: 'skip' proves the same mutant — every proof is blind to the missing inhibitor", async () => {
     // Why the structural check exists. Properties, initial markings, segments as in
-    // `verifyWorkflow`'s default; the only difference is the skipped structural check.
-    const reports = await verifyWorkflow(stripped(), { structure: 'skip' });
-    expect(reports.map((r) => `${r.segment}/${r.property}`)).toEqual([
-      'closed/deadlockFree',
-      'closed/terminatesAtSink',
-      'closed/exactlyOneTerminal',
-      'closed/neverCanceled',
-      'cancel/deadlockFree',
-      'cancel/terminatesAtSink',
-      'cancel/exactlyOneTerminal',
+    // `verifyWorkflow`'s default — the resume segments of both steps' sites included ([ADR 0007]);
+    // the only difference is the skipped structural check.
+    const mutant = stripped();
+    // `s.1.b.in` is also resume site 1, so the resume gate check names the ungated start as well.
+    expect(resumeGateViolations(mutant)).toEqual([
+      "'t.1.b.run' consumes resume site 1 ('s.1.b.in') without an inhibitor on 'wf.cancel'",
     ]);
+    const reports = await verifyWorkflow(mutant, { structure: 'skip' });
+    expect(reports.map((r) => `${segmentLabel(r.segment)}/${r.property}`)).toEqual(
+      segmentsFor(mutant).flatMap((segment) => {
+        const canceled = typeof segment === 'string' ? segment === 'cancel' : segment.cancel;
+        const properties = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', ...(canceled ? [] : ['neverCanceled'])];
+        return properties.map((p) => `${segmentLabel(segment)}/${p}`);
+      }),
+    );
+    // The derivation above is not vacuous: both steps' sites are there.
+    expect(segmentsFor(mutant).map(segmentLabel)).toEqual(['closed', 'cancel', 'resume@0', 'resume@0+cancel', 'resume@1', 'resume@1+cancel']);
     for (const r of reports) expect(r.result.verdict.type, describeReport(r)).toBe('proven');
   }, 60_000);
 

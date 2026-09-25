@@ -55,11 +55,27 @@ export type RunOutcome =
   | ({ readonly status: 'success'; readonly output: unknown; readonly bailed: true } & At & Residue)
   | ({ readonly status: 'failed'; readonly error: unknown } & At & Residue)
   | ({ readonly status: 'tripwire'; readonly tripwire: unknown; readonly error: unknown } & At & Residue)
-  | ({ readonly status: 'suspended'; readonly payload: unknown } & At & Residue)
+  /**
+   * `pending` names the block's other suspensions, in arm or item order ([ADR 0007]) — present only
+   * when there are any, so a single suspension reads as before.
+   */
+  | ({ readonly status: 'suspended'; readonly payload: unknown; readonly pending?: readonly SuspendToken[] } & At & Residue)
   | ({ readonly status: 'paused' } & At & Residue)
   /** Mastra's canceled run carries no step id; `origin` names what was waiting or running. */
   | ({ readonly status: 'canceled'; readonly origin?: CanceledToken['origin']; readonly started: boolean } & Residue)
-  | { readonly status: 'stranded'; readonly places: readonly string[] };
+  /**
+   * No terminal to report — or a firing failed ({@link TransitionFailure}), which strands the run
+   * whatever else it reached. `places` names every marked place but the cancel signal (and the
+   * permits, when all `k` are back); `failure` is present only when a firing failed.
+   */
+  | { readonly status: 'stranded'; readonly places: readonly string[]; readonly failure?: TransitionFailure };
+
+/** A firing that threw, from libpetri's `transition-failed` event: the action's error or an `OutViolationError`. */
+export interface TransitionFailure {
+  readonly transition: string;
+  readonly exceptionType: string;
+  readonly message: string;
+}
 
 export interface RunOptions {
   /** Runs the steps. Supplied per run: a compiled net holds no runner. */
@@ -95,7 +111,8 @@ export interface RunOptions {
    * end at quiescence on its own ([ENV-010]): the kernel ends the run by calling `drain()` the
    * moment a terminal is marked. A run whose model strands a token therefore reaches no terminal
    * and ends only at `timeoutMs` — a model defect the proven `exactlyOneTerminal` rules out, and
-   * the reason a run without a signal registers no environment place at all.
+   * the reason a run without a signal registers no environment place at all. A token lost to a
+   * *failed firing* is not waited out: the kernel ends that run at once, as `stranded`.
    */
   readonly signal?: AbortSignal;
   /**
@@ -125,7 +142,8 @@ export interface RunReport {
  * **How a run ends.** Without a signal no environment place is registered and the executor ends
  * at quiescence ([ENV-010]). With one, the cancel request place is an environment place, so the
  * executor would wait at quiescence for more; the kernel ends the run with `drain()` the moment a
- * terminal is marked ([ADR 0004]).
+ * terminal is marked ([ADR 0004]). Either way a **failed firing** ends the run at once as
+ * `stranded`, carrying the failure: its inputs are consumed and nothing was produced.
  *
  * **Cancellation is `close()`, never `run(timeoutMs)` alone.** The default timeout policy is
  * `'abandon'`: it rejects while the loop keeps firing and mutating the marking. `'close'` is the
@@ -142,11 +160,6 @@ export async function runWorkflowDetailed(
     // one thing "one net serves execution and verification" rules out.
     throw new Error(`compiled workflow '${compiled.net.name}': its program was compiled from a different net`);
   }
-  if (options.resume !== undefined) {
-    // CONTRACT STUB (ADR 0007): the kernel area implements the seeded segment. Refused rather than
-    // silently run from the entry place.
-    throw new Error('runWorkflowDetailed: resumed segments are not implemented yet (M4, ADR 0007)');
-  }
   if (options.stepResults) assertStepResults(options.stepResults);
   const { signal } = options;
   const scope = new KernelRunScope({
@@ -157,21 +170,7 @@ export async function runWorkflowDetailed(
     ...(options.stepResults ? { stepResults: options.stepResults } : {}),
   });
 
-  // A marking is built before any executor exists, so the ordinary constructor stamps wall time
-  // and would differ on every replay — inside the marking. Seed through the clock.
-  const seed = <T>(value: T): Token<T> => (options.clock ? seedToken<T>(options.clock, value) : tokenOf<T>(value));
-  const initial = new Map<Place<unknown>, Token<unknown>[]>([[compiled.entryPlace, [seed<FlowToken>({ data: input })]]]);
-  // Aborted before it began: the signal is already in the marking, so the first entry's sweep
-  // takes the run straight to `wf.canceled`, as Mastra's check before the first entry does.
-  // The SIGNAL, not the request: the arrival already happened, before the run. Seeding the request
-  // would let `arrive` and the first entry's start fire in either order — they share no input — so
-  // a pre-aborted run could start its first step, which Mastra's check before the first entry never
-  // allows. (The `cancel` proof segment seeds the request on purpose: there the arrival may land
-  // anywhere, including after the first start.)
-  if (signal?.aborted) initial.set(compiled.cancel, [seed(null)]);
-  // The run's step budget ([ADR 0006]): `k` permits in the initial marking, never deposited by an
-  // action, so the analyses see exactly `k` — the multiplicity lives where [IO-016] models it.
-  if (compiled.budget) initial.set(compiled.budget.permits, Array.from({ length: compiled.budget.k }, () => seed(null)));
+  const initial = initialMarking(compiled, input, options);
 
   const context = new Map<string, unknown>([[RUN_SCOPE_KEY, scope]]);
   // At runtime the environment writes to the SIGNAL directly, not to the request place. The net's
@@ -189,16 +188,31 @@ export async function runWorkflowDetailed(
   // in-flight actions finish ([ENV-011]), so the run still comes to rest, and `exactlyOneTerminal`
   // covers the marking it rests in. Called from inside the firing cycle, which is safe: a wake-up
   // raised while the executor is not parked is latched, not lost (libpetri 6.1.0).
+  //
+  // A **failed firing** ends the run at once, signal or not: `drain()` then `close()`. A firing that
+  // throws — an action's uncaught error, or an `OutViolationError` when it emits outside its `Out`
+  // spec — consumed its inputs and produced nothing, so its token is gone and no terminal can be
+  // counted on. With a signal the executor would then wait at quiescence forever (`timeoutMs` is
+  // `null` under Mastra); without one, sibling work would keep running for a run already lost. The
+  // proofs cannot see this — they model the `Out` spec, not the action — so the kernel does.
   let executor: PrecompiledNetExecutor | undefined;
-  const drainOnTerminal: EventStore | undefined = signal
-    ? terminalWatcher(terminalNames, () => executor?.drain())
-    : undefined;
+  let failure: TransitionFailure | undefined;
+  const watcher = runWatcher(
+    signal ? terminalNames : new Set(),
+    () => executor?.drain(),
+    (event) => {
+      failure ??= { transition: event.transitionName, exceptionType: event.exceptionType, message: event.errorMessage };
+      executor?.drain();
+      executor?.close();
+    },
+  );
 
   executor = new PrecompiledNetExecutor(compiled.net, initial, {
     executionContextProvider: () => context,
     program: compiled.program,
+    eventStore: watcher,
     ...(options.clock ? { clock: options.clock, deadlineToleranceMs: 0 } : {}),
-    ...(signal ? { environmentPlaces: new Set([cancelPlace]), eventStore: drainOnTerminal } : {}),
+    ...(signal ? { environmentPlaces: new Set([cancelPlace]) } : {}),
   });
 
   // After `drain()` or `close()` the executor rejects an injection silently — the run is already
@@ -214,6 +228,11 @@ export async function runWorkflowDetailed(
     marking = await executor.run(options.timeoutMs === null ? undefined : (options.timeoutMs ?? 300_000), 'close');
   } finally {
     signal?.removeEventListener('abort', onAbort);
+  }
+  if (failure !== undefined) {
+    // Stranded whatever else the marking holds: a terminal a sibling reached is not this run's
+    // outcome once one of its tokens was lost. Every marked place is named, terminals included.
+    return { outcome: { status: 'stranded', places: markedPlaces(compiled, marking), failure }, stepResults: scope.stepResults() };
   }
   const outcome = classify(compiled, marking);
 
@@ -236,6 +255,156 @@ export async function runWorkflowDetailed(
     }
   }
   return { outcome, stepResults: scope.stepResults() };
+}
+
+/**
+ * The token counts a run — and the proof of its segment — starts from: one token at `start`, one at
+ * `cancel` when given, and `k` permits when a budget was compiled in. **The one definition of a
+ * segment's initial marking**: the verifier's `segmentInitialMarking` calls it with the segment's
+ * start place and, for a cancel segment, the cancel *request*; {@link initialMarking} checks every
+ * run's tokens against it with the start it seeded and, for a pre-aborted run, the cancel *signal*.
+ *
+ * Insertion order is start, cancel, permits — the order a report's marking prints in. Counts are
+ * set, not added, so a start place that collides with the permits, or with the cancel place when
+ * the run is pre-aborted, counts once here and twice in a run's tokens, and the kernel refuses that
+ * run. A collision with the cancel place on a run that is not pre-aborted is refused by the
+ * one-token-of-work check instead. This does not check `k` independently: the kernel and the
+ * verifier both read it from the compiled budget, and the guarantee is that they share these counts.
+ */
+export function initialCounts(
+  compiled: CompiledWorkflow,
+  start: Place<unknown>,
+  cancel?: Place<unknown>,
+): ReadonlyMap<Place<unknown>, number> {
+  const counts = new Map<Place<unknown>, number>();
+  counts.set(start, 1);
+  if (cancel !== undefined) counts.set(cancel, 1);
+  if (compiled.budget) counts.set(compiled.budget.permits, compiled.budget.k);
+  return counts;
+}
+
+/**
+ * The marking a run starts from — built before any executor exists, and the only place a run's
+ * initial tokens are decided. Exported so a test can compare it with what the verifier seeds.
+ *
+ * - **Fresh run:** one `FlowToken` in the entry place.
+ * - **Resumed segment** ([ADR 0007]): one token — the seed's value, as it is — in the site's place,
+ *   **instead of** the entry place. Nothing is restored from a marking (no CORE-073), so clocks
+ *   start fresh, as in Mastra.
+ * - Either way: `k` permits when a budget was compiled in, and the cancel **signal** when the run's
+ *   signal had already fired.
+ *
+ * **Checked, then returned.** Every check runs before any executor is built, so a refused run
+ * starts nothing:
+ * 1. A resume site must be the one this workflow registered at that path — by identity, so a site
+ *    from another compile (even of the same workflow) cannot slip in.
+ * 2. The token count of every place must equal {@link initialCounts} for the same start — the
+ *    marking the `closed` or `resume@site` segment is proven from — plus the cancel signal when
+ *    pre-aborted. A pre-aborted run's marking is therefore **not** the one a `+cancel` segment is
+ *    proven from: it is that marking's successor after `t.cancel.arrive` (the request moved to the
+ *    signal), so it is reachable from the proven one, which is what the `+cancel` proof covers.
+ * 3. A resumed segment holds exactly one token outside the permits and the cancel signal, at its
+ *    site — which (2) cannot see when a site is registered on the cancel place itself.
+ * 4. An entry site's seed is a `FlowToken` (a non-null object with `data`). The verifier is
+ *    value-blind, so a proof says nothing about a malformed seed; without this a `null` seed fails
+ *    inside the step's first attempt. An arm's `ArmResume` and a foreach's `ForeachResume` are
+ *    checked by their own gates, which refuse a misfit by name as the block's `failed` outcome.
+ */
+export function initialMarking(
+  compiled: CompiledWorkflow,
+  input: unknown,
+  options: Pick<RunOptions, 'clock' | 'signal' | 'resume'>,
+): Map<Place<unknown>, Token<unknown>[]> {
+  const { resume, signal } = options;
+  if (resume !== undefined) {
+    const key = resume.site.path.join('.');
+    if (compiled.resumeSites.get(key) !== resume.site) {
+      throw new Error(
+        `compiled workflow '${compiled.net.name}': the resume site at path ${key} ('${resume.site.stepId}') is not the one this workflow registered there`,
+      );
+    }
+  }
+
+  // A marking is built before any executor exists, so the ordinary constructor stamps wall time
+  // and would differ on every replay — inside the marking. Seed through the clock.
+  const seed = <T>(value: T): Token<T> => (options.clock ? seedToken<T>(options.clock, value) : tokenOf<T>(value));
+  const start: Place<unknown> = resume === undefined ? compiled.entryPlace : resume.site.place;
+  const initial = new Map<Place<unknown>, Token<unknown>[]>();
+  initial.set(start, [resume === undefined ? seed<FlowToken>({ data: input }) : seed(resume.value)]);
+  // Aborted before it began: the signal is already in the marking, so the first entry's sweep
+  // takes the run straight to `wf.canceled`, as Mastra's check before the first entry does — and a
+  // resume site's gate or sweep does the same, as Mastra's check before each entry holds for a
+  // resumed run (`default.ts:815`).
+  // The SIGNAL, not the request: the arrival already happened, before the run. Seeding the request
+  // would let `arrive` and the first entry's start fire in either order — they share no input — so
+  // a pre-aborted run could start its first step, which Mastra's check before the first entry never
+  // allows. (The `cancel` proof segment seeds the request on purpose: there the arrival may land
+  // anywhere, including after the first start.)
+  const aborted = signal?.aborted === true;
+  if (aborted) initial.set(compiled.cancel, [...(initial.get(compiled.cancel) ?? []), seed(null)]);
+  // The run's step budget ([ADR 0006]): `k` permits in the initial marking, never deposited by an
+  // action, so the analyses see exactly `k` — the multiplicity lives where [IO-016] models it.
+  if (compiled.budget) {
+    const { permits, k } = compiled.budget;
+    initial.set(permits, [...(initial.get(permits) ?? []), ...Array.from({ length: k }, () => seed(null))]);
+  }
+
+  assertProvenCounts(compiled, initial, initialCounts(compiled, start, aborted ? compiled.cancel : undefined), resume, aborted);
+  if (resume !== undefined) {
+    let work = 0;
+    for (const [p, tokens] of initial) {
+      if (p === compiled.cancel || p === compiled.budget?.permits) continue;
+      work += tokens.length;
+    }
+    if (work !== 1 || initial.get(resume.site.place)?.length !== 1) {
+      throw new Error(
+        `compiled workflow '${compiled.net.name}': a resumed segment must start from exactly one token at its site '${resume.site.place.name}', found ${work} outside the permits and the cancel signal`,
+      );
+    }
+    const misfit = seedMisfit(resume.site, resume.value);
+    if (misfit !== undefined) {
+      throw new Error(
+        `compiled workflow '${compiled.net.name}': the seed at resume site ${resume.site.path.join('.')} ('${resume.site.place.name}') ${misfit}`,
+      );
+    }
+  }
+  return initial;
+}
+
+/** Throws unless every place holds exactly the count the segment is proven from (see {@link initialMarking}). */
+function assertProvenCounts(
+  compiled: CompiledWorkflow,
+  initial: ReadonlyMap<Place<unknown>, readonly Token<unknown>[]>,
+  expected: ReadonlyMap<Place<unknown>, number>,
+  resume: ResumeSeed | undefined,
+  aborted: boolean,
+): void {
+  const differences: string[] = [];
+  for (const p of new Set([...expected.keys(), ...initial.keys()])) {
+    const want = expected.get(p) ?? 0;
+    const have = initial.get(p)?.length ?? 0;
+    if (want !== have) differences.push(`${p.name}: ${have}, proven from ${want}`);
+  }
+  if (differences.length === 0) return;
+  const segment = resume === undefined ? 'closed' : `resume@${resume.site.path.join('.')}`;
+  throw new Error(
+    `compiled workflow '${compiled.net.name}': the initial marking is not the one segment ${segment} is proven from` +
+      `${aborted ? ' plus the cancel signal' : ''} (${differences.join('; ')})`,
+  );
+}
+
+/**
+ * Why a seed's colour is not what its site's gate reads, or `undefined` when it is.
+ *
+ * Only an **entry** site is checked here: its gate is a step's first attempt, which reads `data`
+ * off the token and has no refusal of its own, so a `null` would fail the firing. An **arm** or
+ * **foreach** gate refuses a seed that does not fit by name, as the block's own `failed` outcome
+ * before any step runs (`reentry.ts`, `foreach.ts` `seedMisfit`) — a Mastra-shaped failure the
+ * gadget tests pin — so the kernel leaves those to it rather than pre-empt it with a rejection.
+ */
+function seedMisfit(site: ResumeSeed['site'], value: unknown): string | undefined {
+  if (site.kind !== 'entry') return undefined;
+  return typeof value === 'object' && value !== null && 'data' in value ? undefined : 'is not a FlowToken: a non-null object with `data`';
 }
 
 /** Statuses a carried-in record may have: every outcome, and a combinator's `canceled`. */
@@ -278,6 +447,32 @@ export async function runWorkflow(
 }
 
 /**
+ * Token counts of every place that holds work at rest: the cancel signal is skipped (it stays
+ * marked once injected — the environment's, not work), and the permits appear only when their
+ * count is not `k` (every branch returns its permit in the same firing, so any other count is a
+ * minted or leaked one; `permitsReturned` proves it cannot happen).
+ */
+function placeCounts(compiled: CompiledWorkflow, marking: Marking): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const p of compiled.net.places) {
+    if (p.name === compiled.cancel.name) continue;
+    if (p.name === compiled.budget?.permits.name) {
+      const n = marking.tokenCount(p);
+      if (n !== compiled.budget.k) counts.set(`${p.name} (k=${compiled.budget.k})`, n);
+      continue;
+    }
+    const count = marking.tokenCount(p);
+    if (count > 0) counts.set(p.name, count);
+  }
+  return counts;
+}
+
+/** Every marked place as {@link classify} names residue: `name` or `name=n`, sorted. */
+function markedPlaces(compiled: CompiledWorkflow, marking: Marking): readonly string[] {
+  return [...placeCounts(compiled, marking)].map(([name, n]) => (n === 1 ? name : `${name}=${n}`)).sort();
+}
+
+/**
  * Reads the outcome out of the marking.
  *
  * The residue scan covers **every** place, terminals included, and the reported terminal then
@@ -290,22 +485,7 @@ export async function runWorkflow(
  */
 export function classify(compiled: CompiledWorkflow, marking: Marking): RunOutcome {
   const { terminals } = compiled;
-  const counts = new Map<string, number>();
-  for (const p of compiled.net.places) {
-    // The cancellation signal stays marked once injected — it is the environment's, not work — and
-    // the step permits are *supposed* to be all back at rest; a missing one is a leak, not residue
-    // (`permitsReturned` proves it cannot happen).
-    if (p.name === compiled.cancel.name) continue;
-    if (p.name === compiled.budget?.permits.name) {
-      // Exactly k at rest: every branch returns its permit in the same firing. Any other count is a
-      // minted or leaked permit, and reported rather than hidden.
-      const n = marking.tokenCount(p);
-      if (n !== compiled.budget.k) counts.set(`${p.name} (k=${compiled.budget.k})`, n);
-      continue;
-    }
-    const count = marking.tokenCount(p);
-    if (count > 0) counts.set(p.name, count);
-  }
+  const counts = placeCounts(compiled, marking);
 
   // `peekFirst` returns null, not undefined, on an empty place ([CORE-013]).
   const head = <T>(p: Place<T>): T | null => {
@@ -337,7 +517,10 @@ export function classify(compiled: CompiledWorkflow, marking: Marking): RunOutco
       : { status: 'failed', ...at(failure), error: failure.error };
     reported = terminals.failed.name;
   } else if (suspension !== null) {
-    outcome = { status: 'suspended', ...at(suspension), payload: suspension.payload };
+    outcome =
+      suspension.pending !== undefined && suspension.pending.length > 0
+        ? { status: 'suspended', ...at(suspension), payload: suspension.payload, pending: suspension.pending }
+        : { status: 'suspended', ...at(suspension), payload: suspension.payload };
     reported = terminals.suspended.name;
   } else if (pause !== null) {
     outcome = { status: 'paused', ...at(pause) };
@@ -362,14 +545,20 @@ export function classify(compiled: CompiledWorkflow, marking: Marking): RunOutco
 }
 
 /**
- * An event store that does one thing: calls `onTerminal` when a token lands in a terminal place.
- * It keeps no events — the kernel needs the signal, not the history.
+ * An event store that does two things: calls `onTerminal` once when a token lands in one of
+ * `terminalNames`, and `onFailure` on every `transition-failed` event. It keeps no events — the
+ * kernel needs the signals, not the history.
  */
-function terminalWatcher(terminalNames: ReadonlySet<string>, onTerminal: () => void): EventStore {
+function runWatcher(
+  terminalNames: ReadonlySet<string>,
+  onTerminal: () => void,
+  onFailure: (event: Extract<NetEvent, { readonly type: 'transition-failed' }>) => void,
+): EventStore {
   let fired = false;
   return {
     append(event: NetEvent): void {
-      if (!fired && event.type === 'token-added' && terminalNames.has(event.placeName)) {
+      if (event.type === 'transition-failed') onFailure(event);
+      else if (!fired && event.type === 'token-added' && terminalNames.has(event.placeName)) {
         fired = true;
         onTerminal();
       }

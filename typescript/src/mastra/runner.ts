@@ -13,9 +13,12 @@ import {
   type StepResult,
 } from '@mastra/core/workflows';
 import type { StepExecutor } from '@mastra/core/workflows/evented';
+import { HostPreconditionError } from '../compiler/gadgets/leaf.js';
 import type { EntryPath } from '../compiler/names.js';
-import type { RunView, StepCall, StepOutcome, StepRunner } from '../compiler/types.js';
+import { UnresumablePositionError } from '../compiler/resume.js';
+import type { RunView, StepCall, StepOutcome, StepRecord, StepRunner } from '../compiler/types.js';
 import { entryId } from './host.js';
+import type { RunnerResume } from './resume-codec.js';
 import { toMastraStepResult } from './step-result.js';
 
 type SingleStepEntry = Extract<StepFlowEntry, { type: 'step' | 'agent' | 'tool' | 'mapping' }>;
@@ -67,6 +70,28 @@ export interface MastraStepRunnerOptions {
   readonly abortController: AbortController;
   readonly initialState: Record<string, unknown>;
   readonly validateInputs: boolean;
+  /**
+   * The resume this segment continues ([ADR 0007]), when it is one: Mastra's `resume` parameter as
+   * the codec decoded it. Only a call the net marks `resumed` receives `payload` — position-exact,
+   * where Mastra selects by `resume.steps[0] === step.id` (`handlers/step.ts:140-142`; maintainer
+   * decision 4, `docs/divergences.md`).
+   */
+  readonly resume?: RunnerResumeOptions | undefined;
+  /**
+   * Epoch milliseconds on the run's clock ([TIME-015]), for the one stamp the runner writes itself:
+   * a resumed record's `resumedAt`. Defaults to the machine clock.
+   */
+  readonly now?: (() => number) | undefined;
+}
+
+/**
+ * {@link RunnerResume}, plus the records the segment started from — read for a resumed `.foreach()`'s
+ * carried resume labels, which are the stored aggregate's (`handlers/control-flow.ts:1046-1048`),
+ * and for a foreach item that a sibling's suspension from this segment hides the store from (see
+ * `#resumeFeed`). Every other prior record is the live store's.
+ */
+export interface RunnerResumeOptions extends RunnerResume {
+  readonly records?: ReadonlyMap<string, StepRecord> | undefined;
 }
 
 /**
@@ -116,11 +141,27 @@ export class MastraStepRunner implements StepRunner {
    * the same name overwriting an earlier one.
    */
   readonly #resumeLabels: Record<string, ResumeLabel> = {};
+  /**
+   * A resumed `.foreach()`'s carried labels, by body id: the stored aggregate's
+   * `__workflow_meta.resumeLabels` for that step, less every item that succeeded — before this
+   * segment or in it (`handlers/control-flow.ts:1047-1048,1149-1152,1235-1239`).
+   */
+  readonly #carried: Map<string, Record<string, ResumeLabel>>;
+  /** The run scope as the last call saw it — read only to tell whether a foreach ended suspended. */
+  #lastView: RunView | undefined;
+  /**
+   * A `.foreach()` item's prior record as its first attempt read it, by body id and index, so every
+   * retry of the item reads the same one: Mastra reads `stepResults[step.id]` once, before its retry
+   * loop (`handlers/step.ts:145-178`), and a sibling that completes between two attempts does not
+   * change it.
+   */
+  readonly #itemPrior = new Map<string, StepRecord | undefined>();
 
   constructor(options: MastraStepRunnerOptions) {
     this.#o = options;
     this.#state = { ...options.initialState };
     this.#mastra = options.mastra;
+    this.#carried = carriedForeachLabels(options.graph, options.resume?.records);
   }
 
   /** The workflow state after every applied update — Mastra's `state`. */
@@ -133,7 +174,21 @@ export class MastraStepRunner implements StepRunner {
    * (`default.ts:1023-1025`) and persists as the snapshot's `resumeLabels` (`:702`).
    */
   get resumeLabels(): Readonly<Record<string, ResumeLabel>> {
-    return this.#resumeLabels;
+    let merged: Record<string, ResumeLabel> | undefined;
+    for (const [bodyId, labels] of this.#carried) {
+      // Merged only by a foreach that ends suspended again (`handlers/control-flow.ts:1433`).
+      if (this.#lastView?.getStepResult(bodyId)?.status !== 'suspended') continue;
+      merged = { ...merged, ...labels };
+    }
+    return merged === undefined ? this.#resumeLabels : { ...merged, ...this.#resumeLabels };
+  }
+
+  /** A `.foreach()` item succeeded: its carried label goes (`handlers/control-flow.ts:1149-1152`). */
+  #itemSucceeded(stepId: string, index: number): void {
+    const labels = this.#carried.get(stepId);
+    if (labels === undefined) return;
+    const key = Object.keys(labels).find((k) => labels[k]?.foreachIndex === index);
+    if (key !== undefined) delete labels[key];
   }
 
   /**
@@ -162,10 +217,21 @@ export class MastraStepRunner implements StepRunner {
     const entry = this.#resolveStep(call.path, stepId);
     const foreachIndex = call.foreachIndex;
     const step = this.#runnable(entry);
+    const nested = step.component === NESTED_WORKFLOW;
     // A nested workflow started by a `.foreach()` runs under a fresh run id; anywhere else it
     // shares the parent's (`handlers/step.ts:108-109,359`).
-    const nestedRunId =
-      step.component === NESTED_WORKFLOW && foreachIndex !== undefined ? randomUUID() : undefined;
+    const nestedRunId = nested && foreachIndex !== undefined ? randomUUID() : undefined;
+    this.#lastView = call;
+
+    // What the resume hands this call is decided before the step runs. Where the default engine's
+    // resume rejects instead of running the step, the refusal is marked as the host's, so the leaf
+    // neither records nor retries it and the engine rejects the run with the cause.
+    let feed: ResumeFeed;
+    try {
+      feed = this.#resumeFeed(stepId, call, nested);
+    } catch (error) {
+      throw new HostPreconditionError(stepId, call.path, error);
+    }
 
     let stateUpdate: Record<string, unknown> | undefined;
     // Set once `StepExecutor` has validated the input and called `execute` with it.
@@ -185,6 +251,10 @@ export class MastraStepRunner implements StepRunner {
         return step.execute({
           ...ctx,
           mastra: this.#mastra,
+          // The default engine's two, not the executor's: see {@link #resumeFeed}.
+          resumeData: feed.resumeData,
+          suspendData: feed.suspendData,
+          ...(feed.resume === undefined ? {} : { resume: feed.resume }),
           suspend: async (data: unknown, options?: SuspendOptions): Promise<void> => {
             const { suspendData, validationError: suspendError } = await validateStepSuspendData({
               suspendData: data,
@@ -231,17 +301,135 @@ export class MastraStepRunner implements StepRunner {
     // Applied once the step has run without failing, suspended and bailed included, as the
     // default engine applies `contextMutations.stateUpdate` whenever the attempt returned.
     if (raw['status'] !== 'failed' && stateUpdate !== undefined) Object.assign(this.#state, stateUpdate);
+    if (raw['status'] === 'success' && foreachIndex !== undefined) this.#itemSucceeded(stepId, foreachIndex);
 
     if (raw['status'] === 'suspended' && suspension === undefined) {
       throw new Error(`step '${stepId}' suspended without calling the suspend it was given`);
     }
+    const payload = validated === undefined ? input : validated.input;
     const host: Record<string, unknown> = {
       ...raw,
-      payload: validated === undefined ? input : validated.input,
+      // A resumed record keeps the prior record's payload (`handlers/step.ts:170-171`).
+      payload: feed.record?.prior === undefined ? payload : feed.record.prior.payload,
+      ...(feed.record === undefined ? {} : { resumePayload: feed.resumeData, resumedAt: feed.record.resumedAt }),
       ...(raw['status'] === 'suspended' ? { suspendPayload: suspension?.data } : {}),
       ...(nestedRunId === undefined ? {} : { metadata: { ...asRecord(raw['metadata']), nestedRunId } }),
     };
-    return toOutcome(host);
+    // `resumedAt` tells the leaf the attempt is recorded as resumed (truthy resume data), so it
+    // keeps the suspended record's start; absent, the record is a fresh start (`handlers/step.ts:166-175`).
+    const outcome = toOutcome(host);
+    return feed.record === undefined ? outcome : { ...outcome, resumedAt: feed.record.resumedAt };
+  }
+
+  /**
+   * What the default engine hands one attempt of a step about a resume
+   * (`handlers/step.ts:132-175,423-435`), made position-exact ([ADR 0007], decision 4).
+   *
+   * - **`resumeData`** is the resume's payload on the call the net marked `resumed`, and
+   *   `undefined` on every other — Mastra's `resume.steps[0] === step.id`, by position.
+   * - **`suspendData`** is Mastra's rule, on **every** call: the prior record's `suspendPayload`
+   *   when that record is `suspended`, a `.foreach()` item's own `foreachOutput[k].suspendPayload`
+   *   when it has one — an item that never started gets the aggregate's — and `__workflow_meta`
+   *   removed (`:145-164`). `StepExecutor` derives the same from the `stepResults` it is handed,
+   *   but on every attempt (`evented/step-executor.ts:125-142`); a foreach item's retry must read
+   *   what its first attempt read, so the executor's is replaced.
+   * - **`resume`**, which a nested `Workflow.execute` reads to resume its own run instead of
+   *   starting one (`workflow.ts:2951-2954,3020-3031`), exactly when the prior record is
+   *   `suspended` (`handlers/step.ts:423-435`): the tail of `resume.steps`, the payload, the nested
+   *   run id from the stored `__workflow_meta`, the label and `forEachIndex` — on the resumed call.
+   *   Any other call gets the empty resume Mastra builds from no `resume`. A nested workflow inside
+   *   a `.foreach()` that would receive one is refused by name (`foreach-nested`): Mastra resumes
+   *   the child the aggregate names, not the item's (`docs/divergences.md` row 77).
+   *
+   * Whatever this throws is a precondition of the call, and {@link run} wraps it in a
+   * `HostPreconditionError`: the step does not run, and the run rejects with the cause.
+   * - **The record.** A truthy `resumeData` makes the record a resumed one: the prior `payload`,
+   *   plus `resumePayload` and `resumedAt`. A falsy one — `0`, `''`, `false`, `null`, `undefined`
+   *   — still reaches the step, but the record is a fresh start (`:166-175`), as Mastra's
+   *   truthiness test makes it.
+   *
+   * The prior record is Mastra's `stepResults[step.id]` for the call, which is the live store. For a
+   * `.foreach()` item that is the store **as the item's first attempt starts**: the aggregate (or
+   * whatever the id held) as the foreach was entered, overwritten by each item that completed
+   * before this one started — Mastra's worker runs `Object.assign(stepResults, …{ [step.id]:
+   * stepResult })` after every item (`handlers/control-flow.ts:1179`, `handlers/step.ts:573`), and
+   * the leaf writes each item's record when the item completes, the same point. So an item that
+   * starts after a sibling succeeded reads the sibling's record, and no suspend data. A sibling's
+   * suspension from this segment is never read: no item starts after one in Mastra, where the queue
+   * is killed, nor here, where the leaf writes it in the firing that marks the lane's outcome, which
+   * inhibits every other lane's `start`. An item this segment's sibling suspension is visible to was
+   * dispatched before it and held by the run budget ([ADR 0006]); it reads the record the segment
+   * began with. The read is made when the item runs, which under a budget is later than its
+   * dispatch, Mastra's start: a sibling that completed in between is read (`docs/divergences.md`).
+   */
+  #resumeFeed(stepId: string, call: StepCall, nested: boolean): ResumeFeed {
+    const resume = this.#o.resume;
+    if (call.resumed === true && resume === undefined) {
+      throw new Error(`step '${stepId}' at path ${call.path.join('-')} is a resumed call, but this run was given no resume`);
+    }
+    const stored = this.#priorOf(stepId, call);
+    const prior = stored === undefined ? undefined : toMastraStepResult(stored, { now: this.#now() });
+    const resumeData = call.resumed === true ? resume?.payload : undefined;
+
+    let suspendData: unknown = prior?.status === 'suspended' ? prior.suspendPayload : undefined;
+    if (suspendData && call.foreachIndex !== undefined) {
+      const item = asRecord(asRecord(asRecord(suspendData)['__workflow_meta'])['foreachOutput'])[call.foreachIndex];
+      const own = asRecord(item);
+      if (own['status'] === 'suspended' && own['suspendPayload']) suspendData = own['suspendPayload'];
+    }
+    // `'__workflow_meta' in suspendDataToUse` (`:160`), as is: on a truthy primitive `in` throws a
+    // `TypeError`, and the default engine's resume rejects with it — reproduced, not guarded;
+    // {@link run} marks it as the host's, so it rejects the run here too.
+    if (suspendData && '__workflow_meta' in (suspendData as object)) {
+      const { __workflow_meta: _meta, ...user } = suspendData as Record<string, unknown>;
+      suspendData = user;
+    }
+
+    let nestedResume: NestedResume | undefined;
+    if (prior?.status === 'suspended') {
+      if (nested && call.foreachIndex !== undefined) {
+        throw new UnresumablePositionError(
+          'foreach-nested',
+          call.path,
+          `nested workflow '${stepId}' inside a .foreach() (item ${call.foreachIndex}) would resume a child run; ` +
+            'which one Mastra resumes there is unsettled, so this engine refuses it (docs/divergences.md)',
+        );
+      }
+      const on = call.resumed === true ? resume : undefined;
+      nestedResume = {
+        steps: on?.steps.slice(1) ?? [],
+        resumePayload: on?.payload,
+        runId: asRecord(asRecord(prior.suspendPayload)['__workflow_meta'])['runId'],
+        label: on?.label,
+        forEachIndex: on?.forEachIndex,
+      };
+    }
+
+    const record =
+      call.resumed === true && resumeData
+        ? { ...(prior !== undefined && 'payload' in prior ? { prior: { payload: prior.payload } } : {}), resumedAt: this.#now() }
+        : undefined;
+    return { resumeData, suspendData, resume: nestedResume, record };
+  }
+
+  /** `stepResults[step.id]` for this call: see {@link #resumeFeed}. */
+  #priorOf(stepId: string, call: StepCall): StepRecord | undefined {
+    if (call.foreachIndex === undefined) return call.getStepResult(stepId);
+    const key = `${stepId}\u0000${call.foreachIndex}`;
+    if (call.attempt > 0 && this.#itemPrior.has(key)) return this.#itemPrior.get(key);
+    const start = this.#o.resume?.records?.get(stepId);
+    const live = call.getStepResult(stepId);
+    // A sibling's non-success result written in this segment (suspended, failed, bailed, paused):
+    // no item starts after one in Mastra — `handleNonSuccessResult` kills the queue
+    // (`handlers/control-flow.ts:1117-1142`) — so this item was dispatched before it, held since
+    // by the run budget ([ADR 0006]), and reads what the id held as the segment began.
+    const prior = live !== undefined && live !== start && live.status !== 'success' ? start : live;
+    this.#itemPrior.set(key, prior);
+    return prior;
+  }
+
+  #now(): number {
+    return this.#o.now === undefined ? Date.now() : this.#o.now();
   }
 
   /**
@@ -462,6 +650,55 @@ export class MastraStepRunner implements StepRunner {
       has: (_, key) => typeof key === 'string' && (view.getStepResult(key) !== undefined || key === 'input'),
     });
   }
+}
+
+/** What {@link MastraStepRunner} hands one attempt about a resume. */
+interface ResumeFeed {
+  readonly resumeData: unknown;
+  readonly suspendData: unknown;
+  readonly resume: NestedResume | undefined;
+  /** Set when the record is a resumed one: the prior payload, when there was one, and the stamp. */
+  readonly record: { readonly prior?: { readonly payload: unknown }; readonly resumedAt: number } | undefined;
+}
+
+/** The `resume` a step's context carries (`handlers/step.ts:423-435`). */
+interface NestedResume {
+  readonly steps: readonly string[];
+  readonly resumePayload: unknown;
+  readonly runId: unknown;
+  readonly label: string | undefined;
+  readonly forEachIndex: number | undefined;
+}
+
+/**
+ * Every top-level `.foreach()` whose body has a stored `suspended` aggregate, with the labels
+ * Mastra carries for it: `getResumeLabelsByStepId(__workflow_meta.resumeLabels, bodyId)`, less the
+ * items whose stored `foreachOutput[k]` is a success (`handlers/control-flow.ts:1046-1048,1235-1239`).
+ */
+function carriedForeachLabels(
+  graph: ExecutionGraph,
+  records: ReadonlyMap<string, StepRecord> | undefined,
+): Map<string, Record<string, ResumeLabel>> {
+  const carried = new Map<string, Record<string, ResumeLabel>>();
+  if (records === undefined) return carried;
+  for (const top of graph.steps) {
+    if (top.type !== 'foreach') continue;
+    const bodyId = entryId(top.step);
+    const stored = records.get(bodyId);
+    if (stored?.status !== 'suspended') continue;
+    const meta = asRecord(asRecord(toMastraStepResult(stored, { now: 0 }).suspendPayload)['__workflow_meta']);
+    const output = meta['foreachOutput'];
+    const labels: Record<string, ResumeLabel> = {};
+    for (const [label, value] of Object.entries(asRecord(meta['resumeLabels']))) {
+      const at = asRecord(value);
+      if (at['stepId'] !== bodyId) continue;
+      const index = typeof at['foreachIndex'] === 'number' ? at['foreachIndex'] : undefined;
+      if (index !== undefined && Array.isArray(output) && asRecord(output[index])['status'] === 'success') continue;
+      labels[label] = { stepId: bodyId, foreachIndex: index };
+    }
+    if (Object.keys(labels).length > 0) carried.set(bodyId, labels);
+  }
+  return carried;
 }
 
 /** `RegisteredLogger.WORKFLOW` — the `component` a nested `Workflow` carries (`adapt.ts`). */

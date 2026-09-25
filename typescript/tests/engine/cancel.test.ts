@@ -5,6 +5,9 @@ import { classify, runWorkflow, runWorkflowDetailed } from '../../src/engine/ind
 import {
   cancelStructureViolations,
   describeReport,
+  resumeGateViolations,
+  segmentLabel,
+  segmentsFor,
   verifyWorkflow,
   type PropertyReport,
   type VerifyOptions,
@@ -105,8 +108,8 @@ afterAll(() => {
   if (proofLog.length > 0) console.info(`[cancel.test proofs]\n${proofLog.join('\n')}`);
 });
 
-/** Every report `verifyWorkflow` returns by default, keyed `segment/property`. */
-const ALL_PROVEN = {
+/** The fresh segments' reports, keyed `segment/property`: pinned literally, never derived. */
+const FRESH_PROVEN = {
   'closed/deadlockFree': 'proven',
   'closed/terminatesAtSink': 'proven',
   'closed/exactlyOneTerminal': 'proven',
@@ -117,21 +120,49 @@ const ALL_PROVEN = {
 } as const;
 
 /**
- * Proves with `verifyWorkflow`'s default: the structural check (throws on a violation), then both
- * segments on the one closed net. Returns every verdict keyed `segment/property`.
+ * Every report `verifyWorkflow` returns by default for `compiled`, keyed `segment/property`, each
+ * `proven`: the fresh segments, then `resume@s` and `resume@s+cancel` for every registered site
+ * ([ADR 0007]). The keys come from `segmentsFor`/`segmentLabel` — never by dropping keys — and
+ * `neverCanceled` is proven only where no cancel arrives. None of these shapes compiles a budget.
+ */
+function allProven(compiled: CompiledWorkflow): Record<string, 'proven'> {
+  expect(compiled.budget).toBeUndefined();
+  const keys = segmentsFor(compiled).flatMap((segment) => {
+    const cancels = typeof segment === 'string' ? segment === 'cancel' : segment.cancel;
+    return ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', ...(cancels ? [] : ['neverCanceled'])].map(
+      (property) => `${segmentLabel(segment)}/${property}`,
+    );
+  });
+  const all = Object.fromEntries(keys.map((key): [string, 'proven'] => [key, 'proven']));
+  // The fresh half is exactly the literal set, first, so the derivation cannot drift unseen.
+  expect(keys.slice(0, Object.keys(FRESH_PROVEN).length)).toStrictEqual(Object.keys(FRESH_PROVEN));
+  expect(keys).toHaveLength(Object.keys(FRESH_PROVEN).length + 7 * compiled.resumeSites.size);
+  return all;
+}
+
+/**
+ * Proves with `verifyWorkflow`'s default: the structural checks (they throw on a violation), then
+ * both fresh segments and both resume segments of every site, on the one closed net. Returns
+ * every verdict keyed `segment/property`, in the order `segmentsFor` gives.
  */
 async function prove(label: string, compiled: CompiledWorkflow, options: VerifyOptions = {}): Promise<Record<string, string>> {
   const t0 = performance.now();
   const reports: readonly PropertyReport[] = await verifyWorkflow(compiled, options);
   const ms = Math.round(performance.now() - t0);
   proofLog.push(`${label} (${ms}ms): ${reports.map(describeReport).join('; ')}`);
-  expect(reports.map((r) => `${r.segment}/${r.property}`)).toEqual(Object.keys(ALL_PROVEN));
-  return Object.fromEntries(reports.map((r) => [`${r.segment}/${r.property}`, r.result.verdict.type]));
+  const keyed = reports.map((r) => `${segmentLabel(r.segment)}/${r.property}`);
+  expect(keyed).toStrictEqual(Object.keys(allProven(compiled)));
+  return Object.fromEntries(reports.map((r) => [`${segmentLabel(r.segment)}/${r.property}`, r.result.verdict.type]));
 }
 
-/** All seven `proven`, stated explicitly — never "not violated", which passes on `unknown`. */
+/** Every verdict `proven`, stated explicitly — never "not violated", which passes on `unknown`. */
 async function expectProven(label: string, compiled: CompiledWorkflow): Promise<void> {
-  expect(await prove(label, compiled), label).toEqual(ALL_PROVEN);
+  expect(await prove(label, compiled), label).toStrictEqual(allProven(compiled));
+}
+
+/** The keys `property` in each of `segments`, each `violated`: the exact flips a mutant causes. */
+function violated(segments: readonly string[], ...properties: readonly string[]): Record<string, 'violated'> {
+  return Object.fromEntries(segments.flatMap((seg) => properties.map((p): [string, 'violated'] => [`${seg}/${p}`, 'violated'])));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1054,12 +1085,21 @@ describe('non-vacuity of each cancellation safeguard', () => {
     const mutant = compile(chain, { gadgets: { step: withoutSweep(stepGadget) } });
     // No sweep, so nothing competes with one: the structural check has nothing to say.
     expect(cancelStructureViolations(mutant)).toEqual([]);
-    const v = await prove('no step sweep', mutant);
-    expect(v).toEqual({
-      ...ALL_PROVEN,
-      'cancel/deadlockFree': 'violated',
-      // Blind: `wf.cancel` is a declared sink — the gap `exactlyOneTerminal` covers.
-      'cancel/exactlyOneTerminal': 'violated',
+    // But each step's input is also a resume site ([ADR 0007]), and a site without a sweep is what
+    // the resume gate check names, exactly — so `verifyWorkflow` now refuses the mutant first, and
+    // the proofs are asked for with the structural checks skipped.
+    expect(resumeGateViolations(mutant)).toStrictEqual([
+      "resume site 3 ('s.3.c.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+      "resume site 1 ('s.1.b.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+      "resume site 0 ('s.0.a.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+    ]);
+    await expect(verifyWorkflow(mutant)).rejects.toThrow(/resume gate structure is unsound/);
+    const v = await prove('no step sweep', mutant, { structure: 'skip' });
+    expect(v).toStrictEqual({
+      ...allProven(mutant),
+      // Blind in `terminatesAtSink`: `wf.cancel` is a declared sink — the gap `exactlyOneTerminal`
+      // covers. Every segment a cancel arrives in sees the stranded input, the resumed ones too.
+      ...violated(['cancel', 'resume@0+cancel', 'resume@1+cancel', 'resume@3+cancel'], 'deadlockFree', 'exactlyOneTerminal'),
     });
     // The run: the abort lands while `a` runs; `b`'s input is never swept and the run never ends.
     const ac = new AbortController();
@@ -1071,7 +1111,11 @@ describe('non-vacuity of each cancellation safeguard', () => {
     const mutant = compile(chain, { gadgets: { sleep: withoutSweep(sleepGadget) } });
     expect(cancelStructureViolations(mutant)).toEqual([]);
     const v = await prove('no sleep sweep', mutant);
-    expect(v).toEqual({ ...ALL_PROVEN, 'cancel/deadlockFree': 'violated', 'cancel/exactlyOneTerminal': 'violated' });
+    // A run resumed at `c` (site 3) is past the sleep, so only the segments that can reach it flip.
+    expect(v).toStrictEqual({
+      ...allProven(mutant),
+      ...violated(['cancel', 'resume@0+cancel', 'resume@1+cancel'], 'deadlockFree', 'exactlyOneTerminal'),
+    });
   }, 120_000);
 
   it('action-side sleep, cancel-waited removed: the cancel segment sees the waited token stranded', async () => {
@@ -1081,7 +1125,9 @@ describe('non-vacuity of each cancellation safeguard', () => {
     });
     expect(cancelStructureViolations(mutant)).toEqual([]);
     const v = await prove('no cancel-waited', mutant);
-    expect(v).toEqual({ ...ALL_PROVEN, 'cancel/deadlockFree': 'violated', 'cancel/exactlyOneTerminal': 'violated' });
+    // The one site is `z` (site 1), past the sleep: both its segments stay proven.
+    expect([...mutant.resumeSites.keys()]).toStrictEqual(['1']);
+    expect(v).toStrictEqual({ ...allProven(mutant), ...violated(['cancel'], 'deadlockFree', 'exactlyOneTerminal') });
     // The run: an abort mid-wait leaves the waited token with nowhere to go.
     const ac = new AbortController();
     const r = new RecordingRunner({ waits: { nap: () => (setTimeout(() => ac.abort(), 30), 60_000) } });
@@ -1159,7 +1205,11 @@ describe('non-vacuity of each cancellation safeguard', () => {
     expect([...mutant.net.transitions].length).toBe([...intact.net.transitions].length - 1);
     expect(cancelStructureViolations(mutant)).toEqual([]);
     const v = await prove(`settle without canceled half (${outcome})`, mutant);
-    expect(v).toEqual({ ...ALL_PROVEN, 'cancel/deadlockFree': 'violated', 'cancel/exactlyOneTerminal': 'violated' });
+    // The settle stage ends every run, resumed ones included: every cancel segment flips.
+    expect(v).toStrictEqual({
+      ...allProven(mutant),
+      ...violated(['cancel', 'resume@0+cancel', 'resume@1+cancel', 'resume@2+cancel'], 'deadlockFree', 'exactlyOneTerminal'),
+    });
 
     const ac = new AbortController();
     const r = new RecordingRunner({
@@ -1169,17 +1219,37 @@ describe('non-vacuity of each cancellation safeguard', () => {
   }, 120_000);
 
   it.each([
-    ["a step sweep's read arc", 't.1.b.cancel'],
-    ["the settle stage's canceled half's read arc", 't.settle.done.canceled'],
-  ])('%s removed: structurally silent, and closed/neverCanceled is violated', async (_label, name) => {
+    {
+      label: "a step sweep's read arc",
+      name: 't.1.b.cancel',
+      // `b`'s input is resume site 1, so the resume gate check names the unguarded consumer and
+      // the missing sweep, exactly — `verifyWorkflow` refuses it before proving.
+      gate: [
+        "'t.1.b.cancel' consumes resume site 1 ('s.1.b.in') without an inhibitor on 'wf.cancel'",
+        "resume site 1 ('s.1.b.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+      ],
+      // A run resumed at `c` (site 2) is past `b` and cannot reach the unguarded sweep.
+      reaches: ['closed', 'resume@0', 'resume@1'],
+    },
+    {
+      label: "the settle stage's canceled half's read arc",
+      name: 't.settle.done.canceled',
+      // The settle stage consumes no resume site: the gate check is silent.
+      gate: [],
+      // Every run ends through the settle stage, resumed ones included.
+      reaches: ['closed', 'resume@0', 'resume@1', 'resume@2'],
+    },
+  ])('$label removed: structurally silent, and closed/neverCanceled is violated', async ({ name, gate, reaches }) => {
     const intact = compile(steps3);
     const mutant = withTransitions(intact, (t) => (t.name === name ? withoutReads(t) : t));
     // It no longer reads the signal, so it is not a sweep and competes with nothing the check
     // looks at. Every quiescence property stays proven: the net still drains to one terminal —
     // sometimes the wrong one, which only the reachability bound on `wf.canceled` sees.
     expect(cancelStructureViolations(mutant)).toEqual([]);
-    const v = await prove(`${name} without read`, mutant);
-    expect(v).toEqual({ ...ALL_PROVEN, 'closed/neverCanceled': 'violated' });
+    expect(resumeGateViolations(mutant)).toStrictEqual(gate);
+    if (gate.length > 0) await expect(verifyWorkflow(mutant)).rejects.toThrow(/resume gate structure is unsound/);
+    const v = await prove(`${name} without read`, mutant, gate.length > 0 ? { structure: 'skip' } : {});
+    expect(v).toStrictEqual({ ...allProven(mutant), ...violated(reaches, 'neverCanceled') });
   }, 120_000);
 
   it("the sweep's read arc, removed: the run flips too — canceled with no signal at all", async () => {
@@ -1197,6 +1267,10 @@ describe('non-vacuity of each cancellation safeguard', () => {
     const v = await prove('no arrival', mutant);
     // The request is not a sink, so a run that finishes with it still pending is a deadlock; it
     // still reaches exactly one terminal (`wf.done`), so only `deadlockFree` sees it.
-    expect(v).toEqual({ ...ALL_PROVEN, 'cancel/deadlockFree': 'violated' });
+    // The same in every resume segment a cancel request is seeded in.
+    expect(v).toStrictEqual({
+      ...allProven(mutant),
+      ...violated(['cancel', 'resume@0+cancel', 'resume@1+cancel', 'resume@2+cancel'], 'deadlockFree'),
+    });
   }, 120_000);
 });

@@ -16,6 +16,8 @@ import { foreachGadget } from '../../src/compiler/gadgets/foreach.js';
 import {
   cancelStructureViolations,
   describeReport,
+  segmentLabel,
+  segmentsFor,
   verifyWorkflow,
   type PropertyReport,
   type Segment,
@@ -60,35 +62,27 @@ function build(entries: readonly EntryDescription[], gadget?: Gadget): CompiledW
   return compile({ id: 'batch', entries }, gadget ? { gadgets: { foreach: gadget } } : {});
 }
 
-/** Every property of both segments, in the order `verifyWorkflow` runs them. */
-const BOTH = [
-  'closed/deadlockFree',
-  'closed/terminatesAtSink',
-  'closed/exactlyOneTerminal',
-  'closed/neverCanceled',
-  'cancel/deadlockFree',
-  'cancel/terminatesAtSink',
-  'cancel/exactlyOneTerminal',
-];
+const cancels = (segment: Segment): boolean => (typeof segment === 'string' ? segment === 'cancel' : segment.cancel);
+
 /**
- * With a run budget compiled in ([ADR 0006]) each segment adds `permitsBounded`
- * (`placeBound(wf.permits, k)`) and `permitsReturned` (`quiescentCount([wf.permits], k, k)`), and
- * the initial marking of both segments also holds `k` permits.
+ * Every property of every default segment, in the order `verifyWorkflow` runs them: `closed`,
+ * `cancel`, then `resume@s` and `resume@s+cancel` per resume site ([ADR 0007]) — a foreach
+ * registers its own site. `neverCanceled` only where no cancel arrives. With a run budget compiled
+ * in ([ADR 0006]) each segment adds `permitsBounded` (`placeBound(wf.permits, k)`) and
+ * `permitsReturned` (`quiescentCount([wf.permits], k, k)`), and every initial marking also holds
+ * `k` permits.
  */
-const BOTH_BUDGETED = [
-  'closed/deadlockFree',
-  'closed/terminatesAtSink',
-  'closed/exactlyOneTerminal',
-  'closed/neverCanceled',
-  'closed/permitsBounded',
-  'closed/permitsReturned',
-  'cancel/deadlockFree',
-  'cancel/terminatesAtSink',
-  'cancel/exactlyOneTerminal',
-  'cancel/permitsBounded',
-  'cancel/permitsReturned',
-];
-const keyOf = (r: PropertyReport): string => `${r.segment}/${r.property}`;
+const everyKey = (compiled: CompiledWorkflow): string[] =>
+  segmentsFor(compiled).flatMap((segment) =>
+    [
+      'deadlockFree',
+      'terminatesAtSink',
+      'exactlyOneTerminal',
+      ...(cancels(segment) ? [] : ['neverCanceled']),
+      ...(compiled.budget ? ['permitsBounded', 'permitsReturned'] : []),
+    ].map((p) => `${segmentLabel(segment)}/${p}`),
+  );
+const keyOf = (r: PropertyReport): string => `${segmentLabel(r.segment)}/${r.property}`;
 
 /** Appends a line to the file `PROOF_LOG` names, when it names one — the route-and-ms record. */
 const proofLog = (line: string): void => {
@@ -97,19 +91,19 @@ const proofLog = (line: string): void => {
 };
 
 /**
- * `verifyWorkflow`'s default — the structural check, then both segments — with every property
- * `proven`. Logs each report's route and time under `label`.
+ * `verifyWorkflow`'s default — the structural checks, then every segment, the foreach's resume
+ * site's two included — with every property `proven`. Logs each report's route and time under
+ * `label`.
  */
 async function prove(
   expect: ExpectStatic,
   label: string,
   compiled: CompiledWorkflow,
   timeoutMs = 300_000,
-  expected: readonly string[] = BOTH,
 ): Promise<readonly PropertyReport[]> {
   const reports = await verifyWorkflow(compiled, { timeoutMs });
   proofLog(`[${label}] ${reports.map(describeReport).join('; ')}`);
-  expect(reports.map(keyOf)).toEqual(expected);
+  expect(reports.map(keyOf)).toEqual(everyKey(compiled));
   for (const report of reports) expect(report.result.verdict.type, `${label}: ${describeReport(report)}`).toBe('proven');
   return reports;
 }
@@ -254,15 +248,16 @@ describe.concurrent('compiled foreach, proved (both segments)', () => {
  * retry delay or a finisher. Proven for c = 2 at k = 1 (the budget binds below the lane count) and
  * k = 2 (they coincide): the initial marking is one token in the entry place plus `k` permits,
  * plus the cancel request in the `cancel` segment; route SMT, as for every foreach shape; eleven
- * properties. Peak items in flight = min(c, k) is measured by `tests/compiler/foreach.test.ts`
+ * properties, and the same eleven again from the foreach's resume site `resume@0` with and without
+ * a cancel ([ADR 0007]), whose marking also holds the `k` permits. Peak items in flight = min(c, k) is measured by `tests/compiler/foreach.test.ts`
  * — "in flight" is an executor notion (a transition whose action has not returned), not a marking.
  */
 describe.concurrent('compiled foreach under a run budget, proved (both segments)', () => {
-  it.for([1, 2])('c = 2, k = %i: the budget is conserved from the arcs, and all eleven properties are proven', SLOW, async (k, { expect }) => {
+  it.for([1, 2])('c = 2, k = %i: the budget is conserved from the arcs, and every property of every segment is proven', SLOW, async (k, { expect }) => {
     const compiled = compile({ id: 'batch', entries: [foreach(2)] }, { concurrency: k });
     expect(compiled.budget?.k).toBe(k);
     expect(budgetStructureViolations(compiled)).toEqual([]);
-    await prove(expect, `foreach(c=2) k=${k}`, compiled, 300_000, BOTH_BUDGETED);
+    await prove(expect, `foreach(c=2) k=${k}`, compiled, 300_000);
   });
 });
 
@@ -466,6 +461,15 @@ describe.concurrent('compiled foreach: each cancellation safeguard is load-beari
       'cancel/deadlockFree': 'proven',
       'cancel/terminatesAtSink': 'proven',
       'cancel/exactlyOneTerminal': 'proven',
+      // Resumed at the foreach's own site ([ADR 0007]): the finishers are reached from there too,
+      // so the resumed segment without a cancel sees the same, and the one with a cancel does not.
+      'resume@0/deadlockFree': 'proven',
+      'resume@0/terminatesAtSink': 'proven',
+      'resume@0/exactlyOneTerminal': 'proven',
+      'resume@0/neverCanceled': 'violated',
+      'resume@0+cancel/deadlockFree': 'proven',
+      'resume@0+cancel/terminatesAtSink': 'proven',
+      'resume@0+cancel/exactlyOneTerminal': 'proven',
     });
   });
 });

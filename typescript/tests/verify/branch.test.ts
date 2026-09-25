@@ -26,6 +26,9 @@ import { runWorkflow } from '../../src/engine/index.js';
 import {
   cancelStructureViolations,
   describeReport,
+  resumeGateViolations,
+  segmentLabel,
+  segmentsFor,
   verifyWorkflow,
   type PropertyReport,
   type Segment,
@@ -42,27 +45,30 @@ const branch = (id: string, ...arms: StepDescription[]): EntryDescription => ({ 
 const workflow = (...entries: EntryDescription[]): WorkflowDescription => ({ id: 'triage', entries });
 const arms = (k: number): StepDescription[] => Array.from({ length: k }, (_, i) => step(`arm${i}`));
 
-/** Every property of both segments `verifyWorkflow` proves by default, in its order. */
-const EVERY_REPORT = [
-  'closed/deadlockFree',
-  'closed/terminatesAtSink',
-  'closed/exactlyOneTerminal',
-  'closed/neverCanceled',
-  'cancel/deadlockFree',
-  'cancel/terminatesAtSink',
-  'cancel/exactlyOneTerminal',
-];
+/** The property set `verifyWorkflow` proves in a segment with no cancel arriving, and in one with. */
+const UNCANCELED = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', 'neverCanceled'] as const;
+const CANCELED = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal'] as const;
+const cancels = (segment: Segment): boolean => (typeof segment === 'string' ? segment === 'cancel' : segment.cancel);
+const keyOf = (r: PropertyReport): string => `${segmentLabel(r.segment)}/${r.property}`;
 
 /**
- * Proves a compiled net through `verifyWorkflow`'s default — the structural cancel check, then
- * both segments on the same closed net: `closed` (no cancel ever arrives, so `wf.canceled` is
- * never marked either) and `cancel` (one cancel request seeded, and its arrival free to fire at
- * every reachable point). Every report `proven`, asserted explicitly: `isViolated()` is false on
- * `unknown` too.
+ * Every `segment/property` key `verifyWorkflow` proves by default, in its order: `closed`,
+ * `cancel`, then `resume@s` and `resume@s+cancel` for every resume site ([ADR 0007]).
+ */
+const everyReport = (compiled: CompiledWorkflow): string[] =>
+  segmentsFor(compiled).flatMap((segment) => (cancels(segment) ? CANCELED : UNCANCELED).map((p) => `${segmentLabel(segment)}/${p}`));
+
+/**
+ * Proves a compiled net through `verifyWorkflow`'s default — the structural checks, then every
+ * segment on the same closed net: `closed` (no cancel ever arrives, so `wf.canceled` is never
+ * marked either), `cancel` (one cancel request seeded, and its arrival free to fire at every
+ * reachable point), and `resume@s` / `resume@s+cancel` from each resume site — every arm of a
+ * branch, and every top-level step ([ADR 0007]). Every report `proven`, asserted explicitly:
+ * `isViolated()` is false on `unknown` too.
  */
 async function expectProvenBoth(compiled: CompiledWorkflow, timeoutMs = 120_000): Promise<readonly PropertyReport[]> {
   const reports = await verifyWorkflow(compiled, { timeoutMs });
-  expect(reports.map((r) => `${r.segment}/${r.property}`)).toEqual(EVERY_REPORT);
+  expect(reports.map(keyOf)).toEqual(everyReport(compiled));
   for (const report of reports) expect(report.result.verdict.type, describeReport(report)).toBe('proven');
   return reports;
 }
@@ -144,11 +150,12 @@ describe('compiled branch, scaling in the number of arms', () => {
 
       const reports = await expectProvenBoth(compiled, 600_000);
 
-      // Block: decide, its sweep, gate-i and collect-i per arm, four exit collects, three joins —
-      // 2k + 9; one per arm; ten for the settle stage and one for the cancel arrival. Branches:
-      // decide 2, each gate 2, each arm 5, every other transition 1.
-      expect(transitions).toHaveLength(3 * k + 9 + 11);
-      expect(branches).toBe(8 * k + 10 + 11);
+      // Block: decide, its sweep, four exit collects, three joins — 9; per arm gate-i, collect-i,
+      // the arm's run, and the resume trio replay-i, re-enter-i and its sweep re-enter-i.cancel
+      // ([ADR 0007]) — 6k; ten for the settle stage and one for the cancel arrival. Branches:
+      // decide 2, each gate 2, each arm 5, each replay 3, each re-enter 2, every other transition 1.
+      expect(transitions).toHaveLength(6 * k + 9 + 11);
+      expect(branches).toBe(14 * k + 10 + 11);
       const cell = (segment: Segment) => {
         const rs = inSegment(reports, segment);
         return `${[...new Set(rs.map((r) => r.result.route))].join('/')} ${rs.map((r) => Math.round(r.result.elapsedMs)).join('+')}ms`;
@@ -384,7 +391,8 @@ describe('compiled branch, non-vacuity', () => {
 function dropping(role: string): Gadget {
   return (entry, next, ctx) => {
     const result = branchGadget(entry, next, ctx);
-    const transitions = result.transitions.filter((t) => !t.name.endsWith(`.${role}`));
+    // By the block's own name: an arm's resume sweep also ends in `.cancel` ([ADR 0007]).
+    const transitions = result.transitions.filter((t) => !t.name.endsWith(`.${entry.id}.${role}`));
     expect(result.transitions.length - transitions.length, `drop target '${role}'`).toBe(1);
     return { ...result, transitions };
   };
@@ -419,7 +427,7 @@ const gatedArms: Gadget = (entry, next, ctx) =>
   });
 
 const verdicts = (reports: readonly PropertyReport[]): Record<string, string> =>
-  Object.fromEntries(reports.map((r) => [`${r.segment}/${r.property}`, r.result.verdict.type]));
+  Object.fromEntries(reports.map((r) => [keyOf(r), r.result.verdict.type]));
 
 /**
  * Each cancellation safeguard the block adds, removed in turn through the `gadgets` override,
@@ -510,11 +518,15 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
   }
 
   it('every cancel inhibitor the block adds is structurally load-bearing: stripped, each is named', () => {
-    // The block gates exactly its start: `decide` (or `pass` when it has no arms). The join's
+    // The block gates exactly its start — `decide`, or `pass` when it has no arms — and each arm's
+    // resume gate `re-enter-i` ([ADR 0007]), which competes with its own sweep. The join's
     // inhibitors are on its own markers, not on the signal, and the arms are ungated by design.
     for (const [description, expected] of [
-      [twoArms, ['t.0.route.decide']],
-      [prepThen(branch('route', step('a'), step('b'), step('c'))), ['t.1.route.decide']],
+      [twoArms, ['t.0.route.decide', 't.0.route.re-enter-0', 't.0.route.re-enter-1']],
+      [
+        prepThen(branch('route', step('a'), step('b'), step('c'))),
+        ['t.1.route.decide', 't.1.route.re-enter-0', 't.1.route.re-enter-1', 't.1.route.re-enter-2'],
+      ],
       [workflow(branch('route'), step('audit')), ['t.0.route.pass']],
     ] as const) {
       const real = compile(description);
@@ -550,6 +562,7 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
         );
         expect(gatedArmStarts.length).toBeGreaterThanOrEqual(2);
         expect(cancelStructureViolations(mutant)).toEqual([]);
+        expect(resumeGateViolations(mutant)).toEqual([]);
       }
     });
 
@@ -577,7 +590,43 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
       // never matters, so every closed report stays proven.
       // Measured last phase at 152s-243s via SMT, `unknown` on some properties; the cancel segment
       // now enumerates and refutes it in milliseconds, so the proof is a flip of its own.
-      for (const description of [twoArms, middle]) {
+      // Resumed at an arm: with no cancel the gate never matters either. With one, a cancel
+      // landing after `re-enter-i` sweeps the gated arm to `canceled` and it never arrives, so the
+      // sibling's replayed arrival is stranded beside the one terminal — deadlockFree sees it,
+      // exactlyOneTerminal (still one terminal) does not. Resumed at `prep`, the entry place
+      // itself, the segment starts where the fresh one does and sees what it sees; resumed at
+      // `audit`, past the block, nothing gated by the mutant is left to run.
+      const armSegments = (site: string) => ({
+        [`resume@${site}/deadlockFree`]: 'proven',
+        [`resume@${site}/terminatesAtSink`]: 'proven',
+        [`resume@${site}/exactlyOneTerminal`]: 'proven',
+        [`resume@${site}/neverCanceled`]: 'proven',
+        [`resume@${site}+cancel/deadlockFree`]: 'violated',
+        [`resume@${site}+cancel/terminatesAtSink`]: 'proven',
+        [`resume@${site}+cancel/exactlyOneTerminal`]: 'proven',
+      });
+      const asFresh = (site: string) => ({
+        [`resume@${site}/deadlockFree`]: 'proven',
+        [`resume@${site}/terminatesAtSink`]: 'proven',
+        [`resume@${site}/exactlyOneTerminal`]: 'proven',
+        [`resume@${site}/neverCanceled`]: 'proven',
+        [`resume@${site}+cancel/deadlockFree`]: 'violated',
+        [`resume@${site}+cancel/terminatesAtSink`]: 'proven',
+        [`resume@${site}+cancel/exactlyOneTerminal`]: 'violated',
+      });
+      const allProven = (site: string) => ({
+        [`resume@${site}/deadlockFree`]: 'proven',
+        [`resume@${site}/terminatesAtSink`]: 'proven',
+        [`resume@${site}/exactlyOneTerminal`]: 'proven',
+        [`resume@${site}/neverCanceled`]: 'proven',
+        [`resume@${site}+cancel/deadlockFree`]: 'proven',
+        [`resume@${site}+cancel/terminatesAtSink`]: 'proven',
+        [`resume@${site}+cancel/exactlyOneTerminal`]: 'proven',
+      });
+      for (const [description, resumed] of [
+        [twoArms, { ...armSegments('0.0'), ...armSegments('0.1') }],
+        [middle, { ...asFresh('0'), ...armSegments('1.0'), ...armSegments('1.1'), ...allProven('2') }],
+      ] as const) {
         const reports = await verifyWorkflow(compile(description, { gadgets: { branch: gatedArms } }), { timeoutMs: 120_000 });
         expect(verdicts(reports), reports.map(describeReport).join('; ')).toEqual({
           'closed/deadlockFree': 'proven',
@@ -588,6 +637,7 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
           // A marked `wf.cancel` is a sink, so a stuck join beside it still "terminates at a sink".
           'cancel/terminatesAtSink': 'proven',
           'cancel/exactlyOneTerminal': 'violated',
+          ...resumed,
         });
         for (const r of reports) expect(r.result.route, describeReport(r)).toBe('enumeration');
       }

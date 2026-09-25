@@ -140,16 +140,24 @@ export function toMastraStepResult(record: StepRecord, options: ToMastraOptions 
       return { ...common, status: 'bailed', output: record.output, endedAt: time('endedAt', record.endedAt) };
     case 'failed': {
       const tripwire = tripwireInfo(record.tripwire);
+      // A failure Mastra itself recorded — `host` is that very record — is already what Mastra
+      // stores: its `error` normalised, or serialised once it has been through storage
+      // (`SerializedStepFailure`), and is kept as it is.
+      const recorded = host['status'] === 'failed' && host['error'] === record.error;
       return {
         ...common,
         status: 'failed',
-        error: (options.normalizeError ?? normalizeError)(record.error),
+        error: recorded ? (record.error as Error) : (options.normalizeError ?? normalizeError)(record.error),
         endedAt: time('endedAt', record.endedAt),
         // An own key even when there is no tripwire: Mastra writes `tripwire: undefined` on every
         // failure (`default.ts:497-506`), and the differential harness compares keys, not values.
+        // A stored failure JSON dropped the undefined key from gets it back, as Mastra writes it.
         tripwire,
         ...(record.nonRetryable === true ? { nonRetryable: true as const } : {}),
-      };
+        // A failed `.foreach()` aggregate carries its `__workflow_meta.foreachOutput` here
+        // (`handlers/control-flow.ts:1355-1370`); no other failure has one.
+        ...(record.suspendPayload === undefined ? {} : { suspendPayload: record.suspendPayload }),
+      } as StepFailure;
     }
     case 'suspended':
       return {
@@ -178,7 +186,14 @@ export function toMastraStepResult(record: StepRecord, options: ToMastraOptions 
  * status but `success` (`step.ts:179-193`). A caller that must keep such an entry for the codec
  * keeps the Mastra object itself.
  *
- * The whole result is kept as `host`, so {@link toMastraStepResult} gives it back unchanged.
+ * **The inverse of {@link toMastraStepResult}** ([ADR 0007]: a resume starts from these records).
+ * The whole result is kept as `host`, so `toMastraStepResult(fromMastraStepResult(r))` is `r` again
+ * — key for key, a stored failure's serialised `error` included — for every status that has a
+ * record, with one key restored: a failure JSON stored without its undefined `tripwire` gets the
+ * own key back, as Mastra writes it (`default.ts:497-506`). The other way, `fromMastraStepResult(toMastraStepResult(rec))` is
+ * `rec` on every field but `host` (now the Mastra result) and the two Mastra never stores: the
+ * engine's `metadata.foreachIndex`, and a thrown value that is not an `Error`, which Mastra
+ * normalises (`default.ts:466-469`). `tests/mastra/step-result-roundtrip.test.ts` holds both.
  * `metadata` keeps only the key the engine reads (`iterationCount`); the rest stays in `host`. A
  * status Mastra has not declared throws, naming it — except `bailed` and `canceled`, which Mastra
  * stores without declaring.
@@ -211,6 +226,7 @@ export function fromMastraStepResult(result: StoredStepResult): StepRecord | und
         endedAt: result.endedAt,
         ...(result.tripwire === undefined ? {} : { tripwire: result.tripwire }),
         ...(result.nonRetryable === true ? { nonRetryable: true } : {}),
+        ...(failedSuspendPayload(result) === undefined ? {} : { suspendPayload: failedSuspendPayload(result) }),
       };
     case 'suspended':
       return {
@@ -268,6 +284,11 @@ export function getStepResultView(
     const record: unknown = view.getStepResult(id) ?? (id === 'input' ? view.initData : undefined);
     return isRecord(record) && record['status'] === 'success' ? record['output'] : null;
   };
+}
+
+/** A stored failure's `suspendPayload` — a failed `.foreach()` aggregate's meta — or none. */
+function failedSuspendPayload(result: StoredStepResult): unknown {
+  return (result as { readonly suspendPayload?: unknown }).suspendPayload;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

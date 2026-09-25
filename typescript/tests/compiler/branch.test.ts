@@ -383,7 +383,17 @@ describe('branch: failure, suspension and their precedence', () => {
 
     const report = await runWorkflowDetailed(compile(threeArms), 'alert', { runner });
 
-    expect(report.outcome).toStrictEqual({ status: 'suspended', stepId: 'sms', path: [0, 1], payload: 'sms-wait' });
+    // The other suspended arm rides along as `pending`, in arm order ([ADR 0007]), with the
+    // `suspendedAt` its record carries.
+    const pendingAt = (report.stepResults.get('push') as { suspendedAt?: number } | undefined)?.suspendedAt;
+    expect(pendingAt).toEqual(expect.any(Number));
+    expect(report.outcome).toStrictEqual({
+      status: 'suspended',
+      stepId: 'sms',
+      path: [0, 1],
+      payload: 'sms-wait',
+      pending: [{ stepId: 'push', path: [0, 2], payload: 'push-wait', suspendedAt: pendingAt }],
+    });
     // Both arms' suspensions are in the step results, which is where Mastra's run result lists
     // every suspended step from (`default.ts:630-643`). The record's `payload` is the step's
     // *input*, Mastra's `StepResult.payload`; the suspension's own is `suspendPayload`, kept
@@ -580,15 +590,44 @@ describe('branch: structure', () => {
     expect(compile(threeArmsThenAudit).structuralHash).toBe(compile(threeArmsThenAudit).structuralHash);
   });
 
-  it('emits 2n + 9 transitions of its own plus one per arm, every name unique', () => {
+  it('emits 5n + 9 transitions of its own plus one per arm, every name unique', () => {
     const compiled = compile(workflow(branch('route', step('x'), step('x'), step('y'))));
 
     const places = [...compiled.net.places].map((p) => p.name);
     const transitions = [...compiled.net.transitions].map((t) => t.name);
     expect(new Set(places).size).toBe(places.length);
     expect(new Set(transitions).size).toBe(transitions.length);
-    // decide, its cancellation sweep, gate-i and collect-i per arm, four exit collects, three joins.
-    expect(transitions.filter((name) => name.startsWith('t.0.route.'))).toHaveLength(2 * 3 + 9);
+    // decide, its cancellation sweep, gate-i and collect-i per arm, four exit collects, three joins
+    // — and per arm the resume topology ([ADR 0007]): re-enter-i, its sweep re-enter-i.cancel, and
+    // replay-i, which replays that arm's stored verdict through the same joins.
+    const own = transitions.filter((name) => name.startsWith('t.0.route.'));
+    expect(own).toHaveLength(5 * 3 + 9);
+    expect([...own].sort()).toStrictEqual([
+      't.0.route.cancel',
+      't.0.route.collect-0',
+      't.0.route.collect-1',
+      't.0.route.collect-2',
+      't.0.route.collect-bail',
+      't.0.route.collect-err',
+      't.0.route.collect-pause',
+      't.0.route.collect-susp',
+      't.0.route.decide',
+      't.0.route.gate-0',
+      't.0.route.gate-1',
+      't.0.route.gate-2',
+      't.0.route.join-fail',
+      't.0.route.join-ok',
+      't.0.route.join-susp',
+      't.0.route.re-enter-0',
+      't.0.route.re-enter-0.cancel',
+      't.0.route.re-enter-1',
+      't.0.route.re-enter-1.cancel',
+      't.0.route.re-enter-2',
+      't.0.route.re-enter-2.cancel',
+      't.0.route.replay-0',
+      't.0.route.replay-1',
+      't.0.route.replay-2',
+    ]);
     // Two arms share the id `x` and still get distinct transitions, because the path differs.
     expect(transitions.filter((name) => /^t\.0-\d\.x\.run$/.test(name)).sort()).toEqual(['t.0-0.x.run', 't.0-1.x.run']);
   });

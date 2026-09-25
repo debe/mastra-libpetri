@@ -5,7 +5,7 @@
  * and a tsup external, so a compiler or verification build never pulls Mastra in (CLAUDE.md,
  * *Source layout*). This file is that seam — a structural copy of exactly the fields the
  * adapter and the step-result translation (`step-result.ts`) read or write, and nothing else.
- * Types only: no runtime code but `entryId`.
+ * Types only: no runtime code but `entryId` and `suspendTracingContext`.
  *
  * **Transcribed from `@mastra/core@1.67.0`.** Cited so drift is findable:
  * - `StepFlowEntry`, `SingleStepEntry`, `ForeachOptions`, `StepFlowEntryOptions` —
@@ -13,6 +13,9 @@
  * - `Step` — `.mastra/package/dist/workflows/step.d.ts:59-78`
  * - `ExecutionGraph` — `.mastra/package/dist/workflows/execution-engine.d.ts:13-16`
  * - `getEntryId` — `.mastra/src-extracted/src/workflows/step-entry.ts:23-25`
+ * - `resolveExportedSpanId` — `.mastra/src-extracted/src/observability/utils.ts:117-122`; the span
+ *   members it and `default.ts:945-950` read — `dist/observability/types/tracing.d.ts:1049,1113,1122`
+ * - `WorkflowStateTracingContext` — `.mastra/package/dist/workflows/types.d.ts:231-235`
  * - `StepResult` and its members, `StepTripwireInfo`, `SerializedStepFailure` —
  *   `.mastra/package/dist/workflows/types.d.ts:65-162`; `SerializedError` —
  *   `dist/_types/@internal_core/dist/error/index.d.ts:12-17`
@@ -354,3 +357,40 @@ export type StepResult =
  * (`SerializedStepResult`, `types.d.ts:162`), and the undeclared `'bailed'` and `'canceled'`.
  */
 export type StoredStepResult = StepResult | SerializedStepFailure | StepBailed | StepCanceled;
+
+// ---------------------------------------------------------------------------------------------
+// Tracing
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The members of Mastra's workflow run span that a suspension's tracing context is read from
+ * (`tracing.d.ts:1049,1113,1122`). `getExportedSpanId` is optional on Mastra's own interface.
+ */
+export interface TracedSpan {
+  readonly traceId?: string;
+  readonly id?: string;
+  getParentSpanId?(includeInternalSpans?: boolean): string | undefined;
+  getExportedSpanId?(): string | undefined;
+}
+
+/** `WorkflowStateTracingContext` (`types.d.ts:231-235`): what a suspended snapshot links a resume to. */
+export interface TracingContext {
+  readonly traceId?: string;
+  readonly spanId?: string;
+  readonly parentSpanId?: string;
+}
+
+/**
+ * The tracing context the default engine persists with a suspended run, so the resumed run's span
+ * links back to it (`default.ts:938-950`, read back at `workflow.ts:4695-4744`):
+ * `{ traceId, spanId: resolveExportedSpanId(span), parentSpanId: span.getParentSpanId() }`.
+ *
+ * `resolveExportedSpanId` reproduced structurally (`observability/utils.ts:117-122`), so no runtime
+ * `@mastra/core` import is needed: the span's exported id when the span has the method — which may
+ * be `undefined`, meaning nothing in the chain reached an exporter — and its own `id` when it
+ * predates the method.
+ */
+export function suspendTracingContext(span: TracedSpan): TracingContext {
+  const spanId = typeof span.getExportedSpanId === 'function' ? span.getExportedSpanId() : span.id;
+  return { traceId: span.traceId, spanId, parentSpanId: span.getParentSpanId?.() };
+}

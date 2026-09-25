@@ -13,6 +13,7 @@ import type {
   StepOutcome,
 } from '../../src/compiler/types.js';
 import { RecordingRunner } from '../fixtures/runner.js';
+import { ManualClock } from '../support/manual-clock.js';
 
 /**
  * `.foreach`, run — against Mastra's `executeForeach` (`@mastra/core@1.67.0`,
@@ -112,9 +113,16 @@ async function run(
   runner: RecordingRunner,
   gadget?: Gadget,
   signal?: AbortSignal,
+  clock?: ManualClock,
 ): Promise<RunReport> {
-  return runWorkflowDetailed(build(entries, gadget), input, { runner, timeoutMs: 10_000, ...(signal ? { signal } : {}) });
+  return runWorkflowDetailed(build(entries, gadget), input, {
+    runner,
+    timeoutMs: 10_000,
+    ...(signal ? { signal } : {}),
+    ...(clock ? { clock } : {}),
+  });
 }
+
 
 /**
  * Observes what the foreach puts on one of its exits, without changing what happens next: the
@@ -547,7 +555,7 @@ describe('foreach: bail, pause and suspend', () => {
     const report = await run([foreach(3)], ['a', 'b', 'c'], runner);
 
     expect(report.outcome).toEqual({ status: 'suspended', stepId: 'body', path: [0], foreachIndex: 0, payload: { ask: 'a' } });
-    // `{...stepInfo, suspendedAt, status, suspendPayload}` (`:1432-1450`): the foreach's input and
+    // `{...stepInfo, suspendedAt, status, suspendPayload}` (`:1433-1451`): the foreach's input and
     // start, the lowest item's suspend payload, `suspendedAt`, and no `endedAt`. No `suspendOutput`
     // either — Mastra reads it from `foreachIndexObj`, which never stores one (`:1119-1124`).
     const record = report.stepResults.get('body')!;
@@ -717,9 +725,29 @@ describe('foreach: per-item context (row 32)', () => {
     const { runner } = itemRunner((label) =>
       label === 'b' ? { status: 'suspended', suspendPayload: 'wait' } : { status: 'success', output: `${label}!` },
     );
-    const report = await run([{ kind: 'step', id: 'before' }, foreach(1)], ['a', 'b', 'c'], runner, s.gadget);
+    // A virtual clock, so every stamp is asserted to the instant: no virtual time passes, so each
+    // is the clock's epoch, `EPOCH` (a const is hoisted but read only when the test runs).
+    const report = await run([{ kind: 'step', id: 'before' }, foreach(1)], ['a', 'b', 'c'], runner, s.gadget, undefined, new ManualClock());
     expect(report.outcome).toEqual({ status: 'suspended', stepId: 'body', path: [1], foreachIndex: 1, payload: 'wait' });
-    expect(s.seen).toEqual([{ stepId: 'body', path: [1], foreachIndex: 1, payload: 'wait' }]);
+    // The suspension carries Mastra's `__workflow_meta.{foreachIndex, foreachOutput}` as `foreach`
+    // (`handlers/control-flow.ts:1433-1451`): the item that suspended, and every item's record so
+    // far — `c` never started, one lane and `b` suspended first.
+    expect(s.seen).toEqual([
+      {
+        stepId: 'body',
+        path: [1],
+        foreachIndex: 1,
+        payload: 'wait',
+        suspendedAt: EPOCH,
+        foreach: {
+          foreachIndex: 1,
+          foreachOutput: [
+            { index: 0, record: { status: 'success', output: 'a!', payload: 'a', startedAt: EPOCH, endedAt: EPOCH, suspendPayload: {} } },
+            { index: 1, record: { status: 'suspended', payload: 'b', startedAt: EPOCH, suspendPayload: 'wait', suspendedAt: EPOCH } },
+          ],
+        },
+      },
+    ]);
   });
 });
 
@@ -734,11 +762,31 @@ describe('foreach: nonRetryable on the aggregate failure (row 36)', () => {
       await sleep(10);
       return { status: 'success', output: 'b!' };
     });
-    const report = await run([foreach(2, body({ retries: 3 }))], ['a', 'b'], runner, f.gadget);
+    const report = await run([foreach(2, body({ retries: 3 }))], ['a', 'b'], runner, f.gadget, undefined, new ManualClock());
 
     expect(runner.attempts.filter((a) => a.attempt > 0)).toEqual([]);
     expect(report.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 0, error: 'fatal' });
-    expect(f.seen).toEqual([{ stepId: 'body', path: [0], foreachIndex: 0, error: 'fatal', nonRetryable: true }]);
+    // The failure carries `__workflow_meta.foreachOutput` as `foreach` (`handlers/control-flow.ts:
+    // 1355-1370`): `b`'s success is in it, because `b` settled before the lanes drained.
+    expect(f.seen).toEqual([
+      {
+        stepId: 'body',
+        path: [0],
+        foreachIndex: 0,
+        error: 'fatal',
+        nonRetryable: true,
+        foreach: {
+          foreachIndex: 0,
+          foreachOutput: [
+            {
+              index: 0,
+              record: { status: 'failed', error: 'fatal', nonRetryable: true, payload: 'a', startedAt: EPOCH, endedAt: EPOCH, suspendPayload: {} },
+            },
+            { index: 1, record: { status: 'success', output: 'b!', payload: 'b', startedAt: EPOCH, endedAt: EPOCH, suspendPayload: {} } },
+          ],
+        },
+      },
+    ]);
     expect(report.stepResults.get('body')).toMatchObject({
       status: 'failed',
       error: 'fatal',
@@ -751,8 +799,21 @@ describe('foreach: nonRetryable on the aggregate failure (row 36)', () => {
   it('keeps a retryable failure retryable', async () => {
     const f = tapped('failed');
     const { runner } = itemRunner(() => ({ status: 'failed', error: 'plain' }));
-    await run([foreach(1)], ['a'], runner, f.gadget);
-    expect(f.seen).toEqual([{ stepId: 'body', path: [0], foreachIndex: 0, error: 'plain' }]);
+    await run([foreach(1)], ['a'], runner, f.gadget, undefined, new ManualClock());
+    expect(f.seen).toEqual([
+      {
+        stepId: 'body',
+        path: [0],
+        foreachIndex: 0,
+        error: 'plain',
+        foreach: {
+          foreachIndex: 0,
+          foreachOutput: [
+            { index: 0, record: { status: 'failed', error: 'plain', payload: 'a', startedAt: EPOCH, endedAt: EPOCH, suspendPayload: {} } },
+          ],
+        },
+      },
+    ]);
     expect('nonRetryable' in (f.seen[0] as object)).toBe(false);
   });
 });

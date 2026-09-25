@@ -6,8 +6,9 @@
  * `init()` returns Mastra's own `createWorkflow` / `createStep`, bound to `PetriExecutionEngine`
  * and branded with `PetriEngineType`. The engine extends Mastra's `ExecutionEngine`, compiles the
  * committed step flow (`adapt.ts`) to one net, and runs every firing on Mastra's `StepExecutor`.
- * `step-result.ts` translates the engine's step records to and from Mastra's `StepResult`. See the
- * root README for the architecture.
+ * `step-result.ts` translates the engine's step records to and from Mastra's `StepResult`;
+ * `resume-codec.ts` decodes the `resume` parameter `Run.resume()` hands `execute()` ([ADR 0007]).
+ * See the root README for the architecture.
  */
 export { init, PETRI_ENGINE_TYPE } from './init.js';
 export type {
@@ -30,7 +31,11 @@ export {
   UnsupportedWorkflowError,
 } from './adapt.js';
 export type { AdaptOptions } from './adapt.js';
-export { entryId } from './host.js';
+export { entryId, suspendTracingContext } from './host.js';
+export type { TracedSpan, TracingContext } from './host.js';
+export { decodeResume } from './resume-codec.js';
+export type { DecodedResume, RunnerResume } from './resume-codec.js';
+export type { PersistGuard } from './persist.js';
 export { fromMastraStepResult, getStepResultView, toMastraStepResult } from './step-result.js';
 export type { OutcomeStepResult, StepReference, ToMastraOptions } from './step-result.js';
 export type {

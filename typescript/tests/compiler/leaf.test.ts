@@ -9,9 +9,18 @@ import {
   type Gadget,
 } from '../../src/compiler/index.js';
 import { runWorkflow, runWorkflowDetailed } from '../../src/engine/index.js';
-import { cancelStructureViolations, describeReport, verifyWorkflow, type PropertyReport } from '../../src/verify/index.js';
+import {
+  cancelStructureViolations,
+  describeReport,
+  resumeGateViolations,
+  segmentLabel,
+  segmentsFor,
+  verifyWorkflow,
+  type PropertyReport,
+} from '../../src/verify/index.js';
 import type {
   CanceledToken,
+  CompiledWorkflow,
   EntryDescription,
   Exits,
   FlowToken,
@@ -101,8 +110,28 @@ function failedWith(stepId: string, message: RegExp, path: readonly number[] = [
   };
 }
 
-/** Every report `verifyWorkflow` returns by default, in order: both segments on one closed net. */
-const ALL_REPORTS = [
+/**
+ * Every report `verifyWorkflow` returns by default for `compiled`, in order: `closed`, `cancel`,
+ * then `resume@s` and `resume@s+cancel` for every registered site ([ADR 0007]) — derived from
+ * `segmentsFor`/`segmentLabel`, never by dropping keys. `neverCanceled` only where no cancel
+ * arrives; a budget adds its two permit properties to every segment.
+ */
+function allReports(compiled: CompiledWorkflow): string[] {
+  return segmentsFor(compiled).flatMap((segment) => {
+    const label = segmentLabel(segment);
+    const cancels = typeof segment === 'string' ? segment === 'cancel' : segment.cancel;
+    return [
+      'deadlockFree',
+      'terminatesAtSink',
+      'exactlyOneTerminal',
+      ...(cancels ? [] : ['neverCanceled']),
+      ...(compiled.budget ? ['permitsBounded', 'permitsReturned'] : []),
+    ].map((property) => `${label}/${property}`);
+  });
+}
+
+/** The fresh segments alone, pinned literally, so `allReports` cannot drift from them unseen. */
+const FRESH_REPORTS = [
   'closed/deadlockFree',
   'closed/terminatesAtSink',
   'closed/exactlyOneTerminal',
@@ -112,8 +141,13 @@ const ALL_REPORTS = [
   'cancel/exactlyOneTerminal',
 ];
 
-function expectAllProven(reports: readonly PropertyReport[]): void {
-  expect(reports.map((r) => `${r.segment}/${r.property}`)).toEqual(ALL_REPORTS);
+function expectAllProven(compiled: CompiledWorkflow, reports: readonly PropertyReport[], sites: readonly string[]): void {
+  // The registered sites, exactly, so a lost or extra site is a failure of its own.
+  expect([...compiled.resumeSites.keys()].sort()).toStrictEqual([...sites].sort());
+  const expected = allReports(compiled);
+  expect(expected.slice(0, FRESH_REPORTS.length)).toStrictEqual(FRESH_REPORTS);
+  expect(expected).toHaveLength(FRESH_REPORTS.length + 7 * sites.length);
+  expect(reports.map((r) => `${segmentLabel(r.segment)}/${r.property}`)).toStrictEqual(expected);
   for (const report of reports) {
     // `proven`, explicitly: `isViolated()` is false for `unknown` too.
     expect(report.result.verdict.type, describeReport(report)).toBe('proven');
@@ -121,13 +155,15 @@ function expectAllProven(reports: readonly PropertyReport[]): void {
 }
 
 /**
- * Proves the default property set: the structural cancel check first (it throws on a violation),
- * then the closed segment (no cancel request: `deadlockFree`, `terminatesAtSink`,
- * `exactlyOneTerminal`, `neverCanceled`) and the cancel segment (one request seeded, so the arrival
- * lands at every reachable point: the first three). All seven must be `proven`.
+ * Proves the default property set: the structural checks first (they throw on a violation), then
+ * the closed segment (no cancel request: `deadlockFree`, `terminatesAtSink`, `exactlyOneTerminal`,
+ * `neverCanceled`), the cancel segment (one request seeded, so the arrival lands at every
+ * reachable point: the first three), and both resume segments of every site in `sites` — a
+ * suspendable step is a site. All must be `proven`.
  */
-async function expectProvenBothSegments(description: WorkflowDescription): Promise<void> {
-  expectAllProven(await verifyWorkflow(compile(description)));
+async function expectProvenBothSegments(description: WorkflowDescription, sites: readonly string[]): Promise<void> {
+  const compiled = compile(description);
+  expectAllProven(compiled, await verifyWorkflow(compiled), sites);
 }
 
 /**
@@ -1060,18 +1096,21 @@ describe('structuralHash over leaf entries', () => {
  */
 describe('leaf chains, proved', () => {
   it('proves a plain chain', async () => {
-    await expectProvenBothSegments(wf(step('a'), step('b'), step('c')));
+    // Every step can suspend, so every step is a resume site; a sleep is not.
+    await expectProvenBothSegments(wf(step('a'), step('b'), step('c')), ['0', '1', '2']);
   }, 90_000);
 
   it('proves a chain with unrolled retries and a retry delay', async () => {
     await expectProvenBothSegments(
       wf(step('a', { retries: 2, retryDelayMs: 100 }), step('b'), step('c', { retries: 1 })),
+      ['0', '1', '2'],
     );
   }, 90_000);
 
   it('proves a chain with a fixed sleep', async () => {
     await expectProvenBothSegments(
       wf(step('a'), { kind: 'sleep', id: 'nap', duration: { fixed: 60_000 } }, step('b')),
+      ['0', '2'],
     );
   }, 90_000);
 
@@ -1083,6 +1122,7 @@ describe('leaf chains, proved', () => {
         { kind: 'sleepUntil', id: 'until', until: { perRun: true } },
         step('b', { retries: 1 }),
       ),
+      ['0', '3'],
     );
   }, 90_000);
 });
@@ -1130,7 +1170,16 @@ describe('non-vacuity of the leaf', () => {
     expect(intact).toEqual({ status: 'failed', stepId: 'b', path: [1], error: 'declined' });
     // The Out spec is enforced at run time: the undeclared write is refused, the consumed input
     // is not restored ([EXEC-031]), and the run reaches no terminal at all.
-    expect(mutant).toEqual({ status: 'stranded', places: [] });
+    // The kernel ends the run at the failed firing and names it, rather than waiting it out.
+    expect(mutant).toEqual({
+      status: 'stranded',
+      places: [],
+      failure: {
+        transition: 't.1.b.run',
+        exceptionType: 'Error',
+        message: "Place 'wf.settle.failed' not in declared outputs: [s.2.c.in, wf.settle.bailed, wf.settle.suspended, wf.settle.paused]",
+      },
+    });
     expect(mutantRunner.calls).toEqual(['a', 'b']);
   });
 
@@ -1138,9 +1187,19 @@ describe('non-vacuity of the leaf', () => {
     // Why the hard rule "every transition carries a real Out spec, never skipOutputValidation"
     // matters: the mutant still proves, because the verifier reads the Out spec, and only the
     // run-time validation above catches an action that writes outside it.
-    expectAllProven(
-      await verifyWorkflow(compile(wf(step('a'), step('b')), { gadgets: { step: withoutFailedBranch } })),
-    );
+    //
+    // The mutant also drops the run's cancel inhibitor and the entry sweep, and every step's input
+    // is a resume site ([ADR 0007]), so the resume gate check now names the mutant too, exactly —
+    // which is why the proofs are asked for with the structural checks skipped.
+    const mutant = compile(wf(step('a'), step('b')), { gadgets: { step: withoutFailedBranch } });
+    expect(resumeGateViolations(mutant)).toStrictEqual([
+      "'t.1.b.run' consumes resume site 1 ('s.1.b.in') without an inhibitor on 'wf.cancel'",
+      "resume site 1 ('s.1.b.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+      "'t.0.a.run' consumes resume site 0 ('s.0.a.in') without an inhibitor on 'wf.cancel'",
+      "resume site 0 ('s.0.a.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+    ]);
+    await expect(verifyWorkflow(mutant)).rejects.toThrow(/resume gate structure is unsound/);
+    expectAllProven(mutant, await verifyWorkflow(mutant, { structure: 'skip' }), ['0', '1']);
   }, 90_000);
 
   it('routing one exit to a place that is not a terminal flips deadlockFree to violated', async () => {
@@ -1296,10 +1355,13 @@ describe('the exit tokens a step writes carry their Origin', () => {
   });
 
   it('a suspension carries its payload but not its output, which lives on the record', async () => {
-    const { probed } = await exitOf({ status: 'suspended', suspendPayload: { ask: 1 }, suspendOutput: 'partial' });
+    const { probed, clock } = await exitOf({ status: 'suspended', suspendPayload: { ask: 1 }, suspendOutput: 'partial' });
+    // `suspendedAt` is the record's own instant on the run's clock ([TIME-015]): no virtual time
+    // passes, so it is the clock's epoch.
+    expect(clock.epochNow()).toBe(EPOCH);
     expect(probed).toEqual({
       status: 'success',
-      output: { exit: 'suspended', token: { stepId: 's', path: [0], payload: { ask: 1 } } },
+      output: { exit: 'suspended', token: { stepId: 's', path: [0], payload: { ask: 1 }, suspendedAt: EPOCH } },
     });
   });
 
@@ -1316,8 +1378,9 @@ describe('the exit tokens a step writes carry their Origin', () => {
 
   it('carries a foreach index, and the attempt\'s own start, onto every exit token', async () => {
     // A foreach item's exit token carries `stepStartedAt`: the aggregate record takes the deciding
-    // item's own start, not its dispatch (`handlers/step.ts:166,174`). The suspension does not —
-    // its aggregate keeps the foreach's start. No virtual time passes, so the start is the clock's
+    // item's own start, not its dispatch (`handlers/step.ts:166,174`). The suspension does too:
+    // the foreach consumes it for the item's `foreachOutput` entry and strips it from its own
+    // suspension token. No virtual time passes, so the start is the clock's
     // epoch at the run's first instant.
     const fields = { foreachIndex: 3 };
     const failed = await exitOf({ status: 'failed', error: 'x', nonRetryable: true }, fields);
@@ -1326,9 +1389,10 @@ describe('the exit tokens a step writes carry their Origin', () => {
       status: 'success',
       output: { exit: 'failed', token: { stepId: 's', path: [0], foreachIndex: 3, stepStartedAt: start, error: 'x', nonRetryable: true } },
     });
-    expect((await exitOf({ status: 'suspended', suspendPayload: 'p' }, fields)).probed).toEqual({
+    const suspended = await exitOf({ status: 'suspended', suspendPayload: 'p' }, fields);
+    expect(suspended.probed).toEqual({
       status: 'success',
-      output: { exit: 'suspended', token: { stepId: 's', path: [0], foreachIndex: 3, payload: 'p' } },
+      output: { exit: 'suspended', token: { stepId: 's', path: [0], foreachIndex: 3, payload: 'p', suspendedAt: suspended.clock.epochNow(), stepStartedAt: suspended.clock.epochNow() } },
     });
     expect((await exitOf({ status: 'bailed', output: 'o' }, fields)).probed).toEqual({
       status: 'success',
@@ -1903,6 +1967,7 @@ describe('sleeps proven with the begin/waiting/wake split', () => {
         { kind: 'sleepUntil', id: 's4', until: { fixed: EPOCH } },
         fixed('s5'),
       ),
+      ['1'],
     );
   }, 180_000);
 

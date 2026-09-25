@@ -4,12 +4,16 @@ import { StepExecutor } from '@mastra/core/workflows/evented';
 import type { Mastra } from '@mastra/core/mastra';
 import type { Clock } from 'libpetri';
 import { compile } from '../compiler/compile.js';
+import { HostPreconditionError } from '../compiler/gadgets/leaf.js';
+import { resumeSeed, UnresumablePositionError, type ResumeSeed } from '../compiler/resume.js';
 import type { CompiledWorkflow, WorkflowDescription } from '../compiler/types.js';
 import { runWorkflowDetailed, type RunReport } from '../engine/kernel.js';
 import { adaptExecutionGraph } from './adapt.js';
-import { persistRun, type PersistContext } from './persist.js';
+import { suspendTracingContext } from './host.js';
+import { persistRun, type PersistContext, type PersistGuard } from './persist.js';
+import { decodeResume, type DecodedResume } from './resume-codec.js';
 import { MastraStepRunner } from './runner.js';
-import { formatWorkflowResult, type FormattedResult } from './result.js';
+import { formatWorkflowResult, withForeachHostFields, type FormattedResult, type ResumedFrom } from './result.js';
 
 type ExecuteParams = Parameters<ExecutionEngine['execute']>[0];
 type WorkflowSpan = NonNullable<ExecuteParams['workflowSpan']>;
@@ -43,27 +47,50 @@ export interface PetriEngineOptions {
 const DEFAULTS: ExecutionEngineOptions = { validateInputs: true, shouldPersistSnapshot: () => true };
 
 /**
- * The run modes M2 does not run. Each is a `Run` method (`resume`, `restart`, `timeTravel`) or a
- * `start()` option (`perStep`) whose semantics live in the default engine's loop and its snapshot
- * handling; running one as a plain start would quietly re-run finished steps.
+ * The run modes this engine refuses. `restart`, `timeTravel` (`Run` methods) and `perStep` (a
+ * `start()` option) are refused outright: their semantics live in the default engine's loop and its
+ * snapshot handling, and running one as a plain start would quietly re-run finished steps (M4b and
+ * later). `resume` runs ([ADR 0007]) and is refused only for a position it cannot place — then with
+ * the reason, in Mastra's words.
  */
 export type UnsupportedRunMode = 'resume' | 'restart' | 'timeTravel' | 'perStep';
 
-/** Thrown by `execute()` for a run mode this engine does not support yet (ADR 0005, until M4). */
+/**
+ * Thrown by `execute()` for a run mode, or a resume, this engine does not support (ADR 0005,
+ * ADR 0007). Always before anything is persisted, so a refused resume leaves the suspension as it
+ * was and `Run` releases its claim (`workflow.ts:4760-4806,4846-4849`).
+ */
 export class UnsupportedRunModeError extends Error {
   override readonly name = 'UnsupportedRunModeError';
   readonly mode: UnsupportedRunMode;
   readonly workflowId: string;
   readonly runId: string;
+  /** Why a resume was refused, when it was one: the step, its stored position and the reason. */
+  readonly resume?: {
+    readonly stepId: string;
+    readonly path: readonly number[];
+    readonly reason: UnresumablePositionError['reason'];
+  };
 
-  constructor(mode: UnsupportedRunMode, workflowId: string, runId: string) {
+  constructor(
+    mode: UnsupportedRunMode,
+    workflowId: string,
+    runId: string,
+    resume?: { readonly stepId: string; readonly path: readonly number[]; readonly reason: UnresumablePositionError['reason']; readonly detail: string },
+    options?: { readonly cause?: unknown },
+  ) {
     super(
-      `PetriExecutionEngine does not support '${mode}' yet (workflow '${workflowId}', run '${runId}'); ` +
-        'run the workflow on the default engine for this, or start it afresh',
+      resume === undefined
+        ? `PetriExecutionEngine does not support '${mode}' yet (workflow '${workflowId}', run '${runId}'); ` +
+            'run the workflow on the default engine for this, or start it afresh'
+        : `PetriExecutionEngine cannot resume step '${resume.stepId}' at [${resume.path.join(', ')}] ` +
+            `(workflow '${workflowId}', run '${runId}'): ${resume.detail}`,
+      options?.cause === undefined ? undefined : { cause: options.cause },
     );
     this.mode = mode;
     this.workflowId = workflowId;
     this.runId = runId;
+    if (resume !== undefined) this.resume = { stepId: resume.stepId, path: [...resume.path], reason: resume.reason };
   }
 }
 
@@ -113,6 +140,18 @@ export class PetriExecutionEngine extends ExecutionEngine {
    * computed *by* `compile`, which made it a key that cost a full build to look up.
    */
   readonly #cache = new Map<string, CompiledWorkflow>();
+  /**
+   * The status this instance last wrote for each run — the default engine's overwrite guard
+   * (`handlers/entry.ts:195-205`, kept per engine at `default.ts:85-105`). A suspended or paused
+   * run keeps its entry, so a resume in the same process does not overwrite the suspension with
+   * `running` before it has an outcome; any other outcome drops it, as `default.ts:1010-1018,
+   * 1117-1124` do, so the map does not grow with every run.
+   */
+  readonly #lastPersisted = new Map<string, WorkflowRunStatus>();
+  readonly #guard: PersistGuard = {
+    lastPersisted: (runId) => this.#lastPersisted.get(runId),
+    persisted: (runId, status) => void this.#lastPersisted.set(runId, status),
+  };
 
   constructor(options: PetriEngineOptions = {}) {
     super({ ...(options.mastra ? { mastra: options.mastra } : {}), options: { ...DEFAULTS, ...options.options } });
@@ -154,6 +193,15 @@ export class PetriExecutionEngine extends ExecutionEngine {
     });
     const compiled = this.#compiled(description);
 
+    // A resume is placed — decoded, and its one seed token chosen — before anything is persisted
+    // or run, so a resume this engine cannot place is refused with the stored suspension intact
+    // and `Run` releases its claim (`workflow.ts:4760-4806,4846-4849`).
+    const resumed = params.resume === undefined ? undefined : placeResume(params, compiled);
+    const resumedFrom: ResumedFrom | undefined =
+      resumed === undefined
+        ? undefined
+        : { index: resumed.seed.site.path[0], carriedPath: resumed.decoded.carriedPath, context: resumed.decoded.context };
+
     // Read per run, never cached. `Run._start` does not touch the engine's options; what replaces
     // them is `init()` (the workflow's own options object) and `Workflow.execute` — the NESTED path,
     // which rewrites `executionEngine.options.validateInputs` on every nested run
@@ -175,6 +223,8 @@ export class PetriExecutionEngine extends ExecutionEngine {
       abortController: params.abortController,
       initialState,
       validateInputs,
+      ...(resumed === undefined ? {} : { resume: { ...resumed.decoded.runnerResume, records: resumed.decoded.records } }),
+      ...(this.#clock === undefined ? {} : { now: () => this.#clock!.epochNow() }),
     });
 
     const persistBase = {
@@ -184,23 +234,59 @@ export class PetriExecutionEngine extends ExecutionEngine {
       input: params.input,
       serializedStepGraph: params.serializedStepGraph,
       requestContext: params.requestContext,
+      ...(resumedFrom === undefined ? {} : { resume: resumedFrom }),
     } satisfies Partial<PersistContext>;
 
     // The default engine's first write is a step's `start` with run status `running`
     // (`handlers/step.ts:216-229`); `Run` wrote `pending` when it was created (`workflow.ts:2794`).
-    await persistRun(this, { ...persistBase, phase: 'start', state: initialState });
+    // On a resume `Run` has already claimed the run `running` (`workflow.ts:4758`); this write
+    // carries the stored context whole and clears the stored `suspendedPaths`.
+    await persistRun(
+      this,
+      resumed === undefined
+        ? { ...persistBase, phase: 'start', state: initialState }
+        : { ...persistBase, phase: 'resume-start', activePath: resumed.decoded.request.path, state: initialState },
+      this.#guard,
+    );
 
-    const report: RunReport = await runWorkflowDetailed(compiled, params.input, {
+    // Mastra's `resumeTime` for a resumed `.foreach()`, taken as the segment enters it
+    // (`handlers/control-flow.ts:987-988`).
+    const segmentStart = this.#clock === undefined ? Date.now() : this.#clock.epochNow();
+    const netReport: RunReport = await runWorkflowDetailed(compiled, params.input, {
       runner,
       signal: params.abortController.signal,
       // Mastra has no run timeout (`default.ts:720-1130`). A stranded run with a signal would then
       // wait forever; the proven `exactlyOneTerminal` rules that out, not a timer.
       timeoutMs: null,
       ...(this.#clock ? { clock: this.#clock } : {}),
+      // A resumed segment: one token at the site, and the stored records as the run's own
+      // (`default.ts:800-807`).
+      ...(resumed === undefined ? {} : { resume: resumed.seed, stepResults: resumed.decoded.records }),
     });
 
+    const site = resumed?.seed.site;
+    // The host's fields on every `.foreach()` aggregate the net wrote: the run's resume labels and,
+    // on a resumed foreach, `resumePayload` / `resumedAt` (see `withForeachHostFields`).
+    const report: RunReport = {
+      ...netReport,
+      stepResults: withForeachHostFields(netReport.stepResults, {
+        graph: params.graph,
+        ...(resumed === undefined ? {} : { carried: resumed.decoded.records }),
+        resumeLabels: runner.resumeLabels,
+        ...(site?.kind === 'foreach' && resumed?.decoded.runnerResume.steps[0] === site.stepId
+          ? { resumed: { bodyId: site.stepId, resumePayload: resumed.decoded.runnerResume.payload, resumedAt: segmentStart } }
+          : {}),
+      }),
+    };
     const outcome = report.outcome;
     if (outcome.status === 'stranded') throw new StrandedRunError(workflowId, runId, outcome.places);
+    if (outcome.status === 'failed' && outcome.error instanceof HostPreconditionError) {
+      // The host refused a step before it ran (row 84): the default engine's resume rejects there,
+      // with the error itself — a `TypeError` from `handlers/step.ts:160` as it is — and writes no
+      // outcome. A position this engine refuses at run time rejects as the refusal does at seed time.
+      const cause = outcome.error.cause;
+      throw cause instanceof UnresumablePositionError ? refusal(cause, workflowId, runId, outcome.error.stepId) : cause;
+    }
     if (outcome.residue !== undefined) {
       // A token left beside the terminal: the run's result stands, the model is wrong. Never silent.
       this.getLogger().error(
@@ -221,16 +307,24 @@ export class PetriExecutionEngine extends ExecutionEngine {
       graph: params.graph,
       resumeLabels: runner.resumeLabels,
       ...(params.outputOptions ? { outputOptions: params.outputOptions } : {}),
+      ...(resumedFrom === undefined ? {} : { resume: resumedFrom }),
     });
 
-    await persistRun(this, {
-      ...persistBase,
-      phase: 'terminal',
-      state,
-      report,
-      result: formatted,
-      resumeLabels: runner.resumeLabels,
-    });
+    await persistRun(
+      this,
+      {
+        ...persistBase,
+        phase: 'terminal',
+        state,
+        report,
+        result: formatted,
+        resumeLabels: runner.resumeLabels,
+        ...(params.workflowSpan === undefined ? {} : { suspendTracing: suspendTracingContext(params.workflowSpan) }),
+      },
+      this.#guard,
+    );
+    // Only a suspended or paused run keeps its entry: a later resume in this process must see it.
+    if (formatted.status !== 'suspended' && formatted.status !== 'paused') this.#lastPersisted.delete(runId);
 
     const ending = endingOf(formatted);
     // The span. Mastra ends a canceled run's span two ways: a dedicated branch when the abort is seen
@@ -239,8 +333,13 @@ export class PetriExecutionEngine extends ExecutionEngine {
     // `default.ts:969-983`). A cancel swept before an entry *started* is the first — but only at
     // entry 0: a not-started sweep at a later entry is, in Mastra's order, the re-stamp of the entry
     // before it, which checks the signal before the next loop top does.
+    // On a resumed run the loop-top check before the segment's first entry is at `resumePath[0]`
+    // (`default.ts:811-835`): the resume site's gate, which for an arm site is the block's
+    // `re-enter` sweep, reporting the block's top-level path.
     const o = report.outcome;
-    const atLoopTop = o.status === 'canceled' && !o.started && (o.origin === undefined || (o.origin.path.length === 1 && o.origin.path[0] === 0));
+    const firstIndex = resumedFrom?.index ?? 0;
+    const atLoopTop =
+      o.status === 'canceled' && !o.started && (o.origin === undefined || (o.origin.path.length === 1 && o.origin.path[0] === firstIndex));
     if (atLoopTop) span.end({ attributes: { status: 'canceled' } });
     else if (ending.error !== undefined) span.error(ending.error, formatted.status);
     else span.end({ output: ending.result, attributes: { status: formatted.status } });
@@ -308,14 +407,62 @@ function runView(mastra: Mastra | undefined, pubsub: ExecuteParams['pubsub'], lo
   });
 }
 
-/** The first run mode in `params` this engine refuses, in the order `default.ts:790-799` reads them. */
+/**
+ * The first run mode in `params` this engine refuses, in the order `default.ts:790-799` reads them.
+ * `resume` is not among them ([ADR 0007]); `perStep` is refused on a resume as on a start.
+ */
 function refusedMode(params: ExecuteParams): UnsupportedRunMode | undefined {
   if (params.timeTravel !== undefined) return 'timeTravel';
   if (params.restart !== undefined) return 'restart';
-  if (params.resume !== undefined) return 'resume';
   if (params.perStep === true) return 'perStep';
   return undefined;
 }
+
+/**
+ * Places a resume ([ADR 0007]): decodes Mastra's `resume` parameter and chooses the one token the
+ * segment starts from. Pure, and run before the first persist. A position it cannot place is
+ * refused as an {@link UnsupportedRunModeError} naming the step, its stored path and the reason:
+ *
+ * - `UnresumablePositionError` from the compiler — nothing resumable there, the workflow changed
+ *   since the run suspended (Mastra resumes blindly; this engine refuses by name, decision 2), a
+ *   nested workflow inside a `.foreach()`, or a stored shape the design does not resume.
+ */
+function placeResume(params: ExecuteParams, compiled: CompiledWorkflow): { decoded: DecodedResume; seed: ResumeSeed } {
+  const { workflowId, runId } = params;
+  const stepId = params.resume?.steps[0] ?? '';
+  let decoded: DecodedResume;
+  try {
+    decoded = decodeResume(params, compiled);
+  } catch (error) {
+    throw refusal(error, workflowId, runId, stepId);
+  }
+  let seed: ResumeSeed;
+  try {
+    seed = resumeSeed(compiled, decoded.request);
+  } catch (error) {
+    throw refusal(error, workflowId, runId, stepId);
+  }
+  return { decoded, seed };
+}
+
+/** An `UnresumablePositionError` as the refusal `execute()` rejects with; anything else unchanged. */
+function refusal(error: unknown, workflowId: string, runId: string, stepId: string): unknown {
+  if (!(error instanceof UnresumablePositionError)) return error;
+  return new UnsupportedRunModeError(
+    'resume',
+    workflowId,
+    runId,
+    { stepId, path: error.path, reason: error.reason, detail: REASONS[error.reason](error) },
+    { cause: error },
+  );
+}
+
+const REASONS: Record<UnresumablePositionError['reason'], (e: UnresumablePositionError) => string> = {
+  'no-site': (e) => `nothing at that position can be resumed (${e.message})`,
+  'id-mismatch': () => 'the workflow changed since the run suspended',
+  'foreach-nested': () => 'a nested workflow inside a .foreach() cannot be resumed yet',
+  unsupported: (e) => e.message,
+};
 
 type LifecycleInfo = Parameters<ExecutionEngine['invokeLifecycleCallbacks']>[0];
 

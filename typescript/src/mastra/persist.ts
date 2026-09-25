@@ -7,8 +7,9 @@ import type {
 import { getErrorFromUnknown } from '@mastra/core/error';
 import { MASTRA_AUTH_TOKEN_KEY } from '@mastra/core/request-context';
 import type { RunOutcome, RunReport } from '../engine/kernel.js';
-import type { FormattedResult, ResumeLabel } from './result.js';
-import { toMastraStepResult } from './step-result.js';
+import type { StepRecord, SuspendToken } from '../compiler/types.js';
+import type { TracingContext } from './host.js';
+import { stepResultsOf, type FormattedResult, type ResumedFrom, type ResumeLabel } from './result.js';
 
 /** What every snapshot of a run needs. */
 interface PersistBase {
@@ -19,12 +20,26 @@ interface PersistBase {
   readonly state: Record<string, unknown>;
   readonly serializedStepGraph: unknown;
   readonly requestContext: unknown;
+  /**
+   * Present on a resumed run ([ADR 0007]). Every write then carries the **whole** stored context
+   * with this segment's records over it — as the default engine's writes spread its `stepResults`,
+   * which start as the stored ones (`default.ts:800-807`, `handlers/step.ts:216-229`). A write of
+   * `{ input }` alone would erase every stored step result.
+   */
+  readonly resume?: ResumedFrom;
 }
 
 /**
  * What persisting a run needs, by the moment of the run the snapshot records.
  *
  * - `start` — before the net runs: no report, no result.
+ * - `resume-start` — before a resumed segment runs ([ADR 0007]): status `running`, the stored
+ *   context carried whole, `suspendedPaths` and `resumeLabels` `{}` — the fresh `executionContext`
+ *   every default-engine write of a resumed run is made with (`default.ts:878-891`). It stands for
+ *   the resumed step's `start` write (`handlers/step.ts:216-229`), and, like it, is suppressed while
+ *   this engine last wrote the run `suspended` or `paused` (see {@link PersistGuard}). It is the
+ *   write `Run`'s claim release looks for (`workflow.ts:4760-4806`): the stored `suspendedPaths` are
+ *   gone from it, so a run that fails after it can never be re-armed as `suspended`.
  * - `terminal` — after `formatWorkflowResult`: the run's report, and the formatted result, which is
  *   the **single source** of the snapshot's `stepExecutionPath` — the default engine hands the same
  *   list to `fmtReturnValue` and to the snapshot (`default.ts:954-967`).
@@ -37,6 +52,11 @@ export type PersistContext = PersistBase &
   (
     | { readonly phase: 'start' }
     | {
+        readonly phase: 'resume-start';
+        /** Mastra's `resumePath`, as the resumed step's `executionContext.executionPath` holds it. */
+        readonly activePath: readonly number[];
+      }
+    | {
         readonly phase: 'terminal';
         readonly report: RunReport;
         readonly result: FormattedResult;
@@ -46,8 +66,26 @@ export type PersistContext = PersistBase &
          * collects them. Omitted, the snapshot's `resumeLabels` is `{}`.
          */
         readonly resumeLabels?: Readonly<Record<string, ResumeLabel>>;
+        /**
+         * The run span's ids, persisted with a **suspended** run so a resume links its span back
+         * (`default.ts:938-950`), built by `suspendTracingContext` (`host.ts`). Omitted when the run
+         * has no span; any other status ignores it.
+         */
+        readonly suspendTracing?: TracingContext;
       }
   );
+
+/**
+ * The default engine's in-process overwrite guard (`handlers/entry.ts:195-205`,
+ * `default.ts:85-105`): the status this engine instance last **wrote** for a run. A `running` write
+ * is skipped while it is `suspended` or `paused`, so a resume in the same process never clobbers the
+ * suspension record before the resumed run has an outcome. It lives on `DefaultExecutionEngine`,
+ * not on `ExecutionEngine`, so every engine keeps its own.
+ */
+export interface PersistGuard {
+  lastPersisted(runId: string): WorkflowRunStatus | undefined;
+  persisted(runId: string, status: WorkflowRunStatus): void;
+}
 
 /**
  * Writes the run's `WorkflowRunState` to Mastra's storage — the port of
@@ -57,7 +95,9 @@ export type PersistContext = PersistBase &
  *    `engine.options.shouldPersistSnapshot`, called with `{ stepResults, workflowStatus }`; a falsy
  *    answer (or no predicate at all) writes nothing (`:187-192`);
  * 2. the snapshot is built field for field as `:209-227` builds it (see {@link buildRunSnapshot});
- * 3. it goes through `mastra.getStorage().getStore('workflows').persistWorkflowSnapshot`, after
+ * 3. a `running` write is skipped while `guard` says this engine last wrote the run `suspended` or
+ *    `paused` (`:195-205`), and every write that passes is recorded on it (`:236`);
+ * 4. it goes through `mastra.getStorage().getStore('workflows').persistWorkflowSnapshot`, after
  *    `engine.options.pruneSnapshot` when one is set (`:229-235`). No registered Mastra, or a Mastra
  *    without storage, writes nothing — as the default engine's optional chain does.
  *
@@ -66,15 +106,20 @@ export type PersistContext = PersistBase &
  * (`workflow.ts:2771-2819`) and never hands them to a supplied engine (`:1819-1827`); the default
  * engine reads `engine.options` too, so reading them here is Mastra's contract for every engine.
  *
- * The two phases stand for the default engine's many writes (`docs/divergences.md`): `start` for the
- * first `running` write (`handlers/step.ts:216-229`), `terminal` for the `terminal` /
- * `workflow-end` / loop-top `canceled` write (`default.ts:814-835,954-967,1081-1093`).
+ * The phases stand for the default engine's many writes (`docs/divergences.md`): `start` and
+ * `resume-start` for the first `running` write (`handlers/step.ts:216-229`), `terminal` for the
+ * `terminal` / `workflow-end` / loop-top `canceled` write (`default.ts:814-835,954-967,1081-1093`).
  */
-export async function persistRun(engine: ExecutionEngine, ctx: PersistContext): Promise<void> {
+export async function persistRun(engine: ExecutionEngine, ctx: PersistContext, guard?: PersistGuard): Promise<void> {
   const workflowStatus = statusOf(ctx);
   const stepResults = contextOf(ctx, Date.now());
   const predicate = engine.getRunPersistenceOverride(ctx.runId) ?? engine.options?.shouldPersistSnapshot;
   if (!predicate?.({ stepResults: stepResults as never, workflowStatus })) return;
+  // After the predicate, as `handlers/entry.ts:187-205` orders them.
+  if (workflowStatus === 'running') {
+    const last = guard?.lastPersisted(ctx.runId);
+    if (last === 'suspended' || last === 'paused') return;
+  }
 
   const snapshot = buildRunSnapshot(ctx);
   const workflowsStore = await engine.mastra?.getStorage()?.getStore('workflows');
@@ -85,6 +130,7 @@ export async function persistRun(engine: ExecutionEngine, ctx: PersistContext): 
     ...(ctx.resourceId === undefined ? {} : { resourceId: ctx.resourceId }),
     snapshot: prune ? prune({ snapshot, workflowStatus }) : snapshot,
   });
+  guard?.persisted(ctx.runId, workflowStatus);
 }
 
 /**
@@ -104,12 +150,17 @@ export async function persistRun(engine: ExecutionEngine, ctx: PersistContext): 
  * - `stepExecutionPath` — the formatted result's, the one list both carry.
  * - `activeStepsPath` `{}` (every finished step deleted its entry, `handlers/step.ts:532`; a sleep
  *   deletes its own when the wait ends or is cut short, `handlers/entry.ts:634`), `waitingPaths`
- *   `{}`; `suspendedPaths` names the reported suspension; `resumeLabels` is the run's, as
- *   `suspend(…, { resumeLabel })` writes them to the execution context (`handlers/step.ts:398-411`).
- * - `tracingContext` — `{}` on every write made after an entry (the entry-end check or the
- *   non-success exit, `default.ts:938-966`), and **absent** on a run that ran to the end
- *   (`:1081-1093`) and on a cancel seen before the first entry (`:814-835`, no key passed). The span
- *   ids a suspension would carry are not available here.
+ *   `{}`; `suspendedPaths` names every suspension the run ended with ({@link suspendedPathsOf});
+ *   `resumeLabels` is the run's, as `suspend(…, { resumeLabel })` writes them to the execution
+ *   context (`handlers/step.ts:398-411`) — a resumed run starts from `{}` (`default.ts:878-891`).
+ * - `tracingContext` — on every write made after an entry (the entry-end check or the non-success
+ *   exit, `default.ts:938-966`): the run span's ids for a suspended run (`:945-950`), `{}` for any
+ *   other status or a run with no span; **`undefined`** on a run that ran to the end
+ *   (`:1081-1093`), on a cancel seen before the segment's first entry (`:814-835`) and on every
+ *   `running` write — those pass no tracing context, and `persistStepUpdate` writes the key anyway
+ *   (`handlers/entry.ts:209-227`). The key is present with the value `undefined`, as Mastra's
+ *   snapshot literal has it: a store that keeps objects (`InMemoryStore`) shows the key, a
+ *   serialising one drops it on both engines alike.
  * - `requestContext` — serialized as `serializeRequestContext` does, without the auth token
  *   (`default.ts:657-671`).
  */
@@ -126,21 +177,22 @@ export function buildRunSnapshot(ctx: PersistContext, now: number = Date.now()):
     timestamp: now,
   };
 
-  if (ctx.phase === 'start') {
+  if (ctx.phase === 'start' || ctx.phase === 'resume-start') {
     return {
       ...common,
       status: 'running',
-      activePaths: [0],
-      stepExecutionPath: [],
+      activePaths: ctx.phase === 'start' ? [0] : [...ctx.activePath],
+      stepExecutionPath: [...(ctx.resume?.carriedPath ?? [])],
       suspendedPaths: {},
       resumeLabels: {},
       result: undefined,
       error: undefined,
+      tracingContext: undefined,
     };
   }
 
   const o = ctx.report.outcome;
-  const { index, afterEntry } = terminalPosition(o, graph);
+  const { index, afterEntry } = terminalPosition(o, graph, ctx.resume?.index);
   const ended = {
     activePaths: [index],
     stepExecutionPath: [...(ctx.result.stepExecutionPath ?? [])],
@@ -148,7 +200,7 @@ export function buildRunSnapshot(ctx: PersistContext, now: number = Date.now()):
     resumeLabels: { ...(ctx.resumeLabels ?? {}) },
     result: undefined,
     error: undefined,
-    ...(afterEntry ? { tracingContext: {} } : {}),
+    tracingContext: afterEntry ? (o.status === 'suspended' ? { ...(ctx.suspendTracing ?? {}) } : {}) : undefined,
   };
   switch (o.status) {
     case 'success':
@@ -158,7 +210,7 @@ export function buildRunSnapshot(ctx: PersistContext, now: number = Date.now()):
     case 'tripwire':
       return { ...common, ...ended, status: 'tripwire' };
     case 'suspended':
-      return { ...common, ...ended, status: 'suspended', suspendedPaths: { [o.stepId]: [...o.path] } };
+      return { ...common, ...ended, status: 'suspended', suspendedPaths: suspendedPathsOf(o, ctx.report.stepResults) };
     case 'paused':
       return { ...common, ...ended, status: 'paused' };
     case 'canceled':
@@ -170,6 +222,50 @@ export function buildRunSnapshot(ctx: PersistContext, now: number = Date.now()):
   }
 }
 
+type Suspended = Extract<RunOutcome, { readonly status: 'suspended' }>;
+
+/**
+ * `suspendedPaths` of a suspended run: every suspension the run ended with — the reported one and
+ * the `pending` ones a block or foreach carried beside it ([ADR 0007]) — keyed by step id, each
+ * with its view path. The default engine writes `suspendedPaths[step.id]` the moment a step
+ * suspends (`handlers/step.ts:394-397`) and re-adds a resumed block's still-suspended arms
+ * (`handlers/entry.ts:100-107`), so on a clash of ids the **last suspension in time** wins; its
+ * `suspendedAt` is the token's, else its record's.
+ */
+export function suspendedPathsOf(
+  o: Suspended,
+  records: ReadonlyMap<string, StepRecord>,
+): Record<string, number[]> {
+  const paths: Record<string, number[]> = {};
+  const at = new Map<string, number>();
+  const recordAt = (stepId: string): number => {
+    const record = records.get(stepId);
+    return record !== undefined && 'suspendedAt' in record && typeof record.suspendedAt === 'number' ? record.suspendedAt : -Infinity;
+  };
+  const reported = { stepId: o.stepId, path: o.path, suspendedAt: suspendedAtOf(o) };
+  for (const t of [reported, ...pendingOf(o)]) {
+    const when = t.suspendedAt ?? recordAt(t.stepId);
+    const best = at.get(t.stepId);
+    if (best !== undefined && when <= best) continue;
+    at.set(t.stepId, when);
+    paths[t.stepId] = [...t.path];
+  }
+  return paths;
+}
+
+/**
+ * The suspensions carried beside the reported one. `RunOutcome` exposes them as `pending` once the
+ * kernel forwards the join's `SuspendToken.pending` ([ADR 0007]); read with an `in` check, as
+ * `startedOf` reads `started`, so an outcome without them reads as none.
+ */
+function pendingOf(o: Suspended): readonly Pick<SuspendToken, 'stepId' | 'path' | 'suspendedAt'>[] {
+  return 'pending' in o && Array.isArray(o.pending) ? (o.pending as readonly SuspendToken[]) : [];
+}
+
+function suspendedAtOf(o: Suspended): number | undefined {
+  return 'suspendedAt' in o && typeof o.suspendedAt === 'number' ? o.suspendedAt : undefined;
+}
+
 /** Where the default engine's terminal write stands: its `executionPath [index]`, and which write. */
 interface TerminalPosition {
   /** The top-level index of the `executionContext` the write was made with. */
@@ -177,7 +273,7 @@ interface TerminalPosition {
   /**
    * Whether the write came after an entry returned — the non-success exit (`default.ts:938-966`),
    * which passes `tracingContext: {}` — rather than the run's end (`:1081-1093`) or the loop-top
-   * cancel check (`:814-835`), which pass none.
+   * cancel check (`:814-835`), which pass none, so the snapshot's key is `undefined`.
    */
   readonly afterEntry: boolean;
 }
@@ -201,8 +297,14 @@ interface TerminalPosition {
  *     gate for both, see `docs/divergences.md`.)
  *   - **not started** at entry 0: the loop-top check before the first entry, with no
  *     `lastExecutionContext`: `[0]` and no tracing context (`default.ts:812-835`).
+ *   - on a resumed run ([ADR 0007]), **not started** at the gate of the resumed top-level entry
+ *     `resumePath[0]`: the loop-top check before the segment's first entry, made with no
+ *     `lastExecutionContext` — `[resumePath[0]]` and no tracing context. The site's gate is that
+ *     check: an entry site's own gate, or a block's `re-enter` sweep, which reports the block's
+ *     top-level path. A not-started sweep *below* it (the resumed arm's own gate, after re-entry)
+ *     is inside an entry that has begun, as above.
  */
-function terminalPosition(o: RunOutcome, graph: readonly SerializedStepFlowEntry[]): TerminalPosition {
+function terminalPosition(o: RunOutcome, graph: readonly SerializedStepFlowEntry[], resumeIndex?: number): TerminalPosition {
   switch (o.status) {
     case 'success':
       return o.bailed ? { index: topLevel(o.path), afterEntry: true } : { index: Math.max(graph.length - 1, 0), afterEntry: false };
@@ -214,6 +316,7 @@ function terminalPosition(o: RunOutcome, graph: readonly SerializedStepFlowEntry
     case 'canceled': {
       if (o.origin === undefined) return { index: Math.max(graph.length - 1, 0), afterEntry: true };
       const index = topLevel(o.origin.path);
+      if (!startedOf(o) && o.origin.path.length === 1 && index === resumeIndex) return { index, afterEntry: false };
       // A gate below the top level is inside a top-level entry that has begun.
       if (startedOf(o) || o.origin.path.length > 1) return { index, afterEntry: true };
       return index === 0 ? { index: 0, afterEntry: false } : { index: index - 1, afterEntry: true };
@@ -241,7 +344,7 @@ function strandedError(places: readonly string[]): Error {
 }
 
 function statusOf(ctx: PersistContext): WorkflowRunStatus {
-  if (ctx.phase === 'start') return 'running';
+  if (ctx.phase === 'start' || ctx.phase === 'resume-start') return 'running';
   const o = ctx.report.outcome;
   switch (o.status) {
     case 'success':
@@ -258,13 +361,13 @@ function statusOf(ctx: PersistContext): WorkflowRunStatus {
   }
 }
 
-/** Mastra's `stepResults`: seeded `{ input }` (`default.ts:805-807`), then every record. */
+/**
+ * Mastra's `stepResults`: seeded `{ input }` (`default.ts:805-807`) — or, on a resumed run, the
+ * stored context whole (`:800-807`) — then every record of this run, in record order.
+ */
 function contextOf(ctx: PersistContext, now: number): Record<string, unknown> {
-  const context: Record<string, unknown> = { input: ctx.input };
-  if (ctx.phase === 'terminal') {
-    for (const [id, record] of ctx.report.stepResults) context[id] = toMastraStepResult(record, { now });
-  }
-  return context;
+  const records = ctx.phase === 'terminal' ? ctx.report.stepResults : new Map<string, StepRecord>();
+  return stepResultsOf(ctx.input, records, () => 0, now, ctx.resume?.context);
 }
 
 function topLevel(path: readonly number[]): number {

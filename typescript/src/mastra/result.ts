@@ -41,6 +41,22 @@ export interface FormatContext {
    * (`default.ts:1023-1025`); omitted, that is `{}`.
    */
   readonly resumeLabels?: Readonly<Record<string, ResumeLabel>>;
+  /**
+   * Present on a resumed run ([ADR 0007]): what the default engine starts its loop from
+   * (`default.ts:792-808`) — the top-level index it resumes at, the stored `stepExecutionPath`, and
+   * the stored `stepResults`, verbatim and in their stored key order.
+   */
+  readonly resume?: ResumedFrom;
+}
+
+/** Where a resumed run picks up, as `formatWorkflowResult` and the snapshot read it. */
+export interface ResumedFrom {
+  /** `resumePath[0]` — the top-level entry the segment re-enters. */
+  readonly index: number;
+  /** The stored `stepExecutionPath`, continued by this segment. */
+  readonly carriedPath: readonly string[];
+  /** The stored `stepResults` (`snapshot.context` with `input`), as `Run` handed them over. */
+  readonly context: Readonly<Record<string, unknown>>;
 }
 
 /** One `resumeLabels` entry, as the step context's `suspend(…, { resumeLabel })` writes it. */
@@ -101,10 +117,8 @@ export type FormattedResult = (
  *   (`default.ts:611-626`), and a tripwire the kernel accepted that is neither is an ordinary
  *   `failed` carrying the outcome's `error`; `suspended` carries **every** suspended record
  *   (`default.ts:629-644`, {@link suspension}); `paused` and `canceled` carry nothing more.
- *   A suspended `.foreach()`'s record does **not** carry Mastra's foreach `__workflow_meta`
- *   (`foreachIndex`, `foreachOutput`, `resumeLabels`, `handlers/control-flow.ts:1432-1450`): the
- *   kernel's aggregate record holds no per-item results to rebuild `foreachOutput` from
- *   (`docs/divergences.md`, row 35).
+ *   A `.foreach()`'s aggregate carries the host's fields only once {@link withForeachHostFields}
+ *   has laid them over the report's records, as `execute()` does before formatting.
  * - **`execute()`'s additions**: `runId`; `state` only when `outputOptions.includeState`;
  *   the run's `resumeLabels` only for a suspended run with `outputOptions.includeResumeLabels`
  *   (`default.ts:1023-1025`).
@@ -117,14 +131,11 @@ export function formatWorkflowResult(ctx: FormatContext): FormattedResult {
   const now = Date.now();
   const rank = firstInsertionRank(ctx.graph, report.stepResults);
 
-  // Mastra's `stepResults`: `{ input }` first (`default.ts:805-807`), then every record.
-  const raw: Record<string, unknown> = { input: ctx.input };
-  for (const [id, record] of [...report.stepResults].sort(([a], [b]) => rank(a) - rank(b))) {
-    raw[id] = toMastraStepResult(record, { now });
-  }
+  const raw = stepResultsOf(ctx.input, report.stepResults, rank, now, ctx.resume?.context);
 
   const steps = cleanStepResults(raw);
-  const path = ctx.graph === undefined ? undefined : stepExecutionPath(ctx.graph.steps, outcome);
+  const from = ctx.resume === undefined ? undefined : { index: ctx.resume.index, carried: ctx.resume.carriedPath };
+  const path = ctx.graph === undefined ? undefined : stepExecutionPath(ctx.graph.steps, outcome, from);
   const base = {
     steps: path === undefined ? steps : deduplicatePayloads(steps, path),
     input: steps['input'],
@@ -165,6 +176,122 @@ export function formatWorkflowResult(ctx: FormatContext): FormattedResult {
     default:
       return assertNever(outcome);
   }
+}
+
+/**
+ * Mastra's `stepResults` object at the end of a run, in its key order.
+ *
+ * - A fresh run: `{ input }` first (`default.ts:805-807`), then every record.
+ * - A resumed run: the stored `stepResults` as `Run` handed them over (`workflow.ts:4677-4685`,
+ *   `default.ts:800-807`) — a key already there keeps its place when this segment overwrites it, as
+ *   `Object.assign` into Mastra's object does (`handlers/entry.ts:346`), and a new key is appended.
+ *   A stored entry the engine has no record for (`running`, `skipped`) is kept verbatim.
+ *
+ * New keys are appended in first-start order (see {@link firstInsertionRank}).
+ */
+export function stepResultsOf(
+  input: unknown,
+  records: ReadonlyMap<string, StepRecord>,
+  rank: (id: string) => number,
+  now: number,
+  carried?: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const raw: Record<string, unknown> = carried === undefined ? { input } : { ...carried, input };
+  for (const [id, record] of [...records].sort(([a], [b]) => rank(a) - rank(b))) {
+    raw[id] = toMastraStepResult(record, { now });
+  }
+  return raw;
+}
+
+/** What {@link withForeachHostFields} lays over a `.foreach()`'s aggregate: the host's own data. */
+export interface ForeachHostFields {
+  /** The workflow's top-level entries — `execute()`'s `graph.steps`. */
+  readonly graph: { readonly steps: readonly StepFlowEntry[] };
+  /** The records the segment started from, by identity: an aggregate still there is not this segment's. */
+  readonly carried?: ReadonlyMap<string, StepRecord>;
+  /** The run's resume labels at its end — Mastra's `executionContext.resumeLabels`. */
+  readonly resumeLabels: Readonly<Record<string, ResumeLabel>>;
+  /**
+   * Present when this segment resumes a `.foreach()` — `resume.steps[0]` is its body id: the
+   * resume's payload, and the instant the segment started, Mastra's `resumeTime`.
+   */
+  readonly resumed?: { readonly bodyId: string; readonly resumePayload: unknown; readonly resumedAt: number };
+}
+
+/**
+ * The report's records with the host's fields on every `.foreach()` aggregate this segment wrote.
+ * The net's aggregate is value-exact but blind to host data; Mastra writes two kinds of it there:
+ *
+ * - **`__workflow_meta.resumeLabels`** on a suspended and on a failed aggregate — the run's labels
+ *   when the foreach returned (`handlers/control-flow.ts:1366`, `1433-1448`; the suspended one
+ *   after merging the carried labels, which the runner's `resumeLabels` has done by then). Exact,
+ *   because a suspended or failed top-level foreach ends the run: nothing adds a label after it.
+ * - **`resumePayload` and `resumedAt`** on an aggregate built on the foreach's `stepInfo` — a
+ *   success, a suspension, a cancel — when the resume named the body (`resume.steps[0] ===
+ *   stepId`, `:987-996`), whatever the payload's truthiness. A failed, bailed or paused aggregate
+ *   is the deciding item's own result (`:1360-1370`, `:1406`) and takes none.
+ *
+ * An aggregate is this segment's when its record is not the very one the segment started from. A
+ * suspended aggregate is the net's own, built on `stepInfo`; a failed one is the deciding item's
+ * record and may carry that item's `host`. The resumed fields go only on an aggregate with no `host`:
+ * an item's own record, written by the leaf, always has one. Failed `foreachOutput` entries gain
+ * Mastra's own `tripwire` key ({@link hostEntries}).
+ */
+export function withForeachHostFields(
+  records: ReadonlyMap<string, StepRecord>,
+  fields: ForeachHostFields,
+): ReadonlyMap<string, StepRecord> {
+  let out: Map<string, StepRecord> | undefined;
+  for (const entry of fields.graph.steps) {
+    if (entry.type !== 'foreach') continue;
+    const bodyId = entryId(entry.step);
+    const record = records.get(bodyId);
+    if (record === undefined || record === fields.carried?.get(bodyId)) continue;
+    let next: StepRecord = record;
+    if ((record.status === 'suspended' || record.status === 'failed') && hasForeachOutput(record.suspendPayload)) {
+      const payload = record.suspendPayload as Record<string, unknown> & { __workflow_meta: Record<string, unknown> };
+      const meta = payload.__workflow_meta;
+      next = {
+        ...next,
+        suspendPayload: {
+          ...payload,
+          __workflow_meta: { ...meta, foreachOutput: hostEntries(meta['foreachOutput']), resumeLabels: { ...fields.resumeLabels } },
+        },
+      } as StepRecord;
+    }
+    if (
+      fields.resumed?.bodyId === bodyId &&
+      record.host === undefined &&
+      (record.status === 'success' || record.status === 'suspended' || record.status === 'canceled')
+    ) {
+      next = { ...next, host: { resumePayload: fields.resumed.resumePayload, resumedAt: fields.resumed.resumedAt } } as StepRecord;
+    }
+    if (next !== record) (out ??= new Map(records)).set(bodyId, next);
+  }
+  return out ?? records;
+}
+
+/**
+ * `foreachOutput` entries as Mastra's step handler writes a result: a failure always has its own
+ * `tripwire` key, `undefined` when there is none (`default.ts:497-506`), as `toMastraStepResult`
+ * writes a record's. A failed entry is always this segment's: a failed foreach ends the run, so no
+ * resume carries one. Holes stay holes.
+ */
+function hostEntries(entries: unknown): unknown {
+  if (!Array.isArray(entries)) return entries;
+  const out = entries.slice();
+  entries.forEach((entry, k) => {
+    if (entry !== null && typeof entry === 'object' && (entry as { status?: unknown }).status === 'failed' && !Object.hasOwn(entry, 'tripwire')) {
+      out[k] = { ...(entry as Record<string, unknown>), tripwire: undefined };
+    }
+  });
+  return out;
+}
+
+function hasForeachOutput(suspendPayload: unknown): boolean {
+  if (suspendPayload === null || typeof suspendPayload !== 'object') return false;
+  const meta = (suspendPayload as { readonly __workflow_meta?: unknown }).__workflow_meta;
+  return meta !== null && typeof meta === 'object' && Object.hasOwn(meta, 'foreachOutput');
 }
 
 /** `formatResultError` (`default.ts:521-529`): `error || lastOutput.error`, serialized without a stack. */
@@ -255,14 +382,25 @@ export function deduplicatePayloads(
  *   level (`path.length > 1`) lies inside a top-level combinator, which is never pushed.
  * - `canceled` with no origin: only the settle stage after the last entry's success emits one
  *   (`compile.ts`, `settleDone`), so every entry ran.
+ *
+ * `from`, on a resumed run ([ADR 0007]): the path starts from `from.carried`, and entries up to and
+ * including `from.index` push nothing — they ran in an earlier segment, or, at `from.index`, are the
+ * resumed entry, which Mastra does not push again. A cancel swept at the resume site's gate is the
+ * loop-top check at `from.index` (`default.ts:812-835`) and adds nothing to the carried path.
  */
 export function stepExecutionPath(
   entries: readonly StepFlowEntry[],
   outcome: Exclude<RunOutcome, { readonly status: 'stranded' }>,
+  from?: { readonly index: number; readonly carried: readonly string[] },
 ): string[] {
+  // A resumed run continues the stored list (`default.ts:802-803`): entries before the resumed one
+  // never re-run, and the resumed entry is not pushed again (`handlers/entry.ts:306-309`) — a
+  // block, loop or foreach is never pushed at all. Everything after it pushes as in a fresh run.
+  const after = from?.index ?? -1;
   const upTo = (stop: number, includeStop: boolean): string[] => {
-    const path: string[] = [];
+    const path: string[] = [...(from?.carried ?? [])];
     entries.forEach((entry, i) => {
+      if (i <= after) return;
       const id = pushedId(entry);
       if (id !== undefined && (i < stop || (i === stop && includeStop))) path.push(id);
     });

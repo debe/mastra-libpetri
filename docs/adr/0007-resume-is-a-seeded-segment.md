@@ -41,11 +41,29 @@ record, so ADR 0003's rule holds and resume works across engines in both directi
   the stored suspend data, on Mastra's own `StepExecutor`.
 - **No CORE-073 restore.** Clocks start fresh by construction, as in Mastra; no stale-name hazard;
   resuming under a different `concurrency` needs nothing special. libpetri 6.1.0 suffices.
-- **Every site is proven as its own segment**, with and without a cancel, from exactly the marking
-  the kernel seeds — `{site: 1, permits: k[, cancel request: 1]}`, asserted at run time. This is
+- **Every site is proven as its own segment**, with and without a cancel: `resume@s` from
+  `{site: 1, permits: k}` and `resume@s+cancel` from that plus `{wf.cancel.request: 1}`. This is
   CORE-073's sanctioned route for a restored marking: re-verify with it as the initial marking
-  (libpetri `spec/01-core-model.md:748-755`). A structural check makes sure every construct that
-  can suspend has a site.
+  (libpetri `spec/01-core-model.md:748-755`). The proof and the kernel share one definition of
+  those counts (`initialCounts` in `src/engine/kernel.ts`, which `segmentInitialMarking` calls),
+  and the kernel refuses, before any executor exists, a run whose marking differs from it per
+  place. A run that is not pre-aborted starts from exactly `resume@s`'s marking. A **pre-aborted**
+  run starts from `{site: 1, wf.cancel: 1, permits: k}`. That is not `resume@s+cancel`'s marking.
+  It is that marking's successor after `t.cancel.arrive` moves the request to the signal, so it is
+  reachable from the proven marking and covered by its proof. The kernel checks an entry
+  seed's colour (a non-null object with `data`), which the value-blind proofs cannot see; an arm or
+  foreach seed that does not fit is refused by name by its own gate, as the block's `failed`
+  outcome (`seedMisfit` in `reentry.ts` / `foreach.ts`; `tests/engine/kernel-resume.test.ts`,
+  "a seed's colour"). The shared counts do not check k independently — both sides read the
+  compiled budget — they refuse a start that collides with the permits or the cancel place. Structural checks make sure every construct that can suspend has a site, and that
+  every site's sweep outputs only into `wf.canceled`, which no proof distinguishes from `wf.done`.
+- **A failed firing ends the run.** A replay or gate whose action throws, or emits outside its
+  `Out` spec, consumes its inputs and produces nothing. The proofs model the spec, not the
+  action, so they stay proven. The kernel watches for `transition-failed` and ends the run at once
+  as `stranded`, with the failed transition in `RunOutcome.failure` (`execute()`'s
+  `StrandedRunError` names only the places so far; `TransitionFailure` keeps strings only, which
+  is why a host precondition failure takes its own route, `HostPreconditionError`, row 84). Otherwise a run with a signal would wait at quiescence forever
+  (`timeoutMs` is `null` under Mastra).
 
 ### Decisions taken
 
@@ -77,11 +95,12 @@ workflow inside a foreach stays refused until a real-Mastra fixture exists.
   the result and the snapshot name every suspended step (closes row 34).
 - The gates are dead in a fresh segment and live only in a resumed one, so whole-workflow analysis
   in M6 is the union of the segments.
-- A timed proof of a resumed segment is about that segment; an untimed one holds from the seeded
-  marking, which is reachable by construction.
+- A timed proof of a resumed segment is about that segment. An untimed one holds from the seeded
+  marking and from every marking reachable from it, including a pre-aborted run's. The seeded
+  marking is never claimed to be reachable from the fresh entry marking.
 
 ## Evidence
 
 `tests/compiler/resume-seed.test.ts`, `tests/compiler/{parallel,branch,leaf,loop,foreach}-resume.test.ts`,
-`tests/verify/resume-segments.test.ts`, `tests/mastra/engine-resume.test.ts`, and the differential's
+`tests/verify/resume-segments.test.ts`, `tests/engine/kernel-resume.test.ts`, `tests/mastra/engine-resume.test.ts`, and the differential's
 suspend-then-resume driver on both engines and crossed, at every k.

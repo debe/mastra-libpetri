@@ -746,7 +746,7 @@ describe('formatWorkflowResult end to end, default engine as the oracle', () => 
     expect(petri).toEqual(oracle);
   });
 
-  it('a suspend inside .foreach(): equal but for Mastra\'s foreach __workflow_meta on the step (divergence, row 35)', async () => {
+  it('a suspend inside .foreach(): equal, the aggregate\'s __workflow_meta.resumeLabels included', async () => {
     const ask = createStep({
       id: 'ask',
       inputSchema: num,
@@ -761,11 +761,33 @@ describe('formatWorkflowResult end to end, default engine as the oracle', () => 
       createWorkflow({ id: 'fe-susp', inputSchema: z.array(num), outputSchema: z.any(), ...cfg(e) }).foreach(ask).commit();
     const { oracle, petri } = await both(make, { inputData: [{ n: 1 }, { n: 2 }], outputOptions: { includeResumeLabels: true } });
     expect(oracle['status']).toBe('suspended');
-    const oracleSteps = oracle['steps'] as Record<string, Record<string, unknown>>;
-    const { __workflow_meta: meta, ...userPayload } = oracleSteps['ask']!['suspendPayload'] as Record<string, unknown>;
-    // What Mastra keeps and the kernel's aggregate record cannot rebuild: the per-item results.
-    expect(meta).toMatchObject({ foreachIndex: 0, foreachOutput: expect.any(Array) });
-    expect(petri).toEqual({ ...oracle, steps: { ...oracleSteps, ask: { ...oracleSteps['ask'], suspendPayload: userPayload } } });
+    const meta = ((oracle['steps'] as Record<string, Record<string, unknown>>)['ask']!['suspendPayload'] as Record<string, unknown>)['__workflow_meta'];
+    // The suspended aggregate's meta (`handlers/control-flow.ts:1433-1451`): the lowest suspended
+    // item, every settled item, and the run's labels, copied at `:1433, 1448` — the host's, laid
+    // over the net's aggregate by `withForeachHostFields`.
+    expect(meta).toMatchObject({ foreachIndex: 0, foreachOutput: expect.any(Array), resumeLabels: { l1: { stepId: 'ask', foreachIndex: 0 } } });
+    expect(petri).toEqual(oracle);
+  });
+
+  it('a failure inside .foreach(): equal, the failed aggregate\'s foreachOutput and resumeLabels included', async () => {
+    const tick = createStep({
+      id: 'tick',
+      inputSchema: num,
+      outputSchema: num,
+      suspendSchema: z.object({ i: z.number() }),
+      execute: async ({ inputData }) => {
+        if (inputData.n === 2) throw new Error('two');
+        return { n: inputData.n * 10 };
+      },
+    });
+    const make = (e: Engine) =>
+      createWorkflow({ id: 'fe-fail', inputSchema: z.array(num), outputSchema: z.any(), ...cfg(e) }).foreach(tick).commit();
+    const { oracle, petri } = await both(make, { inputData: [{ n: 1 }, { n: 2 }, { n: 3 }] });
+    expect(oracle['status']).toBe('failed');
+    // The failing item's own result plus the meta (`handlers/control-flow.ts:1355-1370`).
+    const record = (oracle['steps'] as Record<string, Record<string, unknown>>)['tick']!;
+    expect(record['suspendPayload']).toMatchObject({ __workflow_meta: { foreachOutput: expect.any(Array), resumeLabels: {} } });
+    expect(petri).toEqual(oracle);
   });
 
   it('a nested workflow suspends: the inner path and the nested meta are kept', async () => {

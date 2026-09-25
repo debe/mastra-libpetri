@@ -286,17 +286,48 @@
 - [x] Design: research, three independent designs, three judges, synthesis; the seeded-segment
       design chosen unanimously. Contract written and typechecked: resume sites, arm and foreach
       re-entry tokens, `FlowToken.resumed`, `pending` suspensions, foreach meta, stubs that throw
-- [ ] W1 compiler core — site collection, entry sites, `resumeSeed` with the changed-workflow refusal
-- [ ] W2 blocks — arm re-entry and `replay-i` for `.parallel()` and `.branch()`; `pending` in join-susp
-- [ ] W3 leaf and loop — the resumed attempt, its record shape, `suspendedAt`, the loop's first iteration
-- [ ] W5 kernel — the seeded segment and its one-token assertion
-- [ ] W6 runner — resume data, suspend data, the nested-workflow resume overlay, labels
-- [ ] W7 engine and snapshot — the decoder, refusals before persist, the overwrite guard, the carried
-      context, `suspendedPaths` from every suspension, tracing ids, `stepExecutionPath` continuation
-- [ ] W8 verification — resume segments with and without cancel, and the gate, threshold, coverage
-      and timing structure checks
-- [ ] W4 foreach — last: cursor order, parked items, re-entry; its refusal lifted only when green
-- [ ] W9 conformance — suspend-then-resume on both engines and crossed, at every k
+- [x] W1 compiler core — an `EntrySite` per top-level step and loop, `resumeSeed` mapping every
+      stored status to an arm verdict, and named refusals: a changed workflow (`id-mismatch`,
+      row 78), unsupported stored shapes (row 80), a nested-workflow foreach body (`nested`, row 77)
+- [x] W2 blocks — `gadgets/reentry.ts`: per-arm `resume-j` gates, `re-enter-j` (inhibited by
+      `wf.cancel`) and its sweep, `replay-i` through the block's own join so `decide` never re-runs;
+      join-susp carries `pending`; a misfit seed fails the block by name (rows 34, 43, 79, 80)
+- [x] W3 leaf and loop — the resumed attempt and its record, `suspendedAt` on every suspension,
+      falsy resume data recorded as a fresh start via `resumedAt` (row 82); a resumed loop restarts
+      its allowance (row 13)
+- [x] W5 kernel — a run seeded at a registered site; per-place counts shared with the verifier
+      (`initialCounts`), an entry seed's colour, and a failed firing ending the run as `stranded`
+      instead of waiting forever under Mastra's signal (rows 66, 68)
+- [x] W6 runner — resume data, suspend data, the nested-workflow overlay, labels, a foreach item's
+      prior record (non-success siblings from the segment never read, row 87), and host
+      preconditions rejecting the resume as on the default engine (`HostPreconditionError`, row 84)
+- [x] W7 engine and snapshot — `decodeResume`, refusals before the first persist (Run's claim
+      released), the `#lastPersisted` guard, the resume-start row, `suspendedPaths` from every
+      suspension, tracing ids and `tracingContext: undefined` as Mastra writes it (row 63)
+- [x] W8 verification — `resume@s` and `resume@s+cancel` for every site, by default; six structure
+      checks (`resumeGateViolations` with sweep destinations, threshold, coverage, timing)
+- [x] W4 foreach — cursor order, `parked`/`unpark`, re-entry, `__workflow_meta` (`foreachIndex`,
+      `foreachOutput`, `resumeLabels`), resumed-aggregate host fields; **the refusal is lifted**:
+      `resume-foreach-index`, `-no-index`, `-parked` pass on every route at every k with no
+      attribution. A nested-workflow body stays refused (row 77)
+- [x] W9 conformance — suspend-then-resume on routes default>default (oracle), petri>petri,
+      default>petri and petri>default at k = 1, 2, 4 and unbounded; last-entry resumed blocks
+      (`resume-parallel-last`, `resume-branch-last`); route-scoped attributions
+- [x] Final integration (registry libpetri 6.1.0, not linked; z3 on PATH): `npm run check` exit 0;
+      `npm run build` exit 0; `npm test` "Tests 26 failed | 2135 passed | 35 skipped (2196)" under
+      load average 20-34, every failure a solver timeout or a killed z3 (`unknown`), none a wrong
+      verdict; the nine files re-run unloaded: "Test Files 9 passed (9)", "Tests 361 passed | 7
+      skipped (368)". `SLOW_PROOFS=1` resume lane (resume-segments, resume-proofs, foreach-resume):
+      "Tests 205 passed (205)". Resume differential: 317 pass, 51 divergent-and-attributed, 0 fail;
+      fresh-run differential 206/206
+- [ ] Open after M4, none blocking: row 84's key residual (`tripwire: undefined`,
+      `suspendPayload: {}` on a foreach thrown-result entry); row 86 (a rebuilt foreach entry — needs
+      the item's full record on its tokens, a `stepRecord?` on the exit tokens); `StrandedRunError`
+      naming the failed transition; `HostPreconditionError` from a `.parallel()` arm or loop body,
+      untested; surviving mutants P6, P8, P13, P14; partial resume@ verdict maps in the budget, loop
+      and foreach mutant tests; exact key lists in leaf-resume and anchored refusal messages in
+      parallel-/branch-resume; ManualClock stamps for pending tokens; `foreachOutput.*` clock stamps
+      in `EXCLUDED_PATHS`; the e2e falsy-resume loop for `''` and omitted data
 - Dropped from the plan, with reasons in ADR 0007: capturing a marking with `executor.snapshot()`
   (a suspended marking is dead and rebuilt from records; `snapshot()` throws after drain), and
   driving drain and injection from inside `Clock.sleep` (a resume injects nothing)

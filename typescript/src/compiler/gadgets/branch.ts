@@ -24,6 +24,7 @@ import type {
   StepRecord,
   SuspendToken,
 } from '../types.js';
+import { blockReentry, suspendedBlock, type ArmArrival } from './reentry.js';
 import type { Gadget, GadgetResult } from './types.js';
 
 /**
@@ -39,22 +40,7 @@ export type GateToken =
   | { readonly decision: 'skip' }
   | { readonly decision: 'reuse'; readonly output: unknown };
 
-/**
- * One arm's settlement, as the join counts it. Every arm deposits exactly one, whichever way it
- * went, so the join is a cardinality join over `arrived` and never waits on an arm that will not
- * come.
- *
- * Only `ok` carries a value: it is the only status whose data reaches the block's own output.
- * The index is stamped by *which* transition deposited it, so arm identity is topology rather
- * than a value the join has to trust.
- */
-export type ArmArrival =
-  | { readonly status: 'ok'; readonly index: number; readonly data: unknown }
-  | { readonly status: 'failed' }
-  | { readonly status: 'suspended' }
-  /** Bailed or paused: the arm is done, and the block does not report it. */
-  | { readonly status: 'settled' }
-  | { readonly status: 'skipped' };
+export type { ArmArrival } from './reentry.js';
 
 /**
  * `.branch([[cond, step], ...])` — **inclusive**, not if/else.
@@ -76,9 +62,19 @@ export type ArmArrival =
  *                        -> armPause  --collect-pause> arrived{settled}              (swallowed)
  *
  *   exactly(n, arrived), all(errSeen),  reset(suspSeen)       --join-fail--> exits.failed
- *   exactly(n, arrived), all(suspSeen), inhibitor(errSeen)    --join-susp--> exits.suspended
+ *   exactly(n, arrived), all(suspSeen), inhibitor(errSeen)    --join-susp--> exits.suspended {lowest, pending}
  *   exactly(n, arrived), inhibitor(errSeen), inhibitor(suspSeen) --join-ok--> next
+ *
+ *   resume-j --re-enter-j [inhibitor cancel]---> arm_j.in {resumed} + replay_i for every i != j
+ *   resume-j --re-enter-j.cancel [read cancel]-> exits.canceled        the resume never started
+ *   replay_i --replay-i--> arrived{ok | failed + errSeen | suspended + suspSeen | settled | skipped}
  * ```
+ *
+ * **Resume** ([ADR 0007], `./reentry.ts`). Each arm is a resume site, gated and swept like `decide`.
+ * Re-entering arm *j* runs only that arm and replays each sibling's stored outcome — `skipped` for
+ * an arm with no record, as Mastra's `onlyExecutedSteps` leaves it out (`handlers/entry.ts:43-46`)
+ * — through the unchanged join. `decide` is never on the resume path, so no condition is
+ * re-evaluated, as in Mastra (`handlers/entry.ts:415-500`).
  *
  * **The join is Mastra's aggregation, shared with `.parallel()`.** Mastra awaits every arm
  * (`Promise.all`, and an arm failure never rejects), then reports failed > suspended > success
@@ -113,7 +109,8 @@ export type ArmArrival =
  * Cartesian product of its children, so a `decide` declaring `and(xor(run_0, skip_0), ...)` is
  * 2^n branches in one transition, and every skip would have to land in a place of its own
  * because a branch models one token per named place. The gates keep `decide` at two branches and
- * the declared branches linear in n (8n + 10 with single-attempt arms and a gated block). The reachable state space
+ * the declared branches linear in n: 14n + 10 with single-attempt arms and a gated block, of which
+ * 6n are the resume sites (`re-enter-j` 2, its sweep 1, `replay-i` 3). The reachable state space
  * still grows exponentially, because every subset and interleaving is genuinely reachable; its
  * cost per arm count is measured in `tests/verify/branch.test.ts`, which is where a split
  * threshold should be chosen from.
@@ -230,6 +227,7 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
   };
 
   const gates: Place<GateToken>[] = [];
+  const armIns: Place<FlowToken>[] = [];
   const transitions: Transition[] = [];
   /** Which arm an outcome came from: its view path's segment below the block. */
   const armIndex = (origin: Origin): number => origin.path[viewPath.length] ?? n;
@@ -243,6 +241,7 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
     // Arm i runs at `[...executionPath, i]` (`handlers/control-flow.ts:569`), and ungated.
     const child = ctx.emitNested(arm, [...path, i], armDone, armExits, { viewPath: [...viewPath, i] });
     gates.push(gateIn);
+    armIns.push(child.inPlace);
 
     transitions.push(
       Transition.builder(names.entryTransition(path, entry.id, `gate-${i}`))
@@ -378,8 +377,9 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
       .inhibitor(errSeen)
       .outputs(outPlace(exits.suspended))
       .action(async (tctx) => {
-        // `results.find(r => r.status === 'suspended')`: the lowest arm index again.
-        tctx.output(exits.suspended, lowest(tctx.inputs(suspSeen), armIndex));
+        // `results.find(r => r.status === 'suspended')`: the lowest arm index again. Every other
+        // suspension rides along as `pending`, in arm order, so none is dropped ([ADR 0007], row 34).
+        tctx.output(exits.suspended, suspendedBlock(tctx.inputs(suspSeen), armIndex));
       })
       .build(),
 
@@ -391,7 +391,24 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
       .build(),
   );
 
-  return { inPlace, transitions };
+  // Resuming at an arm ([ADR 0007]): `decide` is not on this path — Mastra does not re-evaluate the
+  // conditions on a resume — and a sibling that never ran replays as `skipped`.
+  const reentry = blockReentry({
+    names,
+    path,
+    viewPath,
+    blockId: entry.id,
+    block: 'branch',
+    arms,
+    armIns,
+    places: { arrived, errSeen, suspSeen },
+    cancel,
+    canceled: exits.canceled,
+    failed: exits.failed,
+  });
+  transitions.push(...reentry.transitions);
+
+  return { inPlace, transitions, resumeSites: reentry.resumeSites };
 };
 
 /**

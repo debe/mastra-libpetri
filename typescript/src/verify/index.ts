@@ -1,4 +1,17 @@
-export { verifyWorkflow, describeReport } from './properties.js';
-export type { PropertyReport, Segment, VerifyOptions } from './properties.js';
-export { cancelStructureViolations } from './structure.js';
+export {
+  verifyWorkflow,
+  describeReport,
+  resumeSegment,
+  segmentLabel,
+  segmentInitialMarking,
+  segmentsFor,
+} from './properties.js';
+export type { PropertyReport, ResumeSegment, Segment, VerifyOptions } from './properties.js';
+export {
+  cancelStructureViolations,
+  resumeGateViolations,
+  thresholdOnlyViolations,
+  suspensionCoverageViolations,
+  resumeTimingViolations,
+} from './structure.js';
 export { budgetStructureViolations } from './budget.js';

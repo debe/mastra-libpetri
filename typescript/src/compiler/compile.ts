@@ -25,6 +25,7 @@ import type {
   CanceledToken,
   CompiledWorkflow,
   EntryDescription,
+  EntrySite,
   Exits,
   FailureToken,
   FlowToken,
@@ -128,6 +129,12 @@ export function compile(description: WorkflowDescription, options: CompileOption
   // Resume sites ([ADR 0007]), keyed by path; a gadget registers its own through GadgetResult.
   const resumeSites = new Map<string, ResumeSite>();
   const pathToEntry = new Map<string, { entryId: string; kind: EntryDescription['kind'] }>();
+  // One site per path: a stored `resumePath` must name exactly one place to seed.
+  const registerSite = (site: ResumeSite): void => {
+    const key = site.path.join('.');
+    if (resumeSites.has(key)) throw new Error(`two resume sites at path ${key}`);
+    resumeSites.set(key, site);
+  };
 
   // **The arrival is part of the net.** Registering `wf.cancel` itself as an environment place
   // would be the direct model, but libpetri routes any net with an environment place away from
@@ -230,11 +237,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
       transitionToEntry.set(t.name, { path, id: entry.id });
     }
     if (result.places) extraPlaces.push(...result.places);
-    for (const site of result.resumeSites ?? []) {
-      const key = site.path.join('.');
-      if (resumeSites.has(key)) throw new Error(`two resume sites at path ${key}`);
-      resumeSites.set(key, site);
-    }
+    for (const site of result.resumeSites ?? []) registerSite(site);
     return result;
   };
 
@@ -246,6 +249,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
     const entry = description.entries[i]!;
     pathToEntry.set(String(i), { entryId: entry.id, kind: entry.kind });
     next = emit(entry, [i], next, topLevelExits, i === last, { cancel }).inPlace;
+    const site = entrySite(entry, i, next);
+    if (site) registerSite(site);
   }
 
   const net = PetriNet.builder(description.id)
@@ -284,6 +289,32 @@ export function compile(description: WorkflowDescription, options: CompileOption
     resumeSites,
     structuralHash: structuralHash(description, names.names()),
   };
+}
+
+/**
+ * The resume site of a top-level entry that owns one itself ([ADR 0007]): a step — a nested
+ * workflow included, which is one step here (ADR 0003) — and a loop. Both resume at their own
+ * input place, which is already gated on the cancel signal and swept beside it, so Mastra's check
+ * before the entry (`default.ts:815`) holds for a resumed segment with nothing added.
+ *
+ * `stepId` is the id Mastra stores the suspension under, which is what `resume.steps[0]` names:
+ * the step's own for a step, the **body's** for a loop (`suspendedPaths[bodyId] = [i]`,
+ * `handlers/control-flow.ts:726-790`). A sleep never suspends and gets none; a `.parallel()`,
+ * `.branch()` or `.foreach()` registers its own sites through `GadgetResult.resumeSites`.
+ */
+function entrySite(entry: EntryDescription, index: number, inPlace: Place<FlowToken>): EntrySite | undefined {
+  switch (entry.kind) {
+    case 'step':
+      return { kind: 'entry', path: [index], stepId: entry.id, construct: 'step', place: inPlace };
+    case 'loop':
+      return { kind: 'entry', path: [index], stepId: entry.body.id, construct: 'loop', place: inPlace };
+    case 'sleep':
+    case 'sleepUntil':
+    case 'parallel':
+    case 'branch':
+    case 'foreach':
+      return undefined;
+  }
 }
 
 /**

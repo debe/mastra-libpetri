@@ -326,8 +326,9 @@ describe('PetriExecutionEngine.execute — refusals', () => {
     return { outcome, calls };
   }
 
+  // Resume is implemented (ADR 0007), so it is not a mode refused by name; the refusal of one
+  // position it cannot place is asserted on its own below.
   it.each([
-    ['resume', { resume: { steps: ['a'], stepResults: {}, resumePayload: {}, resumePath: [0] } }],
     ['restart', { restart: { activePaths: [0], activeStepsPath: {}, stepResults: {}, state: {} } }],
     ['timeTravel', { timeTravel: { executionPath: [0], steps: ['a'], stepResults: {}, state: {} } }],
     ['perStep', { perStep: true }],
@@ -337,6 +338,22 @@ describe('PetriExecutionEngine.execute — refusals', () => {
     const error = (outcome as { e: unknown }).e;
     expect(error).toBeInstanceOf(UnsupportedRunModeError);
     expect((error as UnsupportedRunModeError).mode).toBe(mode);
+    expect(calls).toEqual([{ span: 'run', method: 'error', args: { error } }]);
+  });
+
+  it('refuses a resume whose resumed step has no stored record, naming the step, its position and the reason', async () => {
+    // Mastra falls back to the previous entry's output, or the run input at index 0, as the
+    // step's input (`handlers/entry.ts:111-128`); this engine refuses by name (divergence row
+    // 80(c)) and errors the span once. That nothing runs or persists is pinned for every refusal by
+    // engine-resume.test.ts ("a refused resume persists nothing, and Run releases its claim").
+    const { outcome, calls } = await direct({ resume: { steps: ['a'], stepResults: {}, resumePayload: {}, resumePath: [0] } });
+    expect(outcome.ok).toBe(false);
+    const error = (outcome as { e: unknown }).e;
+    expect(error).toBeInstanceOf(UnsupportedRunModeError);
+    expect((error as UnsupportedRunModeError).mode).toBe('resume');
+    expect((error as UnsupportedRunModeError).resume).toStrictEqual({ stepId: 'a', path: [0], reason: 'unsupported' });
+    // Refused for the missing record, not for anything else about the request.
+    expect((error as Error).message).toContain("no stored input for step 'a' at [0]: its record is missing");
     expect(calls).toEqual([{ span: 'run', method: 'error', args: { error } }]);
   });
 

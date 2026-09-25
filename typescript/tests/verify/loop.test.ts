@@ -15,7 +15,17 @@ import { loopGadget } from '../../src/compiler/gadgets/loop.js';
 import type { Gadget } from '../../src/compiler/gadgets/types.js';
 import type { CompiledWorkflow, EntryDescription, StepDescription, WorkflowDescription } from '../../src/compiler/types.js';
 import { runWorkflow } from '../../src/engine/kernel.js';
-import { cancelStructureViolations, describeReport, verifyWorkflow, type PropertyReport, type Segment } from '../../src/verify/index.js';
+import {
+  cancelStructureViolations,
+  describeReport,
+  resumeGateViolations,
+  segmentLabel,
+  segmentsFor,
+  verifyWorkflow,
+  type PropertyReport,
+  type Segment,
+  type VerifyOptions,
+} from '../../src/verify/index.js';
 import { RecordingRunner } from '../fixtures/runner.js';
 
 /**
@@ -30,6 +40,9 @@ import { RecordingRunner } from '../fixtures/runner.js';
  *   (`placeBound(wf.canceled, 0)`), which sees a sweep that fires without the signal.
  * - **cancel** — the request place is seeded with one token and `t.cancel.arrive` may move it to
  *   `wf.cancel` at every reachable point: one cancellation, landing anywhere. Three properties.
+ * - **resume@s**, **resume@s+cancel** — `verifyWorkflow`'s default also proves each resume site
+ *   ([ADR 0007]) with the same property sets; a top-level loop's site is its own input place. The
+ *   expected keys come from `segmentsFor`, never from a hand-kept list.
  *
  * Before any proof, `verifyWorkflow` runs `cancelStructureViolations`: an inhibitor on the signal
  * that no quiescence property can see is refused from the arcs (block 5).
@@ -85,11 +98,23 @@ const terminalsOf = (c: CompiledWorkflow) => {
  * sinks, same invariants, and the `cancel` segment seeded the same way — one token in the request
  * place, which `arrive` may move on at every reachable point. The net stays closed either way.
  */
+const postStart = (compiled: CompiledWorkflow, allowance: number, segment: Segment): ReadonlyMap<Place<unknown>, number> => {
+  const marking = new Map<Place<unknown>, number>([
+    [role(compiled.net, '.poll.ready'), 1],
+    [role(compiled.net, '.poll.budget'), allowance],
+  ]);
+  if (segment === 'cancel') marking.set(compiled.cancelRequest, 1);
+  return marking;
+};
+
+/** The marking in `verifyWorkflow`'s own `{place: n, …}` form, so a seeded report names it too. */
+const describeMarking = (marking: ReadonlyMap<Place<unknown>, number>): string =>
+  `{${[...marking].map(([p, n]) => `${p.name}: ${n}`).join(', ')}}`;
+
 const seeded = (compiled: CompiledWorkflow, allowance: number, segment: Segment = 'closed') =>
   SmtVerifier.forNet(compiled.net)
     .initialMarking((m) => {
-      m.tokens(role(compiled.net, '.poll.ready'), 1).tokens(role(compiled.net, '.poll.budget'), allowance);
-      if (segment === 'cancel') m.tokens(compiled.cancelRequest, 1);
+      for (const [p, n] of postStart(compiled, allowance, segment)) m.tokens(p, n);
     })
     .sinkPlaces(...terminalsOf(compiled), compiled.cancel)
     .semiflowInvariants(true)
@@ -107,17 +132,24 @@ const verdict = async (builder: ReturnType<typeof seeded>, property: SmtProperty
 
 /** `verifyWorkflow`'s property set per segment, at the post-start marking. */
 async function seededReports(compiled: CompiledWorkflow, k: number, segment: Segment): Promise<PropertyReport[]> {
+  const marking = describeMarking(postStart(compiled, k, segment));
   const reports: PropertyReport[] = [
-    { property: 'deadlockFree', segment, result: await verdict(seeded(compiled, k, segment), deadlockFree()) },
-    { property: 'terminatesAtSink', segment, result: await verdict(seeded(compiled, k, segment), terminatesAtSink()) },
+    { property: 'deadlockFree', segment, marking, result: await verdict(seeded(compiled, k, segment), deadlockFree()) },
+    { property: 'terminatesAtSink', segment, marking, result: await verdict(seeded(compiled, k, segment), terminatesAtSink()) },
     {
       property: 'exactlyOneTerminal',
       segment,
+      marking,
       result: await verdict(seeded(compiled, k, segment), quiescentCount(terminalsOf(compiled), 1, 1)),
     },
   ];
   if (segment === 'closed') {
-    reports.push({ property: 'neverCanceled', segment, result: await verdict(seeded(compiled, k), placeBound(compiled.terminals.canceled, 0)) });
+    reports.push({
+      property: 'neverCanceled',
+      segment,
+      marking,
+      result: await verdict(seeded(compiled, k), placeBound(compiled.terminals.canceled, 0)),
+    });
   }
   return reports;
 }
@@ -131,12 +163,21 @@ afterAll(() => {
   if (file !== undefined) writeFileSync(file, `${log.join('\n')}\n`);
 });
 
-const CLOSED = ['closed/deadlockFree', 'closed/terminatesAtSink', 'closed/exactlyOneTerminal', 'closed/neverCanceled'];
-const CANCEL = ['cancel/deadlockFree', 'cancel/terminatesAtSink', 'cancel/exactlyOneTerminal'];
-const key = (r: PropertyReport) => `${r.segment}/${r.property}`;
+/** The property set `verifyWorkflow` proves in a segment with no cancel arriving, and in one with. */
+const UNCANCELED_PROPERTIES = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', 'neverCanceled'] as const;
+const CANCELED_PROPERTIES = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal'] as const;
+const cancels = (segment: Segment) => (typeof segment === 'string' ? segment === 'cancel' : segment.cancel);
+const keysOf = (segments: readonly Segment[]) =>
+  segments.flatMap((segment) => (cancels(segment) ? CANCELED_PROPERTIES : UNCANCELED_PROPERTIES).map((p) => `${segmentLabel(segment)}/${p}`));
+/** Every `segment/property` key `verifyWorkflow` reports for these options — `segmentsFor`'s segments, resume sites included. */
+const keysFor = (compiled: CompiledWorkflow, options: Pick<VerifyOptions, 'segments' | 'resume'> = {}) => keysOf(segmentsFor(compiled, options));
+
+const CLOSED = keysOf(['closed']);
+const CANCEL = keysOf(['cancel']);
+const key = (r: PropertyReport) => `${segmentLabel(r.segment)}/${r.property}`;
 
 /** Every report proven — `verdict.type === 'proven'`, never `!isViolated()`, which passes on `unknown`. */
-const expectAllProven = (reports: readonly PropertyReport[], expected: readonly string[] = [...CLOSED, ...CANCEL]) => {
+const expectAllProven = (reports: readonly PropertyReport[], expected: readonly string[]) => {
   expect(reports.map(key)).toEqual(expected);
   for (const report of reports) expect(report.result.verdict.type, describeReport(report)).toBe('proven');
 };
@@ -178,7 +219,7 @@ describe('loop, proved from the entry place', () => {
 
     const reports = await verifyWorkflow(compiled, { timeoutMs: 120_000 });
     record(`entry | ${name} | bound ${bound}`, reports);
-    expectAllProven(reports);
+    expectAllProven(reports, keysFor(compiled));
   }, 300_000);
 });
 
@@ -345,7 +386,7 @@ describe('loop: removing a safeguard flips a verdict (non-vacuity)', () => {
     const description = only(loop(2));
     const broken = compile(description, { gadgets: { loop: mutated('finish', { dropReset: '.budget' }) } });
 
-    expectAllProven(await verifyWorkflow(broken, { timeoutMs: 120_000 }));
+    expectAllProven(await verifyWorkflow(broken, { timeoutMs: 120_000 }), keysFor(broken));
 
     const real = await verdict(seeded(compile(description), 2), deadlockFree());
     const mutant = await verdict(seeded(broken, 2), deadlockFree());
@@ -405,14 +446,23 @@ describe('loop: removing a cancellation safeguard is caught — by structure, by
 
   // Each sweep is the only way out of its place once the signal is marked, because the transition
   // that would continue is inhibited. Removing it strands the waiting token — structurally sound
-  // (nothing races), so it is the cancel segment that catches it.
-  it.each(['cancel-in', 'cancel-ready', 'cancel-produced', 'cancel-exiting'])(
+  // as far as racing goes, so it is the cancel segment that catches it. `cancel-in` is also the
+  // sweep of resume site 0 (the loop's input place, [ADR 0007]), so the resume gate check now
+  // names that mutant too; `structure: 'skip'` lets the proofs show what they see on their own.
+  it.each([
+    ['cancel-in', ["resume site 0 ('s.0.poll.loop-in') has no sweep: nothing reads 'wf.cancel' and consumes it"]],
+    ['cancel-ready', []],
+    ['cancel-produced', []],
+    ['cancel-exiting', []],
+  ] as const)(
     'needs the %s sweep: closed proven, cancel violated, from the entry place',
-    async (sweep) => {
+    async (sweep, gate) => {
       const broken = compile(only(loop(2)), { gadgets: { loop: without(sweep) } });
       expect(cancelStructureViolations(broken)).toEqual([]);
+      expect(resumeGateViolations(broken)).toEqual(gate);
 
-      const reports = await verifyWorkflow(broken, { timeoutMs: 120_000 });
+      // Only the mutant the gate check refuses skips it; the rest still pass every structural check.
+      const reports = await verifyWorkflow(broken, { timeoutMs: 120_000, structure: gate.length > 0 ? 'skip' : 'check' });
       record(`mutant without ${sweep} | entry`, reports);
       expectAllProven(reports.filter((r) => r.segment === 'closed'), CLOSED);
       expect(verdicts(reports), described(reports)).toMatchObject({
@@ -424,15 +474,33 @@ describe('loop: removing a cancellation safeguard is caught — by structure, by
   );
 
   // A sweep that fires without the signal. That net still drains to exactly one terminal — only
-  // sometimes the wrong one — and it is no longer a sweep, so the structural check has nothing to
-  // compare; `neverCanceled` (closed segment) is what sees it.
-  it.each(['cancel-in', 'cancel-ready', 'cancel-produced', 'cancel-exiting'])(
+  // sometimes the wrong one — and it is no longer a sweep, so the cancel structure check has
+  // nothing to compare; `neverCanceled` (closed segment) is what sees it. `cancel-in` consumes
+  // resume site 0, so without its read it is an uninhibited gate there and the site has no sweep:
+  // the resume gate check names that one as well, and `structure: 'skip'` keeps the proof visible.
+  it.each([
+    [
+      'cancel-in',
+      [
+        "'t.0.poll.cancel-in' consumes resume site 0 ('s.0.poll.loop-in') without an inhibitor on 'wf.cancel'",
+        "resume site 0 ('s.0.poll.loop-in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+      ],
+    ],
+    ['cancel-ready', []],
+    ['cancel-produced', []],
+    ['cancel-exiting', []],
+  ] as const)(
     'needs %s to read the signal: closed neverCanceled violated',
-    async (sweep) => {
+    async (sweep, gate) => {
       const broken = compile(only(loop(2)), { gadgets: { loop: mutated(sweep, { dropRead: 'wf.cancel' }) } });
       expect(cancelStructureViolations(broken)).toEqual([]);
+      expect(resumeGateViolations(broken)).toEqual(gate);
 
-      const reports = await verifyWorkflow(broken, { timeoutMs: 120_000, segments: ['closed'] });
+      const reports = await verifyWorkflow(broken, {
+        timeoutMs: 120_000,
+        segments: ['closed'],
+        structure: gate.length > 0 ? 'skip' : 'check',
+      });
       record(`mutant ${sweep} without read | entry | closed`, reports);
       expect(verdicts(reports), described(reports)).toMatchObject({ 'closed/neverCanceled': 'violated' });
     },

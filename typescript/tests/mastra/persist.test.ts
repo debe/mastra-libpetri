@@ -687,10 +687,11 @@ describe('persistRun / buildRunSnapshot — direct calls', () => {
       expect(s).toMatchObject({ activePaths: [1], tracingContext: {} });
     });
 
-    it('not started, at the gate of entry 0: [0] and no tracingContext key (the loop-top check)', () => {
+    it('not started, at the gate of entry 0: [0] and tracingContext undefined (the loop-top check writes the key with no value)', () => {
       const s = buildRunSnapshot(ctxOf(canceled({ stepId: 'a', path: [0] }, false)), 0);
       expect(s.activePaths).toEqual([0]);
-      expect('tracingContext' in s).toBe(false);
+      expect(Object.hasOwn(s, 'tracingContext')).toBe(true);
+      expect(s.tracingContext).toBeUndefined();
     });
 
     it('a gate below the top level is inside a begun entry: that entry', () => {

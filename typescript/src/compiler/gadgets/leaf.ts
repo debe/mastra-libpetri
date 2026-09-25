@@ -12,7 +12,7 @@ import {
 } from 'libpetri';
 import type { EntryPath } from '../names.js';
 import { scopeOf, viewOf, type RunScope } from '../scope.js';
-import type { Exits, FlowToken, StepOutcome, StepSource } from '../types.js';
+import type { Exits, FlowToken, StepOutcome, StepRecord, StepSource } from '../types.js';
 import type { Gadget, GadgetContext } from './types.js';
 
 /**
@@ -358,6 +358,32 @@ function describe(value: unknown): string {
   }
 }
 
+/**
+ * The host refused a step before running it — a precondition of the call, not a failure of the
+ * step. Mastra's own resume rejects at these points instead of recording a failed step: a truthy
+ * primitive stored `suspendPayload` (`'__workflow_meta' in …` throws a `TypeError`,
+ * `handlers/step.ts:160`), a resume position this engine refuses at run time, a resumed call on a
+ * run given no resume. A runner throws this to say so.
+ *
+ * The leaf never retries it and writes no record; it leaves by the step's declared failure branch
+ * carrying this marker (see {@link stepAction}), and the engine rejects the run with `cause`. It
+ * is not rethrown out of the action: that would strand the consumed token and permit.
+ */
+export class HostPreconditionError extends Error {
+  override readonly name = 'HostPreconditionError';
+  constructor(
+    readonly stepId: string,
+    readonly path: EntryPath,
+    cause: unknown,
+  ) {
+    super(
+      `the host refused step '${stepId}' at [${path.join(', ')}] before it ran: ` +
+        (cause instanceof Error ? cause.message : describe(cause)),
+      { cause },
+    );
+  }
+}
+
 interface StepActionSpec {
   readonly stepId: string;
   /** The view path — Mastra's `executionPath` for the call, and every outcome token's `path`. */
@@ -392,9 +418,12 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
       if (permits !== undefined) tctx.output(permits, null);
     };
     const scope = scopeOf(tctx);
-    // Stamped once, by the first attempt, and carried on the retry token: Mastra takes the step's
-    // start before its retry loop (`handlers/step.ts:166,174`).
-    const startedAt = incoming.startedAt ?? scope.epochNow();
+    const resumed = incoming.resumed === true;
+    // The record this step had before this call, if any — read before the runner can write one.
+    const prior = scope.getStepResult(stepId);
+    // Mastra stamps the step's start before its retry loop, `Date.now()` at `handlers/step.ts:166`,
+    // so the first attempt reads the clock before the call and the stamp rides the retry token.
+    const fresh = incoming.startedAt ?? scope.epochNow();
 
     let outcome: StepOutcome;
     try {
@@ -403,18 +432,41 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
         source,
         attempt,
         ...(incoming.foreachIndex === undefined ? {} : { foreachIndex: incoming.foreachIndex }),
+        // The attempt a resume feeds ([ADR 0007]); every retry of it too, as `executeStepWithRetry`
+        // re-calls with the same params (`default.ts:455-511`).
+        ...(resumed ? { resumed: true as const } : {}),
       });
       if (outcome === null || typeof outcome !== 'object' || !OUTCOME_STATUSES.has((outcome as { status: unknown }).status as string)) {
         throw new Error(`runner returned an unrecognised outcome for step '${stepId}': ${describe(outcome)}`);
       }
     } catch (error) {
+      if (error instanceof HostPreconditionError) {
+        // The host refused before the step ran — Mastra's resume rejects there, before it writes
+        // the step's record or enters its retry loop (`handlers/step.ts:145-175`). A rethrow would
+        // lose the consumed input and permit ([EXEC-031]): libpetri drops a failed action's inputs
+        // and, under Mastra's abort signal, the executor never quiesces, so the run would hang
+        // rather than reject. So the refusal leaves by the declared failure branch — no record, no
+        // retry, the permit back — carrying the marker, which the engine turns into the rejection.
+        tctx.output(exits.failed, { ...withIndex({ stepId, path }, incoming), error });
+        release();
+        return;
+      }
       // A runner that throws is a failed step, not a lost token — and, like a step whose
       // `execute` throws in Mastra, it is retryable.
       outcome = { status: 'failed', error };
     }
 
+    // A resumed attempt is recorded as resumed exactly when the runner says so, by `resumedAt`:
+    // Mastra's truthiness test on the resume data (`handlers/step.ts:166-175`). Then the record
+    // takes no new start and keeps the suspended record's `startedAt` — absent, if that record had
+    // none. A resumed attempt with falsy resume data is a fresh start, and takes `fresh` (row 82).
+    const recordedResumed = resumed && outcome.resumedAt !== undefined;
+    const startedAt: number | undefined = incoming.startedAt ?? (recordedResumed ? prior?.startedAt : fresh);
+
     if (outcome.status === 'failed' && retry !== undefined && outcome.nonRetryable !== true) {
-      const carry: RetryToken = { ...incoming, startedAt };
+      // The whole token rides the retry chain — `resumed` included, so the next attempt is still
+      // the resumed one. `carried()` is what stops it at the step's exit.
+      const carry: RetryToken = { ...incoming, ...(startedAt === undefined ? {} : { startedAt }) };
       tctx.output(retry, carry);
       release();
       return;
@@ -425,9 +477,9 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     // `utils.ts:759-775`), and replaces `metadata` only when the call has an iteration count. So a
     // loop's `iterationCount` survives a later `.then(s)` of the same step, and the next loop over
     // it continues from there.
-    const prior = scope.getStepResult(stepId)?.metadata;
+    const priorMeta = prior?.metadata;
     const metadata = {
-      ...(incoming.iteration === undefined ? (prior?.iterationCount === undefined ? {} : { iterationCount: prior.iterationCount }) : { iterationCount: incoming.iteration }),
+      ...(incoming.iteration === undefined ? (priorMeta?.iterationCount === undefined ? {} : { iterationCount: priorMeta.iterationCount }) : { iterationCount: incoming.iteration }),
       ...(incoming.foreachIndex === undefined ? {} : { foreachIndex: incoming.foreachIndex }),
     };
     // A suspended or paused step has not ended: Mastra stamps `suspendedAt` and no `endedAt`
@@ -435,14 +487,30 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     const now = scope.epochNow();
     const when =
       outcome.status === 'suspended' ? { suspendedAt: now } : outcome.status === 'paused' ? {} : { endedAt: now };
-    const payload = 'payload' in outcome ? outcome.payload : incoming.data;
+    // A resumed attempt's record starts from the suspended one minus its completion fields
+    // (`omitPriorCompletionFields`, `utils.ts:759-777`, spread first at `handlers/step.ts:170`).
+    // Recorded as resumed, it writes no new `payload`: Mastra writes `resumePayload` in its place
+    // (`:171`), so the record keeps the input the step suspended on. Recorded fresh (falsy resume
+    // data), it writes the validated input, `payload: inputData`. `resumePayload` and `resumedAt`
+    // are the runner's, on the host record. A fresh attempt writes its own `payload` and start.
+    const kept = resumed && prior !== undefined ? withoutCompletion(prior) : {};
+    // `resumedAt` is the runner's word to the leaf, not a record field: Mastra's own `resumedAt`
+    // rides on the host record, which is what the codec writes.
+    const { resumedAt: _resumedAt, ...reported } = outcome;
+    const payload =
+      recordedResumed && prior !== undefined && Object.hasOwn(prior, 'payload')
+        ? prior.payload
+        : 'payload' in outcome
+          ? outcome.payload
+          : incoming.data;
     scope.recordStepResult(stepId, {
-      ...outcome,
+      ...kept,
+      ...reported,
       payload,
-      startedAt,
+      ...(startedAt === undefined ? {} : { startedAt }),
       ...when,
       ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
-    });
+    } as StepRecord);
 
     const origin = withIndex({ stepId, path }, incoming);
     // A foreach's aggregate record takes the deciding item's payload and its own start
@@ -450,7 +518,7 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     // the item's dispatch when a run budget held it in its lane.
     const stepPayload = {
       ...('payload' in outcome ? { stepPayload: outcome.payload } : {}),
-      ...(incoming.foreachIndex === undefined ? {} : { stepStartedAt: startedAt }),
+      ...(incoming.foreachIndex === undefined || startedAt === undefined ? {} : { stepStartedAt: startedAt }),
     };
     switch (outcome.status) {
       case 'success':
@@ -474,7 +542,17 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
         release();
         return;
       case 'suspended':
-        tctx.output(exits.suspended, { ...origin, payload: outcome.suspendPayload });
+        // `suspendedAt` on the run's clock ([TIME-015]) — the record's own instant — so the codec
+        // can keep the last suspension per id, as `suspendedPaths` does (`handlers/step.ts:395-397`).
+        // A `.foreach()` item's suspension also carries its validated input and start, for its
+        // `foreachOutput` entry should a sibling overwrite this record before the settle; the
+        // foreach consumes both. Anywhere else the token is as it was.
+        tctx.output(exits.suspended, {
+          ...origin,
+          ...(incoming.foreachIndex === undefined ? {} : stepPayload),
+          payload: outcome.suspendPayload,
+          suspendedAt: now,
+        });
         release();
         return;
       case 'paused':
@@ -487,16 +565,43 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
 
 /**
  * A flow token between attempts of one step. `startedAt` exists only on the retry chain's own
- * places; `carried()` never copies it, so it cannot leak downstream.
+ * places; `carried()` never copies it, so it cannot leak downstream. `resumed` rides the chain the
+ * same way — every retry of a resumed attempt is resumed — and stops at the step's exit.
  */
 type RetryToken = FlowToken & { readonly startedAt?: number };
 
-/** The ride-along fields of a flow token, without its data. */
+/**
+ * The ride-along fields of a flow token, without its data. **Never `resumed`**: it marks the one
+ * attempt a resume feeds, and Mastra feeds no later step (`handlers/step.ts:140-142` holds for
+ * `resume.steps[0]` only; position-exact here, `docs/divergences.md`).
+ */
 function carried(incoming: FlowToken): Omit<FlowToken, 'data'> {
   return {
     ...(incoming.foreachIndex === undefined ? {} : { foreachIndex: incoming.foreachIndex }),
     ...(incoming.iteration === undefined ? {} : { iteration: incoming.iteration }),
   };
+}
+
+/**
+ * A record minus what a finished, failed or suspended call wrote — Mastra's
+ * `omitPriorCompletionFields` (`utils.ts:759-777`) — and minus `host`, which is the previous call's
+ * own host record and would outlive it: the codec prefers a `host` when it rebuilds the snapshot.
+ * `status` is always overwritten by the outcome.
+ */
+function withoutCompletion(record: StepRecord): Record<string, unknown> {
+  const {
+    output: _output,
+    error: _error,
+    endedAt: _endedAt,
+    suspendedAt: _suspendedAt,
+    suspendPayload: _suspendPayload,
+    suspendOutput: _suspendOutput,
+    tripwire: _tripwire,
+    nonRetryable: _nonRetryable,
+    host: _host,
+    ...rest
+  } = record as Record<string, unknown>;
+  return rest;
 }
 
 /** Placeholder for a gadget not yet built, so an unsupported entry fails loudly at compile. */

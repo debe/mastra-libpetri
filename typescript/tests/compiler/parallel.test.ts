@@ -11,6 +11,7 @@ import type {
   StepOutcome,
   WorkflowDescription,
 } from '../../src/compiler/types.js';
+import { ManualClock } from '../support/manual-clock.js';
 import { RecordingRunner, type Behaviour } from '../fixtures/runner.js';
 
 const step = (id: string, extra: Partial<Omit<StepDescription, 'kind' | 'id'>> = {}): StepDescription =>
@@ -242,7 +243,17 @@ describe('parallel: suspension', () => {
 
     expect(s.settled.indexOf('c')).toBeLessThan(s.settled.indexOf('a'));
     expect(runner.calls).not.toContain('after');
-    expect(outcome).toStrictEqual({ status: 'suspended', stepId: 'a', path: [0, 0], payload: 'pa' });
+    // Every other suspension of the block rides along as `pending`, in arm order ([ADR 0007]), so
+    // a resume can list them all; its `suspendedAt` is the one the arm's record carries.
+    const pendingAt = (stepResults.get('c') as { suspendedAt?: number } | undefined)?.suspendedAt;
+    expect(pendingAt).toEqual(expect.any(Number));
+    expect(outcome).toStrictEqual({
+      status: 'suspended',
+      stepId: 'a',
+      path: [0, 0],
+      payload: 'pa',
+      pending: [{ stepId: 'c', path: [0, 2], payload: 'pc', suspendedAt: pendingAt }],
+    });
     // Mastra's `fmtReturnValue` lists *every* step result that is suspended, not only the one
     // that decided the block (`default.ts:630-643`); both are in the step results to list.
     // Each record keeps both of Mastra's fields apart: `payload` is the step's input and
@@ -260,9 +271,18 @@ describe('parallel: suspension', () => {
       },
     });
 
-    const outcome = await run(wf(fan('fan', [step('a'), step('a')])), runner);
+    // A virtual clock, so the pending suspension's `suspendedAt` is asserted to the instant: no
+    // virtual time passes, so it is the clock's epoch.
+    const clock = new ManualClock();
+    const outcome = await runWorkflow(compile(wf(fan('fan', [step('a'), step('a')]))), 'x', { runner, clock });
 
-    expect(outcome).toStrictEqual({ status: 'suspended', stepId: 'a', path: [0, 0], payload: 'arm 0' });
+    expect(outcome).toStrictEqual({
+      status: 'suspended',
+      stepId: 'a',
+      path: [0, 0],
+      payload: 'arm 0',
+      pending: [{ stepId: 'a', path: [0, 1], payload: 'arm 1', suspendedAt: clock.epochNow() }],
+    });
   });
 
   it('lets a suspension outrank a bail and a pause', async () => {
@@ -660,7 +680,10 @@ describe('parallel: removing a cancellation safeguard breaks a run', () => {
   });
   const dropSweep: Gadget = (entry, next, ctx) => {
     const result = parallelGadget(entry, next, ctx);
-    const transitions = result.transitions.filter((t) => !t.name.endsWith('.cancel'));
+    // The block's own entry sweep only: each arm's `re-enter-j.cancel` sweep ([ADR 0007]) also
+    // ends in `.cancel`, and it guards a resume site, not this input.
+    const sweep = `t.${ctx.path.join('-')}.${entry.id}.cancel`;
+    const transitions = result.transitions.filter((t) => t.name !== sweep);
     expect(transitions).toHaveLength(result.transitions.length - 1);
     return { ...result, transitions };
   };

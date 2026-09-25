@@ -16,7 +16,9 @@ import { createTool } from '@mastra/core/tools';
 import { TripWire } from '@mastra/core/agent';
 import { MastraNonRetryableError } from '@mastra/core/error';
 import { Mastra } from '@mastra/core/mastra';
+import { InMemoryStore } from '@mastra/core/storage';
 import { PetriExecutionEngine } from '../../src/mastra/engine.js';
+import { phaseEngine, RESUME_ROUTES, routeLabel, UUID } from '../../src/conformance/differential.js';
 import type {
   Attribution,
   DifferentialCase,
@@ -24,6 +26,11 @@ import type {
   Execution,
   IndependentPair,
   Observation,
+  PhaseObservation,
+  ResumeCase,
+  ResumeObservation,
+  ResumeRoute,
+  ResumeRouteLabel,
   TraceEvent,
 } from '../../src/conformance/differential.js';
 
@@ -940,9 +947,9 @@ function foreachFixtures(concurrency: number, count = 3): MastraFixture[] {
             boundDivergences: [
               {
                 row: 70,
-                paths: ['trace.*'],
+                paths: ['trace.*', 'result.steps.item.suspendPayload.__workflow_meta.foreachOutput.**'],
                 reason:
-                  'a budget below the foreach concurrency changes which items were dispatched when the failing item stopped dispatch (handlers/control-flow.ts:1082-1107); the run result is the same',
+                  "a budget below the foreach concurrency changes which items were dispatched when the failing item stopped dispatch (handlers/control-flow.ts:1082-1107), and so which items the failed aggregate's foreachOutput lists; the run result is the same",
               },
             ],
           }
@@ -950,13 +957,651 @@ function foreachFixtures(concurrency: number, count = 3): MastraFixture[] {
       divergences: [
         {
           row: 35,
-          paths: ['result.steps.item.suspendPayload'],
+          paths: ['startedAt', 'endedAt'].map((k) => `result.steps.item.suspendPayload.__workflow_meta.foreachOutput.*.${k}`),
           reason:
-            "a failed foreach's record carries __workflow_meta.foreachOutput/resumeLabels for replay-skip of succeeded items (handlers/control-flow.ts:1355-1369, #21749); foreach replay bookkeeping is M4",
+            "clock stamps, not a difference: each foreachOutput entry of the failed aggregate carries its item's start and end (handlers/control-flow.ts:1194-1198, 1360-1370), and the fresh-run EXCLUDED_PATHS, unlike RESUME_EXCLUDED_PATHS, does not exclude a stamp at that depth",
         },
       ],
       input: { n: count },
       build: (cfg, rec) => wf(`foreach-c${concurrency}-failing-item`, cfg).then(toItems(rec)).foreach(item(rec, 2), { concurrency }).commit(),
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Suspend, then resume ([ADR 0007])
+// ---------------------------------------------------------------------------------------------
+
+/** One `Run.resume()` call, as a fixture declares it; `resumeData` is passed exactly when present. */
+export interface ResumeCall {
+  readonly step?: string | readonly string[];
+  readonly label?: string;
+  readonly resumeData?: unknown;
+  readonly forEachIndex?: number;
+}
+
+/**
+ * A fixture that suspends and is resumed: run to its suspension with `start()`, then each
+ * `resume()` in turn, on the routes of `src/conformance/differential.ts` ([ADR 0007]).
+ */
+export interface ResumeFixture {
+  readonly name: string;
+  /** The workflow id: the storage key both engines share, so a run crosses engines. */
+  readonly id: string;
+  readonly input: unknown;
+  readonly resumes: readonly ResumeCall[];
+  /** The oracle's outcome per phase — a status, or `rejected` — so a broken fixture cannot pass by failing on both. */
+  readonly expected: readonly string[];
+  readonly build: (cfg: EngineConfig, rec: Recorder) => Runnable;
+  /** The resume sites the compiled net registers (`path.join('.')`), which the proofs cover. */
+  readonly sites: readonly string[];
+  readonly divergences?: readonly Attribution[];
+  readonly independent?: readonly IndependentPair[];
+  /** As {@link MastraFixture.width}. */
+  readonly width?: number;
+  readonly boundDivergences?: readonly Attribution[];
+  /**
+   * Attributions that hold only where the fixture's steps can overlap — the petri budget unbounded
+   * or at least {@link width} — the counterpart of `boundDivergences`.
+   */
+  readonly overlapDivergences?: readonly Attribution[];
+}
+
+/** What a registered workflow offers the resume driver: Mastra's own `Workflow`, read structurally. */
+interface ResumableRun extends StartedRun {
+  resume(args: Record<string, unknown>): Promise<unknown>;
+}
+interface Registered {
+  createRun(options: { runId: string }): Promise<ResumableRun>;
+}
+
+/** Registers `wf` on a new `Mastra` over `storage`: one per engine instance. */
+function register(storage: InMemoryStore, wf: Runnable): Registered {
+  const mastra = new Mastra({ storage, workflows: { wf } as never, logger: false });
+  return (mastra as unknown as { getWorkflow(key: string): Registered }).getWorkflow('wf');
+}
+
+/** A sort key for one stored run that does not depend on its ids or its clock. */
+function storedKey(snapshot: unknown): string {
+  return JSON.stringify(snapshot, (k, v: unknown) => (['timestamp', 'startedAt', 'endedAt', 'suspendedAt', 'resumedAt', 'runId'].includes(k) ? undefined : v))
+    .replace(UUID, '<uuid>');
+}
+
+/**
+ * Every `WorkflowRunState` in storage, by workflow name, each list in {@link storedKey} order — as
+ * `InMemoryStore` holds it, key for key: a key whose value is `undefined` is kept, so Mastra's
+ * `tracingContext: undefined` on a write that passes none (`handlers/entry.ts:209-227`) is compared
+ * with the petri engine's.
+ */
+async function storedRuns(storage: InMemoryStore): Promise<Record<string, unknown[]>> {
+  const store = await storage.getStore('workflows');
+  if (!store) throw new Error('InMemoryStore has no workflows store');
+  const { runs } = await store.listWorkflowRuns();
+  const out: Record<string, unknown[]> = {};
+  for (const run of runs) {
+    const snapshot: unknown = typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : structuredClone(run.snapshot);
+    (out[run.workflowName] ??= []).push(snapshot);
+  }
+  const sorted: Record<string, unknown[]> = {};
+  for (const name of Object.keys(out).sort()) sorted[name] = out[name]!.sort((a, b) => (storedKey(a) < storedKey(b) ? -1 : storedKey(a) > storedKey(b) ? 1 : 0));
+  return sorted;
+}
+
+/**
+ * Runs `start()` then each `resume()` on the route's engines, through a real `Mastra` over one
+ * `InMemoryStore`. On a `same` route every phase runs on one registered workflow — one engine
+ * instance; otherwise each phase builds and registers its own, as another process would. The
+ * storage is the only thing the phases share. Each phase records what it returned or threw, every
+ * stored snapshot after it, its step trace and the `execute()` calls it caused.
+ */
+export async function observeResume(fixture: ResumeFixture, route: ResumeRoute, concurrency?: number): Promise<ResumeObservation> {
+  const storage = new InMemoryStore();
+  const rec = new Recorder();
+  const runId = `${fixture.id}-run`;
+  const same = route.process === 'same' && route.suspendOn === route.resumeOn;
+  let shared: Registered | undefined;
+  const phases: PhaseObservation[] = [];
+  const outputOptions = { includeState: true, includeResumeLabels: true };
+  for (let i = 0; i <= fixture.resumes.length; i++) {
+    const engine = phaseEngine(route, i);
+    const executions: Execution[] = [];
+    const from = rec.events.length;
+    const undo = [
+      probeExecute(PetriExecutionEngine.prototype, 'petri', executions),
+      probeExecute(DefaultExecutionEngine.prototype, 'default', executions),
+    ];
+    let outcome: PhaseObservation['outcome'];
+    try {
+      const wf = same ? (shared ??= register(storage, fixture.build(engineConfig(engine, concurrency), rec))) : register(storage, fixture.build(engineConfig(engine, concurrency), rec));
+      const run = await wf.createRun({ runId });
+      rec.bind(run);
+      const call = fixture.resumes[i - 1];
+      const result =
+        call === undefined
+          ? await run.start({ inputData: fixture.input, outputOptions })
+          : await run.resume({
+              ...(call.step === undefined ? {} : { step: call.step }),
+              ...(call.label === undefined ? {} : { label: call.label }),
+              ...('resumeData' in call ? { resumeData: call.resumeData } : {}),
+              ...(call.forEachIndex === undefined ? {} : { forEachIndex: call.forEachIndex }),
+              outputOptions,
+            });
+      outcome = { kind: 'resolved', result };
+    } catch (error) {
+      outcome = { kind: 'rejected', error };
+    } finally {
+      for (const u of undo.reverse()) u();
+    }
+    phases.push({ outcome, stored: await storedRuns(storage), trace: rec.events.slice(from), executions });
+  }
+  return { phases };
+}
+
+/** The fixture as a resume case, the petri engine built with run budget `concurrency` (absent: unbounded). */
+export function toResumeCase(fixture: ResumeFixture, concurrency?: number): ResumeCase {
+  const bound = concurrency !== undefined && concurrency < (fixture.width ?? 1);
+  return {
+    name: fixture.name,
+    run: (route) => observeResume(fixture, route, concurrency),
+    ...(concurrency === undefined ? {} : { concurrency }),
+    divergences: [
+      ...(fixture.divergences ?? []),
+      ...(bound ? (fixture.boundDivergences ?? []) : (fixture.overlapDivergences ?? [])),
+    ],
+    ...(fixture.independent === undefined ? {} : { independent: fixture.independent }),
+  };
+}
+
+const Add = z.object({ add: z.number() });
+const Ask = z.object({ ask: z.string() });
+
+/** Suspends until resumed, then adds the resume data to its input. `onResume` runs inside the resumed body. */
+function gate(rec: Recorder, id: string, options: { label?: string; onResume?: () => Promise<void> } = {}) {
+  return createStep({
+    id,
+    inputSchema: N,
+    outputSchema: N,
+    resumeSchema: Add,
+    suspendSchema: Ask,
+    execute: async ({ inputData, resumeData, suspend }) =>
+      rec.around(id, async () => {
+        if (!resumeData) return suspend({ ask: id }, options.label === undefined ? undefined : { resumeLabel: options.label });
+        await options.onResume?.();
+        return { n: inputData.n + resumeData.add };
+      }),
+  });
+}
+
+/** Each arm's output under its id, summed. */
+function sumArms(rec: Recorder, id: string) {
+  return createStep({
+    id,
+    inputSchema: z.record(z.string(), N),
+    outputSchema: N,
+    execute: async ({ inputData }) => rec.around(id, () => ({ n: Object.values(inputData).reduce((acc, v) => acc + v.n, 0) })),
+  });
+}
+
+const resumeFixture = (f: ResumeFixture): ResumeFixture => f;
+
+/**
+ * The routes whose resume phases run on the petri engine. An attribution for what the petri engine
+ * does on resume — a refusal, a position rule — is scoped to them: on `petri>default` the default
+ * engine resumes, and a difference there must be explained by what the petri engine stored.
+ */
+const RESUMES_ON_PETRI: readonly ResumeRouteLabel[] = RESUME_ROUTES.filter((r) => r.resumeOn === 'petri').map(routeLabel);
+
+export const RESUME_FIXTURES: readonly ResumeFixture[] = [
+  resumeFixture({
+    name: 'resume-step',
+    id: 'rs-step',
+    input: { n: 1 },
+    resumes: [{ step: 'g', resumeData: { add: 5 } }],
+    expected: ['suspended', 'success'],
+    sites: ['0', '1', '2'],
+    build: (cfg, rec) =>
+      wf('rs-step', cfg)
+        .then(nStep(rec, 'a', (n) => n + 1))
+        .then(gate(rec, 'g'))
+        .then(nStep(rec, 'c', (n) => n * 10))
+        .commit(),
+  }),
+  resumeFixture({
+    name: 'resume-suspend-again',
+    id: 'rs-again',
+    input: { n: 1 },
+    resumes: [
+      { step: 'stubborn', resumeData: { add: 1 } },
+      { step: 'stubborn', resumeData: { add: 2 } },
+    ],
+    expected: ['suspended', 'suspended', 'success'],
+    sites: ['0', '1', '2'],
+    build: (cfg, rec) =>
+      wf('rs-again', cfg)
+        .then(nStep(rec, 'a', (n) => n + 1))
+        .then(
+          createStep({
+            id: 'stubborn',
+            inputSchema: N,
+            outputSchema: N,
+            resumeSchema: Add,
+            suspendSchema: Ask,
+            execute: async ({ inputData, resumeData, suspendData, suspend }) =>
+              rec.around('stubborn', async () => {
+                if (resumeData?.add !== 2) return suspend({ ask: `again after ${JSON.stringify(suspendData ?? null)}` });
+                return { n: inputData.n + resumeData.add };
+              }),
+          }),
+        )
+        .then(nStep(rec, 'c', (n) => n * 10))
+        .commit(),
+  }),
+  resumeFixture({
+    name: 'resume-parallel-two-suspended',
+    id: 'rs-par2',
+    width: 2,
+    input: { n: 1 },
+    // The non-lowest arm first, by id: the re-suspension lists the other, then it finishes.
+    resumes: [
+      { step: 'b', resumeData: { add: 2 } },
+      { step: 'a', resumeData: { add: 1 } },
+    ],
+    expected: ['suspended', 'suspended', 'success'],
+    sites: ['0', '1.0', '1.1', '2'],
+    build: (cfg, rec) =>
+      wf('rs-par2', cfg)
+        .then(nStep(rec, 'pre', (n) => n + 1))
+        .parallel([gate(rec, 'a'), gate(rec, 'b')])
+        .then(sumArms(rec, 'sum'))
+        .commit(),
+  }),
+  resumeFixture({
+    name: 'resume-parallel-sibling-done',
+    id: 'rs-par-done',
+    width: 2,
+    input: { n: 1 },
+    resumes: [{ step: 'g', resumeData: { add: 3 } }],
+    expected: ['suspended', 'success'],
+    sites: ['0.0', '0.1', '1'],
+    build: (cfg, rec) =>
+      wf('rs-par-done', cfg)
+        .parallel([nStep(rec, 't', (n) => n * 10), gate(rec, 'g')])
+        .then(sumArms(rec, 'sum'))
+        .commit(),
+  }),
+  resumeFixture({
+    name: 'resume-parallel-last',
+    id: 'rs-par-last',
+    width: 2,
+    input: { n: 1 },
+    // The resumed block is the last entry, beside a sibling that succeeded: the run's result is the
+    // block's own output — the replayed sibling's stored output beside the resumed arm's new one —
+    // as Mastra's buildResumedBlockResult returns it (handlers/entry.ts:44-96, 354-391). A replay
+    // that drops the sibling's output (settles it instead) differs here; nothing follows the block
+    // to hide it.
+    resumes: [{ step: 'g', resumeData: { add: 3 } }],
+    expected: ['suspended', 'success'],
+    sites: ['0.0', '0.1'],
+    build: (cfg, rec) => wf('rs-par-last', cfg).parallel([nStep(rec, 't', (n) => n * 10), gate(rec, 'g')]).commit(),
+  }),
+  resumeFixture({
+    name: 'resume-branch-last',
+    id: 'rs-branch-last',
+    width: 2,
+    input: { n: 1 },
+    // Both conditions hold: arm 'bb' is taken and succeeds, arm 'ba' suspends. The resumed branch
+    // is the last entry, so the result is both taken arms' outputs (handlers/entry.ts:480-509); the
+    // conditions are not evaluated again.
+    resumes: [{ step: 'ba', resumeData: { add: 4 } }],
+    expected: ['suspended', 'success'],
+    sites: ['0.0', '0.1'],
+    build: (cfg, rec) =>
+      wf('rs-branch-last', cfg)
+        .branch([
+          [async ({ inputData }: { inputData: N }) => inputData.n > 0, gate(rec, 'ba')],
+          [async ({ inputData }: { inputData: N }) => inputData.n > 0, nStep(rec, 'bb', (n) => n * 10)],
+        ])
+        .commit(),
+  }),
+  resumeFixture({
+    name: 'resume-parallel-labels',
+    id: 'rs-labels',
+    width: 3,
+    input: { n: 1 },
+    // Settles the PLAUSIBLE label loss (default.ts:878-891 with entry.ts:100-107): after resuming
+    // 'c' by label the stored resumeLabels are {}, so 'L-a' names nothing, Run falls back to
+    // suspendedPaths, finds two and rejects. Resuming by id still works.
+    resumes: [
+      { label: 'L-c', resumeData: { add: 3 } },
+      { label: 'L-a', resumeData: { add: 1 } },
+      { step: 'a', resumeData: { add: 1 } },
+      { step: 'b', resumeData: { add: 2 } },
+    ],
+    expected: ['suspended', 'suspended', 'rejected', 'suspended', 'success'],
+    sites: ['0.0', '0.1', '0.2', '1'],
+    build: (cfg, rec) =>
+      wf('rs-labels', cfg)
+        .parallel([gate(rec, 'a', { label: 'L-a' }), gate(rec, 'b', { label: 'L-b' }), gate(rec, 'c', { label: 'L-c' })])
+        .then(sumArms(rec, 'sum'))
+        .commit(),
+  }),
+  resumeFixture({
+    name: 'resume-branch',
+    id: 'rs-branch',
+    input: { n: 1 },
+    resumes: [{ step: 'ba', resumeData: { add: 4 } }],
+    expected: ['suspended', 'success'],
+    sites: ['0', '1.0', '1.1'],
+    build: (cfg, rec) =>
+      wf('rs-branch', cfg)
+        .then(nStep(rec, 'pre', (n) => n + 1))
+        .branch([
+          [async ({ inputData }: { inputData: N }) => inputData.n > 0, gate(rec, 'ba')],
+          [async ({ inputData }: { inputData: N }) => inputData.n < 0, nStep(rec, 'bb', (n) => n * 10)],
+        ])
+        .commit(),
+  }),
+  resumeFixture({
+    name: 'resume-loop',
+    id: 'rs-loop',
+    input: { n: 0 },
+    // Suspends on the iteration whose input is 2: iteration n re-runs with the resume data, n+1 on fresh.
+    resumes: [{ step: 'body', resumeData: { add: 10 } }],
+    expected: ['suspended', 'success'],
+    sites: ['0', '1'],
+    build: (cfg, rec) =>
+      wf('rs-loop', cfg)
+        .dountil(
+          createStep({
+            id: 'body',
+            inputSchema: N,
+            outputSchema: N,
+            resumeSchema: Add,
+            suspendSchema: Ask,
+            execute: async ({ inputData, resumeData, suspend }) =>
+              rec.around('body', async () => {
+                if (inputData.n === 2 && !resumeData) return suspend({ ask: `body at ${inputData.n}` });
+                return { n: inputData.n + 1 + (resumeData?.add ?? 0) };
+              }),
+          }),
+          async ({ inputData }) => inputData.n >= 15,
+        )
+        .then(nStep(rec, 'after', (n) => n * 10))
+        .commit(),
+  }),
+  resumeFixture({
+    name: 'resume-nested',
+    id: 'rs-nested',
+    input: { n: 1 },
+    resumes: [{ step: ['rs-inner', 'ig'], resumeData: { add: 5 } }],
+    expected: ['suspended', 'success'],
+    sites: ['0', '1', '2'],
+    build: (cfg, rec) => {
+      const inner = createWorkflow({ id: 'rs-inner', inputSchema: N, outputSchema: N, ...cfg })
+        .then(nStep(rec, 'i1', (n) => n * 2))
+        .then(gate(rec, 'ig'))
+        .commit();
+      return wf('rs-nested', cfg)
+        .then(nStep(rec, 'pre', (n) => n + 1))
+        .then(inner)
+        .then(nStep(rec, 'post', (n) => n * 10))
+        .commit();
+    },
+  }),
+  resumeFixture({
+    name: 'resume-cancel',
+    id: 'rs-cancel',
+    input: { n: 1 },
+    // Run.cancel() from inside the resumed step: it finishes its body, the next entry never starts.
+    resumes: [{ step: 'g', resumeData: { add: 5 } }],
+    expected: ['suspended', 'canceled'],
+    sites: ['0', '1', '2'],
+    build: (cfg, rec) =>
+      wf('rs-cancel', cfg)
+        .then(nStep(rec, 'a', (n) => n + 1))
+        .then(gate(rec, 'g', { onResume: () => rec.cancel() }))
+        .then(nStep(rec, 'never', (n) => n))
+        .commit(),
+  }),
+  resumeFixture({
+    name: 'resume-cancel-in-block',
+    id: 'rs-cancel-block',
+    width: 2,
+    input: { n: 1 },
+    // A cancel inside a resumed arm of a block that is not the last entry: the loop top sees it.
+    resumes: [{ step: 'g', resumeData: { add: 5 } }],
+    expected: ['suspended', 'canceled'],
+    sites: ['0.0', '0.1', '1'],
+    build: (cfg, rec) =>
+      wf('rs-cancel-block', cfg)
+        .parallel([nStep(rec, 't', (n) => n), gate(rec, 'g', { onResume: () => rec.cancel() })])
+        .then(sumArms(rec, 'never'))
+        .commit(),
+    divergences: [
+      {
+        row: 76,
+        paths: ['phases.1.stored.rs-cancel-block.0.tracingContext'],
+        reason:
+          "Mastra's resumed block skips the entry-end re-stamp, so its abort is seen at the next loop top, whose write passes no tracingContext (default.ts:815-835); the petri engine ends at the block and writes the terminal's {} (default.ts:946-951)",
+      },
+    ],
+  }),
+  resumeFixture({
+    name: 'resume-cancel-in-last-block',
+    id: 'rs-cancel-last',
+    width: 2,
+    input: { n: 1 },
+    // Settles the PLAUSIBLE re-stamp: Mastra's resumed-block branch returns before the entry-end
+    // re-stamp (handlers/entry.ts:385-391 against :815-817), and nothing follows the block to see
+    // the abort at the loop top, so the canceled run succeeds. Here the cancel wins.
+    resumes: [{ step: 'g', resumeData: { add: 5 } }],
+    expected: ['suspended', 'success'],
+    sites: ['0.0', '0.1'],
+    build: (cfg, rec) => wf('rs-cancel-last', cfg).parallel([nStep(rec, 't', (n) => n), gate(rec, 'g', { onResume: () => rec.cancel() })]).commit(),
+    divergences: [
+      {
+        row: 76,
+        paths: [
+          'phases.1.result.status',
+          'phases.1.result.result',
+          'phases.1.stored.rs-cancel-last.0.status',
+          'phases.1.stored.rs-cancel-last.0.result',
+          'phases.1.stored.rs-cancel-last.0.tracingContext',
+        ],
+        reason:
+          "a cancel inside a resumed arm of the last entry: Mastra's resumed-block branch skips the entry-end re-stamp (handlers/entry.ts:385-391, :815-817) and the run succeeds; the petri engine's cancel wins",
+      },
+    ],
+  }),
+  ...[0, '', false, null, undefined].map((value) =>
+    resumeFixture({
+      name: `resume-falsy-${value === '' ? 'empty' : String(value)}`,
+      id: 'rs-falsy',
+      input: { n: 1 },
+      // Falsy resumeData reaches the step, but Mastra records a fresh start: no resumePayload, and
+      // the payload is the validated input (handlers/step.ts:166-175).
+      resumes: [{ step: 'f', resumeData: value }],
+      expected: ['suspended', 'success'],
+      sites: ['0', '1'],
+      build: (cfg, rec) =>
+        wf('rs-falsy', cfg)
+          .then(nStep(rec, 'a', (n) => n + 1))
+          .then(
+            createStep({
+              id: 'f',
+              inputSchema: N,
+              outputSchema: z.any(),
+              resumeSchema: z.any(),
+              suspendSchema: Ask,
+              execute: async ({ inputData, resumeData, suspendData, suspend }) =>
+                rec.around('f', async () => {
+                  if (suspendData === undefined) return suspend({ ask: 'f' });
+                  return { n: inputData.n, got: resumeData === undefined ? '<undefined>' : resumeData };
+                }),
+            }),
+          )
+          .commit(),
+    }),
+  ),
+  resumeFixture({
+    name: 'resume-same-id-later',
+    id: 'rs-same-id',
+    input: { n: 1 },
+    // One step object entered twice. Mastra treats every entry whose id is in resume.steps as
+    // resumed for the whole segment: the later 'g' gets the resume data and its stale stored input,
+    // and skips its stepExecutionPath push (entry.ts:306-316; step.ts:140-142). Here resume data is
+    // position-exact (maintainer decision 4), so the later 'g' suspends on its own.
+    resumes: [{ step: 'g', resumeData: { add: 5 } }],
+    expected: ['suspended', 'success'],
+    sites: ['0', '1', '2'],
+    build: (cfg, rec) => {
+      const g = gate(rec, 'g');
+      return wf('rs-same-id', cfg)
+        .then(g)
+        .then(nStep(rec, 'a', (n) => n + 1))
+        .then(g)
+        .commit();
+    },
+    divergences: [
+      {
+        row: 75,
+        routes: RESUMES_ON_PETRI,
+        // The later 'g' suspends here and succeeds in Mastra: the run's status, result and
+        // suspension lists, the later 'g' record, the path it pushes, and what a suspended result
+        // carries beside them ('a''s payload, resumeLabels; the non-success exit's tracingContext {}).
+        paths: [
+          'phases.1.result.status',
+          'phases.1.result.result',
+          'phases.1.result.suspended',
+          'phases.1.result.suspendPayload',
+          'phases.1.result.resumeLabels',
+          'phases.1.result.stepExecutionPath.length',
+          'phases.1.result.steps.g.**',
+          'phases.1.result.steps.a.payload',
+          'phases.1.stored.rs-same-id.0.status',
+          'phases.1.stored.rs-same-id.0.result',
+          'phases.1.stored.rs-same-id.0.suspendedPaths.g',
+          'phases.1.stored.rs-same-id.0.stepExecutionPath.length',
+          'phases.1.stored.rs-same-id.0.tracingContext',
+          'phases.1.stored.rs-same-id.0.context.g.**',
+        ],
+        reason:
+          'a later entry of the resumed step id: Mastra feeds it the resume data and its stale stored input and skips its stepExecutionPath push (entry.ts:306-316, step.ts:140-142); resume data here goes to the resumed position only, so the later entry suspends',
+      },
+    ],
+  }),
+  ...foreachResumeFixtures(),
+];
+
+/**
+ * `.foreach()` resume: three items, the middle one or the last two suspending, the rest done — with
+ * forEachIndex set and unset, and a parked suspension resumed after another — and a foreach over a
+ * nested workflow. The first three resume on the petri engine and match the oracle on every route
+ * with no attribution: the aggregate, its `foreachOutput` entries, the host's `resumeLabels`,
+ * `resumePayload` and `resumedAt`, what each item was handed. The nested one stays refused by name
+ * (row 77).
+ */
+function foreachResumeFixtures(): ResumeFixture[] {
+  const Items = z.array(N);
+  const toItems = (rec: Recorder) =>
+    createStep({
+      id: 'explode',
+      inputSchema: N,
+      outputSchema: Items,
+      execute: async ({ inputData }) => rec.around('explode', () => Array.from({ length: inputData.n }, (_, i) => ({ n: i + 1 }))),
+    });
+  const item = (rec: Recorder, suspends: readonly number[]) =>
+    createStep({
+      id: 'item',
+      inputSchema: N,
+      outputSchema: N,
+      resumeSchema: Add,
+      suspendSchema: Ask,
+      execute: async ({ inputData, resumeData, suspend }) =>
+        rec.around(`item:${inputData.n}`, async () => {
+          await delay(2 * (4 - inputData.n));
+          if (suspends.includes(inputData.n) && !resumeData) return suspend({ ask: `item ${inputData.n}` });
+          return { n: inputData.n * 10 + (resumeData?.add ?? 0) };
+        }),
+    });
+  const build = (id: string, suspends: readonly number[]) => (cfg: EngineConfig, rec: Recorder) =>
+    wf(id, cfg).then(toItems(rec)).foreach(item(rec, suspends), { concurrency: 3 }).commit();
+  const labels = ['item:1', 'item:2', 'item:3'];
+  const independent = labels.flatMap((a, i) => labels.slice(i + 1).map((b): IndependentPair => [a, b]));
+  return [
+    {
+      name: 'resume-foreach-index',
+      id: 'rs-fe-index',
+      width: 3,
+      independent,
+      input: { n: 3 },
+      resumes: [{ step: 'item', resumeData: { add: 5 }, forEachIndex: 1 }],
+      expected: ['suspended', 'success'],
+      sites: ['0', '1'],
+      build: build('rs-fe-index', [2]),
+    },
+    {
+      name: 'resume-foreach-no-index',
+      id: 'rs-fe-all',
+      width: 3,
+      independent,
+      input: { n: 3 },
+      resumes: [{ step: 'item', resumeData: { add: 5 } }],
+      expected: ['suspended', 'success'],
+      sites: ['0', '1'],
+      build: build('rs-fe-all', [2]),
+    },
+    {
+      name: 'resume-foreach-parked',
+      id: 'rs-fe-parked',
+      width: 3,
+      independent,
+      input: { n: 3 },
+      // Items 2 and 3 suspend; resuming item 3 by index re-suspends with item 2 parked, then item 2 finishes it.
+      resumes: [
+        { step: 'item', resumeData: { add: 7 }, forEachIndex: 2 },
+        { step: 'item', resumeData: { add: 5 }, forEachIndex: 1 },
+      ],
+      expected: ['suspended', 'suspended', 'success'],
+      sites: ['0', '1'],
+      build: build('rs-fe-parked', [2, 3]),
+    },
+    {
+      name: 'resume-foreach-nested',
+      id: 'rs-fe-nested',
+      width: 2,
+      input: { n: 2 },
+      // Settles the PLAUSIBLE nested-in-foreach run id: both items' children suspend, and resuming
+      // forEachIndex 1 resumes the child the aggregate's __workflow_meta.runId names — item 0's
+      // (step.ts:430; control-flow.ts:1442-1446). Item 1's record gets item 0's result, and item 0
+      // then cannot be resumed ("This workflow run was not suspended").
+      resumes: [
+        { step: ['rs-fe-child', 'ig'], resumeData: { add: 10 }, forEachIndex: 1 },
+        { step: ['rs-fe-child', 'ig'], resumeData: { add: 20 }, forEachIndex: 0 },
+      ],
+      expected: ['suspended', 'suspended', 'failed'],
+      sites: ['0', '1'],
+      build: (cfg, rec) => {
+        const child = createWorkflow({ id: 'rs-fe-child', inputSchema: N, outputSchema: N, ...cfg }).then(gate(rec, 'ig')).commit();
+        return wf('rs-fe-nested', cfg).then(toItems(rec)).foreach(child, { concurrency: 2 }).commit();
+      },
+      overlapDivergences: [
+        {
+          row: 35,
+          paths: ['phases.*.result.steps.rs-fe-child.suspendPayload.__workflow_meta.foreachOutput.*.metadata', 'phases.*.stored.*.*.context.rs-fe-child.suspendPayload.__workflow_meta.foreachOutput.*.metadata'],
+          reason:
+            "an item's foreachOutput entry carries its metadata.nestedRunId in Mastra (control-flow.ts:1193-1198); here only when the leaf's record is still the item's at its settle. When the two children suspend together, the second's record overwrites the first's before it settles, and the first's entry is rebuilt from its outcome token, which carries no host metadata",
+        },
+      ],
+      divergences: [
+        {
+          row: 77,
+          routes: RESUMES_ON_PETRI,
+          paths: ['phases.1.**', 'phases.2.**', 'trace.*'],
+          reason:
+            "a .foreach() over a nested workflow: Mastra resumes the child named by the aggregate's __workflow_meta.runId, the lowest index, whatever forEachIndex says (step.ts:430; control-flow.ts:1442-1446); the petri engine refuses the resume by name",
+        },
+      ],
     },
   ];
 }

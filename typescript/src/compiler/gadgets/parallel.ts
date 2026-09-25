@@ -20,23 +20,8 @@ import type {
   StepRecord,
   SuspendToken,
 } from '../types.js';
+import { blockReentry, suspendedBlock, type ArmArrival } from './reentry.js';
 import type { Gadget } from './types.js';
-
-/**
- * What one arm's settlement looks like to the join.
- *
- * The arm index of a success is stamped by *which* collect transition fired, not carried in from
- * the arm's own output, so arm identity is topology rather than a value the join has to trust.
- * The other three carry nothing: they exist only so the arm still counts toward the join's
- * `exactly(n)`. What a failed or suspended arm *was* travels separately, in `errSeen` /
- * `suspSeen`, where an inhibitor arc can see it.
- */
-type ArmArrival =
-  | { readonly status: 'ok'; readonly index: number; readonly data: unknown }
-  | { readonly status: 'failed' }
-  | { readonly status: 'suspended' }
-  /** A bailed or paused arm: settled, swallowed, and left out of the block's own output. */
-  | { readonly status: 'settled' };
 
 /**
  * `.parallel([...])` — every arm runs, every arm settles, then one join decides the block.
@@ -52,8 +37,12 @@ type ArmArrival =
  *   [any arm]  paused    -> armPause --(collect-pause)-> arrived {settled}              (swallowed)
  *
  *   exactly(n) arrived, all(errSeen), reset(suspSeen)          --(join-fail)-> exits.failed
- *   exactly(n) arrived, all(suspSeen), inhibitor(errSeen)      --(join-susp)-> exits.suspended
+ *   exactly(n) arrived, all(suspSeen), inhibitor(errSeen)      --(join-susp)-> exits.suspended {lowest, pending: rest}
  *   exactly(n) arrived, inhibitor(errSeen), inhibitor(suspSeen) --(join-ok)---> next
+ *
+ *   resume-j --(re-enter-j, inhibitor cancel)--> armIn_j {resumed} + replay_i for every i != j
+ *   resume-j --(re-enter-j.cancel, read cancel)-> exits.canceled    the resume never started
+ *   replay_i --(replay-i)--> arrived (+ errSeen | suspSeen), as arm i's collect did  (./reentry.ts)
  * ```
  *
  * **What Mastra does, and so what this reproduces** (`handlers/control-flow.ts:220-313`). The
@@ -128,6 +117,14 @@ type ArmArrival =
  * fired — so a block that failed, suspended, was canceled or succeeded under an abort ends the run
  * the same way, and the step records are written by the arms either way. A rung would add a
  * transition and an arc with no outcome a caller can tell apart.
+ *
+ * **Resume** ([ADR 0007]). Each arm is a resume site, `resume-j`, gated and swept like the block's
+ * own start (`./reentry.ts`). Re-entering arm *j* runs only that arm, on its stored input, and
+ * replays every sibling's stored outcome as the arrival its collect produced — Mastra re-runs only
+ * the arm at the resume path and rebuilds the block from the siblings' records
+ * (`handlers/entry.ts:350-392`). The join is the same three transitions, so a resumed block is
+ * decided by the same precedence as a fresh one. A losing suspension is carried on the reported
+ * one as `pending`, in arm order, rather than dropped, so every suspended arm stays resumable.
  *
  * **Concurrency is unbounded**, as `Promise.all` is. The `parallel` entry carries no limit to
  * compile (`docs/divergences.md` row 5 is a proposed addition). Adding one would be a permit
@@ -285,7 +282,9 @@ export const parallelGadget: Gadget = (entry, next, ctx) => {
     .inhibitor(errSeen)
     .outputs(outPlace(ctx.exits.suspended))
     .action(async (tctx) => {
-      tctx.output(ctx.exits.suspended, lowest(tctx.inputs(suspSeen), armIndex));
+      // The lowest arm is reported and every other suspension rides along as `pending`, in arm
+      // order, so the result and the snapshot name every suspended arm ([ADR 0007], row 34).
+      tctx.output(ctx.exits.suspended, suspendedBlock(tctx.inputs(suspSeen), armIndex));
     })
     .build();
 
@@ -328,10 +327,27 @@ export const parallelGadget: Gadget = (entry, next, ctx) => {
     })
     .build();
 
+  // Resuming at an arm ([ADR 0007]): a gated `resume-j` site per arm whose re-entry replays every
+  // sibling's stored outcome into `arrived` and the markers, so the join above decides unchanged.
+  const reentry = blockReentry({
+    names,
+    path,
+    viewPath,
+    blockId: entry.id,
+    block: 'parallel',
+    arms,
+    armIns,
+    places: { arrived, errSeen, suspSeen },
+    cancel,
+    canceled: ctx.exits.canceled,
+    failed: ctx.exits.failed,
+  });
+
   // The arms' own transitions are deliberately not returned: `emitNested` already recorded them
   // against their own entry, and repeating them here would re-key the `NetMap` to this entry.
   return {
     inPlace,
+    resumeSites: reentry.resumeSites,
     transitions: [
       fork,
       ...cancelSweep,
@@ -343,6 +359,7 @@ export const parallelGadget: Gadget = (entry, next, ctx) => {
       joinFail,
       joinSusp,
       joinOk,
+      ...reentry.transitions,
     ],
   };
 };

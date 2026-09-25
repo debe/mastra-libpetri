@@ -33,6 +33,13 @@ export const MAX_ITERATION_BOUND = 100_000;
 interface LoopState {
   readonly data: unknown;
   readonly iteration: number;
+  /**
+   * The next body run is the one a resume feeds ([ADR 0007]). Colour only, like
+   * `FlowToken.resumed`: `start` copies it from a resumed seed, `enter` hands it to the body, and
+   * `check`'s next `ready` never carries it — Mastra clears `currentResume` once the resumed
+   * iteration has run (`handlers/control-flow.ts:785-788`), so iteration n + 1 runs fresh.
+   */
+  readonly resumed?: true;
 }
 
 /**
@@ -137,7 +144,8 @@ interface IterationMarker {
  * would hand a truncated result downstream with nothing to tell it from a settled condition, so
  * `exhaust` fails the run with an error naming the bound. The bound counts body runs of **this**
  * entry; a loop re-entered from a record continues Mastra's `iterationCount` but gets a fresh
- * allowance.
+ * allowance — a resumed loop included ([ADR 0007]): its segment starts at `loop-in` like any
+ * entry, so its allowance restarts at the bound (`docs/divergences.md` row 13).
  *
  * **Every other exit cleans up the allowance.** `finish`, `abort`, every `leave-*` and the three
  * sweeps after `start` carry a reset arc on `budget`. The reset cannot sit on `check`, which also
@@ -287,7 +295,10 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
         c.output(exits.failed, loopFailure(error));
         return;
       }
-      c.output(ready, { data, iteration });
+      // A resumed seed ([ADR 0007]) marks this first body run as the resumed one. Its data is
+      // ignored like any incoming token's when a record exists — the record above is the state —
+      // and the allowance restarts at the bound: a resumed loop is a fresh entry of this loop.
+      c.output(ready, { data, iteration, ...(incoming.resumed === true ? { resumed: true as const } : {}) });
       for (let i = 0; i < bound; i++) c.output(budget, null);
     });
 
@@ -299,7 +310,7 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
       const state = c.input(ready);
       const iteration = state.iteration + 1;
       // `iteration` on the flow token is what the leaf stamps as `metadata.iterationCount`.
-      c.output(bodyIn, { data: state.data, iteration });
+      c.output(bodyIn, { data: state.data, iteration, ...(state.resumed === true ? { resumed: true as const } : {}) });
       c.output(running, { iteration });
     });
 
@@ -349,7 +360,8 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
 
       switch (decision.kind) {
         case 'repeat':
-          // The body's own output is the next iteration's input (:764, :780).
+          // The body's own output is the next iteration's input (:764, :780). Never `resumed`: the
+          // resumed iteration has run, and Mastra clears `currentResume` after it (:785-788).
           c.output(ready, { data: output.data, iteration: marker.iteration });
           return;
         case 'exit':

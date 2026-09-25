@@ -115,6 +115,11 @@ export type StepOutcome = (
       readonly tripwire?: unknown;
       /** A `MastraNonRetryableError` — the only error class that skips remaining retries. */
       readonly nonRetryable?: boolean;
+      /**
+       * A failed `.foreach()` aggregate's `__workflow_meta.foreachOutput`
+       * (`handlers/control-flow.ts:1355-1369`), which the codec must not drop.
+       */
+      readonly suspendPayload?: unknown;
     }
   /** `bail(result)`: the run ends early *as a success* whose result is `output`. */
   | { readonly status: 'bailed'; readonly output: unknown }
@@ -139,6 +144,12 @@ export type StepOutcome = (
    * takes the flow token's data, which is the same thing for a runner that validates nothing.
    */
   readonly payload?: unknown;
+  /**
+   * Set by the runner exactly when the attempt is recorded as resumed (truthy resume data,
+   * `handlers/step.ts:166-175`). Absent on a resumed attempt with falsy resume data, which Mastra
+   * records as a fresh start: the leaf then stamps a fresh `startedAt` (row 82).
+   */
+  readonly resumedAt?: number;
 };
 
 /**
@@ -319,6 +330,9 @@ export interface SuspendToken extends Origin {
    * in time per step id (`handlers/step.ts:395-397`), and this is how the codec orders them.
    */
   readonly suspendedAt?: number;
+  /** The input the step ran on and when it started, as on `FailureToken` — a foreach aggregate's entry needs them. */
+  readonly stepPayload?: unknown;
+  readonly stepStartedAt?: number;
   /**
    * The other suspensions parked in the same block, in arm or item index order — the join reports
    * the lowest and carries the rest here instead of dropping them, so the result's `suspended`
@@ -435,6 +449,12 @@ export interface ForeachSite {
   readonly path: readonly [number];
   readonly stepId: string;
   readonly place: Place<ForeachResume>;
+  /**
+   * The body is a nested workflow. Resuming inside it is refused (`foreach-nested`) whatever the
+   * `steps` list says: Mastra accepts a single-id `steps` for a nested body (`workflow.ts:4613-4618`)
+   * and then resumes the wrong child (row 77).
+   */
+  readonly nested?: true;
 }
 
 /**

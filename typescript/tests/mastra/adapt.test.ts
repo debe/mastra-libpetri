@@ -32,9 +32,16 @@ import {
   sleepGadget,
   stepGadget,
 } from '../../src/compiler/index.js';
-import type { FailureToken, Gadget, StepSource } from '../../src/compiler/index.js';
+import type { CompiledWorkflow, FailureToken, Gadget, StepSource } from '../../src/compiler/index.js';
 import { runWorkflow, runWorkflowDetailed } from '../../src/engine/index.js';
-import { cancelStructureViolations, describeReport, verifyWorkflow } from '../../src/verify/index.js';
+import {
+  cancelStructureViolations,
+  describeReport,
+  resumeGateViolations,
+  segmentLabel,
+  segmentsFor,
+  verifyWorkflow,
+} from '../../src/verify/index.js';
 import { RecordingRunner } from '../fixtures/runner.js';
 import { ManualClock } from '../support/manual-clock.js';
 
@@ -957,8 +964,9 @@ describe('end to end: adapt, compile, run', () => {
 
 /** Each property's verdict, by segment and name — asserted whole, so `unknown` can never pass for `proven`. */
 const verdicts = (reports: Awaited<ReturnType<typeof verifyWorkflow>>) =>
-  Object.fromEntries(reports.map((r) => [`${r.segment}/${r.property}`, r.result.verdict.type]));
-const ALL_PROVEN = {
+  Object.fromEntries(reports.map((r) => [`${segmentLabel(r.segment)}/${r.property}`, r.result.verdict.type]));
+/** The fresh segments' verdicts, pinned literally, never derived. */
+const FRESH_PROVEN = {
   'closed/deadlockFree': 'proven',
   'closed/terminatesAtSink': 'proven',
   'closed/exactlyOneTerminal': 'proven',
@@ -967,6 +975,28 @@ const ALL_PROVEN = {
   'cancel/terminatesAtSink': 'proven',
   'cancel/exactlyOneTerminal': 'proven',
 };
+/**
+ * Every verdict `verifyWorkflow` returns by default for `compiled`, each `proven`: the fresh
+ * segments, then `resume@s` and `resume@s+cancel` per registered site ([ADR 0007]). Keys come
+ * from `segmentsFor`/`segmentLabel`; `neverCanceled` only where no cancel arrives; no budget here.
+ */
+function allProven(compiled: CompiledWorkflow): Record<string, string> {
+  expect(compiled.budget).toBeUndefined();
+  const keys = segmentsFor(compiled).flatMap((segment) => {
+    const cancels = typeof segment === 'string' ? segment === 'cancel' : segment.cancel;
+    return ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', ...(cancels ? [] : ['neverCanceled'])].map(
+      (property) => `${segmentLabel(segment)}/${property}`,
+    );
+  });
+  expect(keys.slice(0, 7)).toStrictEqual(Object.keys(FRESH_PROVEN));
+  expect(keys).toHaveLength(7 + 7 * compiled.resumeSites.size);
+  return Object.fromEntries(keys.map((key) => [key, 'proven']));
+}
+/** `property` in each of `segments`, with `verdict`: the exact flips a mutant causes. */
+const each = (verdict: string, segments: readonly string[], ...properties: readonly string[]) =>
+  Object.fromEntries(segments.flatMap((seg) => properties.map((p) => [`${seg}/${p}`, verdict])));
+/** Every step of the flow can suspend, so every step's input is a resume site; a sleep is not. */
+const SITES = ['0', '1', '2', '3', '8', '9'];
 const routes = (reports: Awaited<ReturnType<typeof verifyWorkflow>>) => reports.map(describeReport).join('; ');
 
 /**
@@ -1001,9 +1031,11 @@ const stripInhibitor = (gadget: Gadget, suffix: string): Gadget => (entry, next,
  * All six workflow terminals and the cancel place are declared sinks. Initial marking: one token
  * in the entry place; the `closed` segment leaves the cancel request place empty, the `cancel`
  * segment seeds it with one token whose arrival may fire at every reachable point. Environment
- * mode: none — both segments run on the one closed net. Route and time: printed by
- * `describeReport`, on failure and to the log. Before any proof, `verifyWorkflow` runs the
- * structural cancel check and throws on a violation.
+ * mode: none — every segment runs on the one closed net. The resume segments ([ADR 0007]):
+ * `resume@s` and `resume@s+cancel` for every step's input (sites 0, 1, 2, 3, 8, 9), from one token
+ * at the site, with the same property set. Route and time: printed by `describeReport`, on failure
+ * and to the log. Before any proof, `verifyWorkflow` runs the structural checks and throws on a
+ * violation.
  */
 describe('an adapted leaf-shaped workflow, proved', () => {
   const flow: StepFlowEntry[] = [
@@ -1027,7 +1059,8 @@ describe('an adapted leaf-shaped workflow, proved', () => {
     const reports = await verifyWorkflow(compiled, { timeoutMs: 60_000 });
     console.log(`[proof] adapted leaf flow: ${routes(reports)}`);
 
-    expect(verdicts(reports), routes(reports)).toEqual(ALL_PROVEN);
+    expect([...compiled.resumeSites.keys()].sort()).toStrictEqual(SITES);
+    expect(verdicts(reports), routes(reports)).toStrictEqual(allProven(compiled));
   }, 180_000);
 
   it('is not proved vacuously: a step whose failure is routed nowhere breaks the properties that see it', async () => {
@@ -1041,18 +1074,16 @@ describe('an adapted leaf-shaped workflow, proved', () => {
         exits: { ...ctx.exits, failed: place<FailureToken>(ctx.names.entryPlace(ctx.path, entry.id, 'orphan')) },
       });
 
-    const reports = await verifyWorkflow(compile(adapt(flow, options), { gadgets: { step: orphaningStep } }), {
-      timeoutMs: 60_000,
-    });
+    const mutant = compile(adapt(flow, options), { gadgets: { step: orphaningStep } });
+    const reports = await verifyWorkflow(mutant, { timeoutMs: 60_000 });
 
-    expect(verdicts(reports), routes(reports)).toEqual({
-      'closed/deadlockFree': 'violated',
-      'closed/terminatesAtSink': 'violated',
-      'closed/exactlyOneTerminal': 'violated',
-      'closed/neverCanceled': 'proven',
-      'cancel/deadlockFree': 'violated',
-      'cancel/terminatesAtSink': 'proven',
-      'cancel/exactlyOneTerminal': 'violated',
+    // Every site is a step, so every resumed segment can reach an orphaned failure too: the same
+    // flips, segment for segment.
+    const resumed = SITES.map((site) => `resume@${site}`);
+    expect(verdicts(reports), routes(reports)).toStrictEqual({
+      ...allProven(mutant),
+      ...each('violated', ['closed', ...resumed], 'deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal'),
+      ...each('violated', ['cancel', ...resumed.map((r) => `${r}+cancel`)], 'deadlockFree', 'exactlyOneTerminal'),
     });
   }, 180_000);
 
@@ -1069,12 +1100,24 @@ describe('an adapted leaf-shaped workflow, proved', () => {
       gadgets: { step: withoutSweep(stepGadget), sleep: withoutSweep(sleepGadget), sleepUntil: withoutSweep(sleepGadget) },
     });
 
-    const reports = await verifyWorkflow(compiled, { timeoutMs: 60_000 });
+    // Each step's input is also a resume site ([ADR 0007]), and a site with no sweep is what the
+    // resume gate check names, exactly: `verifyWorkflow` refuses the mutant first, so the proofs
+    // are asked for with the structural checks skipped.
+    expect(resumeGateViolations(compiled)).toStrictEqual([
+      "resume site 9 ('s.9.notify.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+      "resume site 8 ('s.8.fulfil.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+      "resume site 3 ('s.3.shape.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+      "resume site 2 ('s.2.summarise.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+      "resume site 1 ('s.1.charge.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+      "resume site 0 ('s.0.validate.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
+    ]);
+    await expect(verifyWorkflow(compiled)).rejects.toThrow(/resume gate structure is unsound/);
+    const reports = await verifyWorkflow(compiled, { timeoutMs: 60_000, structure: 'skip' });
     console.log(`[proof] adapted leaf flow without sweeps: ${routes(reports)}`);
-    expect(verdicts(reports), routes(reports)).toEqual({
-      ...ALL_PROVEN,
-      'cancel/deadlockFree': 'violated',
-      'cancel/exactlyOneTerminal': 'violated',
+    // Every segment a cancel arrives in breaks, the resumed ones included; none without one does.
+    expect(verdicts(reports), routes(reports)).toStrictEqual({
+      ...allProven(compiled),
+      ...each('violated', ['cancel', ...SITES.map((site) => `resume@${site}+cancel`)], 'deadlockFree', 'exactlyOneTerminal'),
     });
   }, 180_000);
 

@@ -6,8 +6,11 @@ import { budgetStructureViolations, permitConsumers } from '../../src/verify/bud
 import {
   cancelStructureViolations,
   describeReport,
+  segmentLabel,
+  segmentsFor,
   verifyWorkflow,
   type PropertyReport,
+  type Segment,
 } from '../../src/verify/index.js';
 import type { CompiledWorkflow, EntryDescription, StepDescription } from '../../src/compiler/types.js';
 
@@ -20,6 +23,8 @@ import type { CompiledWorkflow, EntryDescription, StepDescription } from '../../
  * (`quiescentCount([wf.permits], k, k)`). Initial marking: one token in the entry place and `k`
  * in `wf.permits`; in the `cancel` segment also one in `wf.cancel.request`, so the arrival may
  * land at every reachable point. Environment: closed in both (the arrival is part of the net).
+ * Then `resume@s` and `resume@s+cancel` per resume site ([ADR 0007]): one token at the site in
+ * place of the entry token, `k` permits, the same property sets.
  * Sinks: the six terminals, `wf.cancel` and `wf.permits`. The route is whatever the verifier
  * reports, printed on a failed assertion and written to `PROOF_LOG` when that names a file.
  *
@@ -33,20 +38,17 @@ import type { CompiledWorkflow, EntryDescription, StepDescription } from '../../
 const step = (id: string, extra: Partial<Omit<StepDescription, 'kind' | 'id'>> = {}): StepDescription => ({ kind: 'step', id, ...extra });
 const arms = (n: number): StepDescription[] => Array.from({ length: n }, (_, i) => step(`a${i + 1}`));
 
-const ALL = [
-  'closed/deadlockFree',
-  'closed/terminatesAtSink',
-  'closed/exactlyOneTerminal',
-  'closed/neverCanceled',
-  'closed/permitsBounded',
-  'closed/permitsReturned',
-  'cancel/deadlockFree',
-  'cancel/terminatesAtSink',
-  'cancel/exactlyOneTerminal',
-  'cancel/permitsBounded',
-  'cancel/permitsReturned',
-];
-const keyOf = (r: PropertyReport): string => `${r.segment}/${r.property}`;
+/** `verifyWorkflow`'s property set under a budget, in a segment without and with a cancel arriving. */
+const UNCANCELED = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', 'neverCanceled', 'permitsBounded', 'permitsReturned'];
+const CANCELED = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', 'permitsBounded', 'permitsReturned'];
+const cancels = (segment: Segment): boolean => (typeof segment === 'string' ? segment === 'cancel' : segment.cancel);
+/**
+ * Every `segment/property` key `verifyWorkflow` reports on a budgeted workflow by default:
+ * `closed`, `cancel`, then `resume@s` and `resume@s+cancel` for every resume site ([ADR 0007]).
+ */
+const keysFor = (compiled: CompiledWorkflow): string[] =>
+  segmentsFor(compiled).flatMap((segment) => (cancels(segment) ? CANCELED : UNCANCELED).map((p) => `${segmentLabel(segment)}/${p}`));
+const keyOf = (r: PropertyReport): string => `${segmentLabel(r.segment)}/${r.property}`;
 
 const proofLog = (line: string): void => {
   const file = process.env['PROOF_LOG'];
@@ -56,13 +58,13 @@ const proofLog = (line: string): void => {
 const build = (entries: readonly EntryDescription[], concurrency: number, gadgets?: Partial<Record<EntryDescription['kind'], Gadget>>): CompiledWorkflow =>
   compile({ id: 'budget', entries }, { concurrency, ...(gadgets ? { gadgets } : {}) });
 
-/** Structure clean (cancel and budget), then every property of both segments `proven`. */
+/** Structure clean (cancel and budget), then every property of every segment `proven`, resume sites included. */
 async function prove(expect: ExpectStatic, label: string, compiled: CompiledWorkflow, timeoutMs = 300_000): Promise<void> {
   expect(cancelStructureViolations(compiled)).toEqual([]);
   expect(budgetStructureViolations(compiled)).toEqual([]);
   const reports = await verifyWorkflow(compiled, { timeoutMs });
   proofLog(`[budget ${label}] ${reports.map(describeReport).join('; ')}`);
-  expect(reports.map(keyOf)).toEqual(ALL);
+  expect(reports.map(keyOf)).toEqual(keysFor(compiled));
   for (const r of reports) expect(r.result.verdict.type, `${label}: ${describeReport(r)}`).toBe('proven');
 }
 
@@ -271,7 +273,7 @@ describe.concurrent('non-vacuity: mutants of the step gadget', () => {
     ]);
     const reports = await verifyWorkflow(compiled, { timeoutMs: 120_000, structure: 'skip' });
     proofLog(`[budget mutant double-named] ${reports.map(describeReport).join('; ')}`);
-    expect(reports.map(keyOf)).toEqual(ALL);
+    expect(reports.map(keyOf)).toEqual(keysFor(compiled));
     for (const r of reports) expect(r.result.verdict.type, describeReport(r)).toBe('proven');
   });
 });

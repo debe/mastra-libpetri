@@ -55,5 +55,6 @@ export type {
   WorkflowDescription,
 } from './types.js';
 export { resumeSeed, UnresumablePositionError } from './resume.js';
+export { HostPreconditionError } from './gadgets/leaf.js';
 export type { ResumeRequest, ResumeSeed } from './resume.js';
 export { foreachSeed } from './resume-foreach.js';

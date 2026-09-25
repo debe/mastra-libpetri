@@ -5,11 +5,15 @@ import { compile, parallelGadget, type Gadget } from '../../src/compiler/index.j
 import {
   cancelStructureViolations,
   describeReport,
+  resumeGateViolations,
+  segmentLabel,
+  segmentsFor,
   verifyWorkflow,
   type PropertyReport,
   type Segment,
 } from '../../src/verify/index.js';
 import type {
+  CompiledWorkflow,
   EntryDescription,
   Exits,
   FailureToken,
@@ -25,21 +29,24 @@ const wf = (...entries: EntryDescription[]): WorkflowDescription => ({ id: 'w', 
 const build = (description: WorkflowDescription, gadget: Gadget = parallelGadget) =>
   compile(description, { gadgets: { parallel: gadget } });
 
-/** Both segments unless a caller narrows them: `verifyWorkflow`'s default is the claim. */
-const verify = (description: WorkflowDescription, gadget: Gadget = parallelGadget, segments?: readonly Segment[]) =>
-  verifyWorkflow(build(description, gadget), { timeoutMs: 120_000, ...(segments ? { segments } : {}) });
+/** Every segment unless a caller narrows them: `verifyWorkflow`'s default is the claim. */
+const verify = (
+  description: WorkflowDescription,
+  gadget: Gadget = parallelGadget,
+  segments?: readonly Segment[],
+) => verifyWorkflow(build(description, gadget), { timeoutMs: 120_000, ...(segments ? { segments } : {}) });
 
-/** Every property of both segments, in the order `verifyWorkflow` runs them. */
-const BOTH = [
-  'closed/deadlockFree',
-  'closed/terminatesAtSink',
-  'closed/exactlyOneTerminal',
-  'closed/neverCanceled',
-  'cancel/deadlockFree',
-  'cancel/terminatesAtSink',
-  'cancel/exactlyOneTerminal',
-];
-const keyOf = (r: PropertyReport): string => `${r.segment}/${r.property}`;
+/** The property set `verifyWorkflow` proves in a segment with no cancel arriving, and in one with. */
+const UNCANCELED = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', 'neverCanceled'] as const;
+const CANCELED = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal'] as const;
+const cancels = (segment: Segment): boolean => (typeof segment === 'string' ? segment === 'cancel' : segment.cancel);
+/**
+ * Every property of every default segment, in the order `verifyWorkflow` runs them: `closed`,
+ * `cancel`, then `resume@s` and `resume@s+cancel` per resume site ([ADR 0007]).
+ */
+const everyKey = (compiled: CompiledWorkflow): string[] =>
+  segmentsFor(compiled).flatMap((segment) => (cancels(segment) ? CANCELED : UNCANCELED).map((p) => `${segmentLabel(segment)}/${p}`));
+const keyOf = (r: PropertyReport): string => `${segmentLabel(r.segment)}/${r.property}`;
 
 /** Appends a proof line to the file `PROOF_LOG` names, when it names one — the route-and-ms record. */
 const proofLog = (line: string): void => {
@@ -54,8 +61,11 @@ const verdictOf = (reports: readonly PropertyReport[], key: string): PropertyRep
 };
 
 /**
- * Every shape must come back `proven` for **every** property of **both** segments, not merely
- * un-violated — `verifyWorkflow`'s default, after its structural cancel check has passed.
+ * Every shape must come back `proven` for **every** property of **every** segment, not merely
+ * un-violated — `verifyWorkflow`'s default, after its structural checks have passed. The segments
+ * are `closed` and `cancel` below, then `resume@s` and `resume@s+cancel` from every resume site —
+ * each arm of a parallel and each top-level step ([ADR 0007]) — one token at the site instead of
+ * the entry place, with the same property sets.
  *
  * Initial marking: one token in the workflow's entry place; in the `cancel` segment also one
  * token in `wf.cancel.request`, whose immediate `arrive` may then fire at every reachable point —
@@ -101,7 +111,7 @@ describe('compiled parallel, proved', () => {
 
       // `proven` explicitly. `isViolated()` is false for `unknown` too, so asserting "not
       // violated" would silently pass on a query that timed out. An `unknown` is a finding.
-      expect(reports.map(keyOf)).toEqual(BOTH);
+      expect(reports.map(keyOf)).toEqual(everyKey(build(description)));
       for (const report of reports) {
         expect(report.result.verdict.type, describeReport(report)).toBe('proven');
       }
@@ -274,16 +284,36 @@ describe('compiled parallel, cancellation non-vacuity', () => {
   const guardedEmpty = wf(step('before'), fan('fan', []), step('after'));
   const withoutSweep: Gadget = (entry, next, ctx) => {
     const result = parallelGadget(entry, next, ctx);
-    const transitions = result.transitions.filter((t) => !t.name.endsWith('.cancel'));
+    // The block's own sweep, by its id: every arm's resume sweep ends in `.cancel` too ([ADR 0007]).
+    const transitions = result.transitions.filter((t) => !t.name.endsWith(`.${entry.id}.cancel`));
     if (transitions.length !== result.transitions.length - 1) throw new Error('sweep not found exactly once');
     return { ...result, transitions };
   };
 
-  for (const [label, shape] of [['n = 2 between two steps', guarded], ['n = 0 between two steps', guardedEmpty]] as const) {
+  /** A resume segment pair's seven verdicts, keyed as `verifyWorkflow` reports them. */
+  const resumed = (site: string, cancelDeadlockFree: string, cancelExactlyOne: string) => ({
+    [`resume@${site}/deadlockFree`]: 'proven',
+    [`resume@${site}/terminatesAtSink`]: 'proven',
+    [`resume@${site}/exactlyOneTerminal`]: 'proven',
+    [`resume@${site}/neverCanceled`]: 'proven',
+    [`resume@${site}+cancel/deadlockFree`]: cancelDeadlockFree,
+    [`resume@${site}+cancel/terminatesAtSink`]: 'proven',
+    [`resume@${site}+cancel/exactlyOneTerminal`]: cancelExactlyOne,
+  });
+
+  // The resume segments ([ADR 0007]). Site 0 is `before`'s input, the entry place itself, so its
+  // pair starts where the fresh segments do and sees the stranding too. Every later site — an
+  // arm, or `after` — is past the block's input, so the missing sweep is never on its path.
+  for (const [label, shape, later] of [
+    ['n = 2 between two steps', guarded, ['1.0', '1.1', '2']],
+    ['n = 0 between two steps', guardedEmpty, ['2']],
+  ] as const) {
     it(`needs the sweep: without it the canceled block's input is stranded (${label})`, async () => {
       // No sweep, no start to compete with it: the structural check has nothing to flag, so the
-      // default run proves — and this is the proof that sees it.
+      // default run proves — and this is the proof that sees it. The block's input is not a resume
+      // site (its arms are), so the resume gate check has nothing to flag either.
       expect(cancelStructureViolations(build(shape, withoutSweep))).toEqual([]);
+      expect(resumeGateViolations(build(shape, withoutSweep))).toEqual([]);
       const reports = await verify(shape, withoutSweep);
       const v = Object.fromEntries(reports.map((r) => [keyOf(r), r.result.verdict.type]));
       const all = reports.map(describeReport).join('; ');
@@ -296,6 +326,8 @@ describe('compiled parallel, cancellation non-vacuity', () => {
         // Blind under cancellation: the marked `wf.cancel` is a sink.
         'cancel/terminatesAtSink': 'proven',
         'cancel/exactlyOneTerminal': 'violated',
+        ...resumed('0', 'violated', 'violated'),
+        ...Object.fromEntries(later.flatMap((site) => Object.entries(resumed(site, 'proven', 'proven')))),
       });
       proofLog(`[mutant sweep ${label}] ${all}`);
     }, 360_000);
