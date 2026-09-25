@@ -36,7 +36,7 @@ The pins are in the bootstrap script and `package.json`:
 - The `mastra` CLI 1.30.0, released with core 1.67.0 on 2026-09-15.
 - `@mastra/deployer` held at 1.67.0 by an override.
 - `@mastra/libsql` 1.23.0.
-- `libpetri` 6.1.0.
+- `libpetri` 7.0.0 (6.1.0 through M5).
 - Ports: `TESTBED_MASTRA_PORT` (default 4111) and `TESTBED_DEBUG_PORT` (default 4112).
 
 The package goes in as a packed tarball, not a symlink. A symlink would resolve a second

@@ -1,4 +1,4 @@
-export { compile, defaultGadgets, MAX_CONCURRENCY, MAX_NET_PLACES } from './compile.js';
+export { compile, defaultGadgets, MAX_CONCURRENCY } from './compile.js';
 export type { CompileOptions } from './compile.js';
 export { stepGadget, sleepGadget, stepAction, unimplemented, MAX_RETRIES, MAX_WAIT_MS } from './gadgets/leaf.js';
 export { parallelGadget } from './gadgets/parallel.js';

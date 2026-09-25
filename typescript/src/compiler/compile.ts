@@ -37,25 +37,6 @@ import type {
   WorkflowDescription,
 } from './types.js';
 
-/**
- * The largest net `compile()` will emit, in places — a guard against a libpetri defect.
- *
- * `PrecompiledNet` stored each transition's single-word needs index in an `Int8Array`, so a
- * transition whose input and read places all sit in one bitmap word at index 128 or above —
- * place ids from 4096 up — wrapped negative and was read as having no needs. On an input that
- * makes a transition fire with its place empty, fail synchronously and re-mark itself dirty
- * forever: a spin `run(timeout, 'close')` cannot interrupt, because the loop never yields. On an
- * inhibitor it is quieter and worse — the inhibitor is ignored and the run gives a wrong answer.
- * Root-caused upstream (`Int8Array` -> `Int32Array`, TypeScript only; Java uses `int[]`). Place
- * ids, not the place count, trigger it, but a net of at most 4096 places has every id below 4096,
- * so this bound excludes both failures exactly.
- *
- * **libpetri 6.1.0 does NOT carry the fix** — its `dist/index.js` still allocates
- * `needsSingleWordIndex` as an `Int8Array`. Lift this only after checking that line in the
- * release the package depends on, not on seeing a version number.
- */
-export const MAX_NET_PLACES = 4096;
-
 export interface CompileOptions {
   /** Override or extend the gadget registry — used by tests to compile one gadget in isolation. */
   readonly gadgets?: Partial<Record<EntryDescription['kind'], Gadget>>;
@@ -268,13 +249,6 @@ export function compile(description: WorkflowDescription, options: CompileOption
     )
     .transitions(...transitions)
     .build();
-
-  if (net.places.size > MAX_NET_PLACES) {
-    throw new Error(
-      `workflow '${description.id}' compiles to ${net.places.size} places, above the ` +
-        `${MAX_NET_PLACES} this engine can currently run (see MAX_NET_PLACES in compile.ts)`,
-    );
-  }
 
   return {
     net,

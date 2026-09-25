@@ -475,13 +475,19 @@ bump not yet run):
       transition per execution). The loop gadget stands on specified behaviour
 - `4d7a9d9` — ν-join verification soundness, committed after the release. Not relevant: no
   compiled net uses `matchSpec` or `freshName`
-- [ ] U9 — **libpetri TypeScript 7.0.0 released 2026-09-25** (tag `typescript/v7.0.0`, reported by
-      the temporal-libpetri session). Carries U7 (commit `03f80db`), so `MAX_NET_PLACES` can be
-      lifted; adds terminal places (`PetriNet.builder(..).terminal(place)`, [EXEC-042]) and
-      `executor.terminationReason()` — the in-net replacement for the kernel's drain-on-terminal
-      watcher; breaking: `NodeCategory` gains `'terminal'`; verification soundness fixes. Not taken
-      mid-M5, so M5's figures stay attributable to 6.1.0: an upgrade of its own after M5, with every
-      gate and the differential re-run. `executionScope` pinning is moot while no net uses `freshName`
+- [x] U9 — **libpetri TypeScript 7.0.0** (released 2026-09-25, tag `typescript/v7.0.0`, reported by
+      the temporal-libpetri session), taken after M5 as an upgrade of its own. Breaking for us:
+      nothing (`NodeCategory` gains `'terminal'`; we switch over neither it nor
+      `terminationReason`). It carries U7: `dist` allocates `needsSingleWordIndex` as an
+      `Int32Array`, checked in the file rather than trusted from the version, so `MAX_NET_PLACES`
+      is removed; a 4313-place chain runs to success and stops at a cancel on step 4200
+      (tests/compiler/leaf.test.ts; not run against 6.1.0, where U7's 4098-place repro spun).
+      **Terminal places ([EXEC-042]) not adopted**: a terminal ends the run the moment it is marked
+      and abandons in-flight actions, where the kernel's `drain()` lets them finish so the run rests
+      and `classify` sees any residue; and the verifier excuses every marking a terminal ends in,
+      which would blunt `exactlyOneTerminal` and residue detection — the properties that catch a
+      token left beside a terminal. The drain-on-terminal watcher stays. `executionScope` pinning is
+      moot while no compiled net uses `freshName`
 
 **Not pursued, deliberately:**
 

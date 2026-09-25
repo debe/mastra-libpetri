@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { Transition, one, outPlace, place, xor, type Place } from 'libpetri';
 import {
   compile,
-  MAX_NET_PLACES, MAX_RETRIES, MAX_WAIT_MS,
+  MAX_RETRIES, MAX_WAIT_MS,
   stepAction,
   sleepGadget,
   stepGadget,
@@ -1257,19 +1257,40 @@ describe('a per-run duration is coerced as setTimeout coerces it', () => {
   });
 });
 
-describe('the net-size stopgap', () => {
-  // A chain of n steps is n input places plus 13 of the workflow's own: six terminals, the cancel
-  // place, the cancel request place and five settle places. 4084 steps is 4097 places, one over.
-  const OWN = 13;
-  it('refuses a workflow whose net exceeds MAX_NET_PLACES, naming the limit', () => {
-    const entries = Array.from({ length: MAX_NET_PLACES - OWN + 1 }, (_, i) => step(`s${i}`));
-    expect(() => compile(wf(...entries))).toThrow(new RegExp(`compiles to ${MAX_NET_PLACES + 1} places, above the ${MAX_NET_PLACES}`));
-  });
+describe('a net past 4096 places', () => {
+  // libpetri before 7.0.0 stored `PrecompiledNet`'s single-word needs index in an `Int8Array`, so a
+  // transition whose needs sat in one bitmap word from place id 4096 up read as having none and spun
+  // synchronously forever; the compiler refused such nets (`MAX_NET_PLACES`, removed with 7.0.0, whose
+  // `dist` allocates an `Int32Array`). A chain of n steps is n input places plus 13 of the
+  // workflow's own, so 4300 steps put every step past s4083 at an id of 4096 or more.
+  const N = 4300;
+  const chain = () => wf(...Array.from({ length: N }, (_, i) => step(`s${i}`)));
 
-  it('compiles one exactly at the limit', () => {
-    const entries = Array.from({ length: MAX_NET_PLACES - OWN }, (_, i) => step(`s${i}`));
-    expect(compile(wf(...entries)).net.places.size).toBe(MAX_NET_PLACES);
-  });
+  it('runs every step of a 4313-place chain to success', async () => {
+    const compiled = compile(chain());
+    expect(compiled.net.places.size).toBe(N + 13);
+    const runner = new RecordingRunner();
+    const outcome = await runWorkflow(compiled, 'x', { runner, signal: new AbortController().signal });
+    expect(outcome.status).toBe('success');
+    expect(runner.calls).toHaveLength(N);
+  }, 60_000);
+
+  it('stops at the cancel inhibitor on a step past place id 4096', async () => {
+    const controller = new AbortController();
+    const runner = new RecordingRunner({
+      steps: {
+        s4200: (input) => {
+          controller.abort();
+          return { status: 'success', output: input };
+        },
+      },
+    });
+    const outcome = await runWorkflow(compile(chain()), 'x', { runner, signal: controller.signal });
+    expect(outcome.status).toBe('canceled');
+    // The abort is injected before s4200 returns, so the inhibitor on s4201's start holds.
+    expect(runner.calls.at(-1)).toBe('s4200');
+    expect(runner.calls).toHaveLength(4201);
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------------------------

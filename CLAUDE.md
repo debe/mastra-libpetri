@@ -55,10 +55,11 @@ requirement IDs (`IO-015`, `EXEC-003`, `MOD-031`, `TIME-015`, …).
 
 ### libpetri
 
-Installed from the registry: `"libpetri": "^6.1.0"`, the first release carrying everything the
-engine calls — **TIME-015** (injectable clock), the **MOD-031** place-alias fix, **NU-011**
-(resume-safe minting) and **CORE-073**/**ENV-014** snapshot. Figures measured against it are
-reportable.
+Installed from the registry: `"libpetri": "^7.0.0"`. 6.1.0 was the first release carrying
+everything the engine calls — **TIME-015** (injectable clock), the **MOD-031** place-alias fix,
+**NU-011** (resume-safe minting) and **CORE-073**/**ENV-014** snapshot; 7.0.0 adds the
+`PrecompiledNet` word-index fix, so nets past 4096 places run. Figures measured against a release
+are reportable; figures through M5 are 6.1.0's.
 
 The sibling checkout is linked only on purpose, to try a fix that is not released yet:
 
