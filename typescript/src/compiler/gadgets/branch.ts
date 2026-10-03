@@ -24,7 +24,7 @@ import type {
   StepRecord,
   SuspendToken,
 } from '../types.js';
-import { blockReentry, suspendedBlock, type ArmArrival } from './reentry.js';
+import { blockClaims, blockReentry, suspendedBlock, type ArmArrival } from './reentry.js';
 import type { Gadget, GadgetResult } from './types.js';
 
 /**
@@ -408,7 +408,12 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
   });
   transitions.push(...reentry.transitions);
 
-  return { inPlace, transitions, resumeSites: reentry.resumeSites };
+  return {
+    inPlace,
+    transitions,
+    resumeSites: reentry.resumeSites,
+    claims: blockClaims([arrived, armErr, armSusp, armBail, armPause, errSeen, suspSeen], arms.length),
+  };
 };
 
 /**

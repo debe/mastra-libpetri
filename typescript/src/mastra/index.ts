@@ -31,6 +31,8 @@ export {
   UnsupportedWorkflowError,
 } from './adapt.js';
 export type { AdaptOptions } from './adapt.js';
+export { isMastraWorkflow, nestedWorkflows, verifyMastraWorkflow, workflowsIn } from './verify.js';
+export type { MastraVerification, MastraVerifyOptions, VerifiableWorkflow } from './verify.js';
 export { entryId, suspendTracingContext } from './host.js';
 export type { TracedSpan, TracingContext } from './host.js';
 export { decodeResume } from './resume-codec.js';

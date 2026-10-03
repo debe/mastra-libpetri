@@ -8,6 +8,9 @@
   "engines": {
     "node": ">=24"
   },
+  "bin": {
+    "mastra-libpetri": "./dist/cli.js"
+  },
   "exports": {
     ".": {
       "import": "./dist/index.js",

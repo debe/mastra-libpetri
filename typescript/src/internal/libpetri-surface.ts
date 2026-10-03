@@ -1,3 +1,5 @@
+import * as libpetri from 'libpetri';
+import { SmtVerifier } from 'libpetri/verification';
 /**
  * Fails loudly when the installed libpetri predates the surface this engine calls.
  *
@@ -85,7 +87,17 @@ export function missingSurfaceMembers(probe: SurfaceProbe): readonly string[] {
 }
 
 /** Throws {@link LibpetriSurfaceError} when any required member is absent. */
-export function assertLibpetriSurface(probe: SurfaceProbe): void {
+export function assertLibpetriSurface(probe: SurfaceProbe = installedSurface()): void {
   const missing = missingSurfaceMembers(probe);
   if (missing.length > 0) throw new LibpetriSurfaceError(missing);
+}
+
+/** Probes the libpetri actually installed — what `verify` checks at entry. */
+export function installedSurface(): SurfaceProbe {
+  return {
+    rootExports: libpetri as unknown as Record<string, unknown>,
+    executorPrototype: libpetri.PrecompiledNetExecutor.prototype as unknown as object,
+    markingConstructor: libpetri.Marking as unknown as Function & Record<string, unknown>,
+    verifierPrototype: SmtVerifier.prototype as unknown as object,
+  };
 }

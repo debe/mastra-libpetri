@@ -10,6 +10,7 @@
 | [0006](0006-run-step-budget.md) | "k" is a run's step budget: a place of permits, proven, never a scheduler | accepted |
 | [0007](0007-resume-is-a-seeded-segment.md) | A resume is a seeded, gated, separately proven segment of the same net | accepted |
 | [0008](0008-step-events-observe-the-net.md) | Step events observe the net: a lifecycle hook at Mastra's emission points, and a tee for the debug UI | accepted |
+| [0009](0009-verification-claims.md) | Every compiled workflow carries four families of claims, derived, proven, and gated over the corpus | accepted |
 
 Each ADR has Context / Decision / Consequences / Evidence; Evidence names the test that pins the
 behaviour it rests on. Amendments are recorded in the existing ADR, tagged with the milestone

@@ -383,10 +383,57 @@
       debug UI issues to raise upstream (no auto-fit for large nets, session list only on Refresh, a
       `?sessionId=` link opens in replay mode, tokens logged as `[object Object]`)
 
-## M6 — Verification
-- [ ] `verify(workflow)`: deadlock freedom with the complete sink list, termination at declared
-      sinks, dead steps, mutual exclusion, place bounds, retry ceiling. CI gate asserts `Proven`
-      per compiled workflow across the corpus; `Unknown` fails, missing z3 fails
+## M6 — Verification ([ADR 0009])
+- [x] Contract: gadgets declare what they claim — `GadgetResult.claims` (a bound other than 1, or
+      `unclaimed` with the reason) and `.exclusions`; the leaf records each step's attempt chain
+      (`StepChain`); `CompiledWorkflow.{steps, claims, exclusions, entries}`. Nothing new is read at
+      runtime, and `verifyWorkflow` is unchanged
+- [x] `verify(compiled)` (`src/verify/workflow.ts`, `claims.ts`): four families per segment —
+      completion (the existing set), bounds (`placeBound` on every place, 1 unless claimed), exclusion
+      (Mastra's barrier, pairwise over each entry's places against `next` and every outcome place,
+      plus the foreach's cursor/record and permit/slot pairs), liveness (every step attempt, retries
+      included, refuted-unreachable with a **confirmed** firing sequence, `closed` only). The retry
+      ceiling is `retryCeilingViolations`, a seventh structural check: each chain a simple path of
+      `retries + 1` attempts nothing else enters; its final attempt's witness is the ceiling reached.
+      `unknown` never holds; a missing z3 throws `Z3Unavailable` before any query
+- [x] Cost, measured against libpetri 7.0.0 from npm: libpetri tries enumeration before the linear
+      bound, 3–5 s a query on `parallel-wide` where the bound proves in ~20 ms. A quick phase
+      (enumeration off, 5 s, kept only if it settles the claim) took `parallel-wide` from over 15 min
+      to 149 s, 5,183 claims; a segment whose completion proofs enumerated skips it. A completion
+      proof that is `unknown` is retried once with [VER-016] counters: `foreach-c5` `deadlockFree`
+      `unknown` at 131 s -> `proven` in 346 s. Reported to the libpetri sessions, not pressed
+- [x] Finding, recorded rather than claimed: a foreach's `faults` / `exits` <= lanes rests on the
+      dispatch inhibitors, which no linear invariant captures; z3 proves it at 2 lanes and returns
+      `unknown` at 3 (300 s; 600 s with counters). Above 2 lanes both are listed as unclaimed with
+      that reason (`MAX_PROVEN_RECORD_LANES`)
+- [x] `verifyMastraWorkflow` (`src/mastra/verify.ts`): adapts and compiles as `execute()` does, the
+      workflow's own `PetriExecutionEngine` supplying `concurrency` / `iterationBound`
+      (`settings()`), nested workflows verified too. CLI `mastra-libpetri verify <module>`
+      (`src/cli.ts`): exit 0 iff every claim holds, 1 on any failure or `unknown`, 2 on usage, no
+      solver, or an unsupported workflow
+- [x] Non-vacuity (`tests/verify/claims.test.ts`): one mutant per family that every completion
+      proof passes — a block claiming 1 where arms settle n times (bounds), a step leaving a token
+      that drains later (the barrier; completion cannot see a transient), an attempt no failure
+      reaches (liveness); each retry-ceiling rule by its own mutant
+- [x] **The gate** (`tests/verify/corpus.test.ts`): every corpus workflow and each it nests, at
+      k = unbounded and 1. Fast lane in `npm test`; the 13 workflows with a `.foreach()` (read off
+      the step flow) and `parallel-wide` run with `SLOW_PROOFS=1`, sharded over a 6-way CI matrix
+      (`CORPUS_SHARD`). Measured locally against libpetri 7.0.0 from npm (not linked), z3 on PATH,
+      10 cores, two shards at once: **132 cases (66 workflows x 2 budgets) + 8 nested workflows,
+      120,972 claims, every one holding** — completion 4,410, bounds 25,840, exclusion 90,300,
+      liveness 422; routes enumeration 71,572, structural 41,674, smt 7,726. Shards 66/66 in 91 min
+      and 66/66 in 134 min; the longest workflow `emit-step-events-off` (a timed foreach) at 18 min,
+      `foreach-c5` 13 min, `parallel-wide` 10.5 min. Fast lane alone: 154 passed, 28 skipped, 87 s
+- [x] Final integration: `npm run check` exit 0; `npm run build` exit 0; `npm test` "Test Files 64
+      passed (64)", "Tests 2477 passed | 63 skipped (2540)" in 1,141 s. CI's `typescript` job timeout
+      raised 20 -> 45 min for the fast lane; the `proofs` matrix has not run on GitHub — the repo is
+      not pushed (M0)
+- [ ] Open after M6, none blocking: a foreach's record bounds above two lanes (needs an
+      inhibitor-aware invariant, or a `StateSpaceCache`-independent route; raise upstream with a
+      repro); retire the quick phase once U10 ships; the CI proofs job's timing on a 4-core runner is
+      unmeasured; `verify` on a nested net takes the caller's `segments` verbatim (a site list is
+      per net); liveness witnesses are untimed-model runs — on a net with a fixed sleep or retry
+      delay a witness may be one the clock rules out, and none has been replayed on the executor
 
 ## M7 — Structural resources (Layer 2 — degrades gracefully)
 - [ ] Mastra-vocabulary options (`concurrency`, `retries`, `retryConfig`, `timeout`) compile to
@@ -488,6 +535,51 @@ bump not yet run):
       which would blunt `exactlyOneTerminal` and residue detection — the properties that catch a
       token left beside a terminal. The drain-on-terminal watcher stays. `executionScope` pinning is
       moot while no compiled net uses `freshName`
+
+- [ ] U10 — a caller-owned `StateSpaceCache` for the [VER-017] enumeration route, raised from M6's
+      cost finding (enumeration tried before the linear bound, 3–5 s a query on `parallel-wide`):
+      the state-class graph built once per net and marking, a truncation remembered, verdicts
+      unchanged. In progress upstream in all four languages (temporal-terminal-places-refactor,
+      2026-09-25), not released. When it ships, pass one cache per net and marking and retire the
+      quick phase in `src/verify/workflow.ts`; route order (VER-015 after enumeration) stays
+
+- [x] U11 — libpetri-87's unreleased verification changes (2026-09-28). Only item 4 applies to
+      us: the result for an initially violating marking, which is every first-step liveness witness
+      in the M6 gate. Answered 2026-09-28: the shape is kept and now documented in all four
+      languages — `violated`, `counterexampleConfirmed: true` (even with replay off), trace `[M0]`,
+      no firings. Pinned here in `tests/verify/claims.test.ts` ("a witness of zero firings") and
+      upstream in `typescript/tests/verification/initial-violation-trace.test.ts`. Items 1–3 and 5
+      do not apply: reaping touches only `deadline`/`window`, and our nets use `delayed` and
+      immediate only; libpetri will say first if that widens
+
+- [ ] U12 — libpetri-87 round 2 (2026-09-29, uncommitted and unreleased). Item 1, the VER-004
+      in-flight split: a transition is split into start → `inflight:t` → `complete:t` when another
+      transition tests one of its OUTPUT places by inhibitor, reset, `all()` or `atLeast()`
+      (`exactly` does not count). In our nets that is `t.cancel.arrive`, every foreach lane's step
+      attempts, the foreach settles and unpark, parallel/branch `collect-err`/`collect-susp`, and
+      the loop's `budget`/`running` writers. Answered 2026-09-29: the barrier claims are *not*
+      weakened. They are now checked at every in-flight marking as well, so a claim that stays
+      proven holds at strictly more executor states. `inflight:t` is not a supported property
+      target; do not build on it. `assumeAtomicFiring(true)` restores the old encoding byte for
+      byte. Item 3 will key sinks, property places and the initial marking by name; we mint each
+      name once, so there should be no change. Item 2: no effect.
+      **Run 2026-09-29 on the linked snapshot** (libpetri f04d128+dirty, dist=ba757fcd1216 by our
+      script, b16e20d6f357eb80 by libpetri's method; not a release figure; unlinked afterwards):
+      the M6 claims, Mastra-verify, CLI and surface tests all pass (54, mutants included). The
+      corpus fast lane is 104 passed, 28 skipped; 67,434 claims hold and no claim count moved.
+      **One real flip:** foreach `closed/deadlockFree` at 3 and 5 lanes is *violated* (proven with
+      `assumeAtomicFiring(true)`). Confirmed trace: lane 1's `start` holds the cursor in flight;
+      lane 0's item fails and its settle resets the cursor (`queue.kill()`), which is empty; the
+      start then completes and re-deposits the cursor, so the run ends as
+      `{cursor: 1, wf.failed: 1}`. The kill was reasoned about as if a start were atomic. At runtime
+      this would leave residue beside a terminal. The window is narrow and untested; no executor
+      repro yet. Split vs atomic cost (closed segment): c1 deadlockFree 86 s vs 5.7 s; c5
+      neverCanceled 90 s vs 4 s; the rest 1.5–2x; no unknowns
+- [ ] **Foreach cursor revived by an in-flight start** (found by U12): remove a cursor that
+      coexists with a recorded outcome — a sweep that reads faults/exits/suspensions and consumes
+      the cursor — and have the fail/exit/suspend finishers reset it. Otherwise a revived cursor
+      also blocks `unpark` (it needs no cursor) and so the suspend finisher on a resumed foreach.
+      Needs an executor repro first, and must re-prove under the split
 
 **Not pursued, deliberately:**
 

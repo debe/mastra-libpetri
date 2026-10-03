@@ -4,6 +4,7 @@ import {
   placeBound,
   quiescentCount,
   terminatesAtSink,
+  type SmtProperty,
   type SmtVerificationResult,
 } from 'libpetri/verification';
 import type { Place } from 'libpetri';
@@ -256,25 +257,37 @@ export async function verifyWorkflow(
   for (const segment of segments) {
     const initial = segmentInitialMarking(compiled, segment);
     const marking = describeMarking(initial);
-    const run = async (property: string, prop: Parameters<SmtVerifier['property']>[0]): Promise<void> => {
+    for (const [property, prop] of completionProperties(compiled, segment)) {
       reports.push({ property, segment, marking, result: await base(initial).property(prop).verify() });
-    };
-    await run('deadlockFree', deadlockFree());
-    await run('terminatesAtSink', terminatesAtSink());
-    await run('exactlyOneTerminal', quiescentCount(terminals, 1, 1));
-    // With no cancel arriving, nothing may reach `wf.canceled` — reachability, not quiescence, so
-    // it sees a transient state too. It is what catches a cancel finisher that lost its read arc
-    // on the signal: that net still drains to exactly one terminal, only sometimes the wrong one.
-    // A resumed segment without a cancel is held to the same: a gate's sweep must stay dead.
-    if (!cancels(segment)) await run('neverCanceled', placeBound(t.canceled, 0));
-    // The step budget ([ADR 0006]): no transition ever mints a permit, and every one is back when
-    // the run comes to rest — so steps in flight never exceed `k` and none is lost.
-    if (compiled.budget) {
-      await run('permitsBounded', placeBound(compiled.budget.permits, compiled.budget.k));
-      await run('permitsReturned', quiescentCount([compiled.budget.permits], compiled.budget.k, compiled.budget.k));
     }
   }
   return reports;
+}
+
+/**
+ * The completion set for one segment, in the order `verifyWorkflow` proves it — each property's
+ * name and query. Exported so a caller can re-ask one query under other options.
+ */
+export function completionProperties(compiled: CompiledWorkflow, segment: Segment): readonly (readonly [string, SmtProperty])[] {
+  const t = compiled.terminals;
+  const terminals = [t.done, t.failed, t.bailed, t.suspended, t.paused, t.canceled] as const;
+  const out: (readonly [string, SmtProperty])[] = [
+    ['deadlockFree', deadlockFree()],
+    ['terminatesAtSink', terminatesAtSink()],
+    ['exactlyOneTerminal', quiescentCount(terminals, 1, 1)],
+  ];
+  // With no cancel arriving, nothing may reach `wf.canceled` — reachability, not quiescence, so
+  // it sees a transient state too. It is what catches a cancel finisher that lost its read arc
+  // on the signal: that net still drains to exactly one terminal, only sometimes the wrong one.
+  // A resumed segment without a cancel is held to the same: a gate's sweep must stay dead.
+  if (!cancels(segment)) out.push(['neverCanceled', placeBound(t.canceled, 0)]);
+  // The step budget ([ADR 0006]): no transition ever mints a permit, and every one is back when
+  // the run comes to rest — so steps in flight never exceed `k` and none is lost.
+  if (compiled.budget) {
+    out.push(['permitsBounded', placeBound(compiled.budget.permits, compiled.budget.k)]);
+    out.push(['permitsReturned', quiescentCount([compiled.budget.permits], compiled.budget.k, compiled.budget.k)]);
+  }
+  return out;
 }
 
 /**

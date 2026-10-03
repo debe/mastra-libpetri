@@ -53,6 +53,10 @@ export type {
   SuspendToken,
   Terminals,
   WorkflowDescription,
+  StepChain,
+  PlaceClaim,
+  ExclusionClaim,
+  TopLevelEntry,
 } from './types.js';
 export { resumeSeed, UnresumablePositionError } from './resume.js';
 export { HostPreconditionError } from './gadgets/leaf.js';

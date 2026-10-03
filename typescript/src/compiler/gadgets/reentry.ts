@@ -9,6 +9,7 @@ import type {
   SiblingVerdict,
   StepDescription,
   SuspendToken,
+  PlaceClaim,
 } from '../types.js';
 
 /**
@@ -305,4 +306,12 @@ export function suspendedBlock(tokens: readonly SuspendToken[], indexOf: (token:
   const [first, ...rest] = ranked;
   if (first === undefined) throw new Error('suspendedBlock: no suspension to report');
   return rest.length === 0 ? first.token : { ...first.token, pending: rest.map((r) => r.token) };
+}
+
+/**
+ * The bounds a `.parallel()` or `.branch()` claims beyond 1 ([ADR 0009]): every arm settles into
+ * the shared places exactly once, fresh or replayed, so each holds at most one token per arm.
+ */
+export function blockClaims(places: readonly Place<unknown>[], arms: number): PlaceClaim[] {
+  return places.map((place) => ({ place: place.name, bound: arms, why: `one settlement per arm (${arms} arms)` }));
 }

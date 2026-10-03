@@ -133,6 +133,12 @@ interface SuspensionRecord {
  */
 export const MAX_FOREACH_LANES = 256;
 
+/**
+ * The most lanes at which a foreach claims its record bounds ([ADR 0009]); see the claim itself.
+ * A measured limit of the solver, not of the net.
+ */
+export const MAX_PROVEN_RECORD_LANES = 2;
+
 /** The largest item count that is still an array length; past it, `results[k]` stops being an index. */
 const MAX_ITEMS = 2 ** 32 - 1;
 
@@ -1019,7 +1025,32 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
 
   // The body's transitions are collected by the builder as `emitNested` returns them; repeating
   // them here would register each one twice.
-  return { inPlace, transitions, resumeSites };
+  const lanesWhy = `at most one outcome per lane in flight (${lanes} lanes)`;
+  return {
+    inPlace,
+    transitions,
+    resumeSites,
+    claims: [
+      { place: results.name, bound: 'unclaimed', why: 'one result per item: the count is the input array, which is data' },
+      { place: parked.name, bound: 'unclaimed', why: 'one per carried suspension, deposited by a single re-enter ([IO-016]): data' },
+      { place: suspensions.name, bound: 'unclaimed', why: `at most ${lanes} in a fresh run, plus every carried suspension unpark moves in at once ([IO-016]): data` },
+      // At most one per lane: once an outcome is recorded no `start` fires, so only the items
+      // already in flight can add one. That rests on the inhibitors, which no linear invariant
+      // captures — z3 settles it at two lanes and returns unknown at three within 600 s
+      // (`foreach-c3`, libpetri 7.0.0, [ADR 0009]). Above two it is listed, not claimed.
+      ...[faults, exited].map((record) =>
+        lanes <= MAX_PROVEN_RECORD_LANES
+          ? { place: record.name, bound: lanes, why: lanesWhy }
+          : { place: record.name, bound: 'unclaimed' as const, why: `${lanesWhy}, by the dispatch inhibitors; unknown to z3 above ${MAX_PROVEN_RECORD_LANES} lanes` }),
+    ],
+    exclusions: [
+      // `queue.kill()`: every non-success settle resets the cursor in the firing that records it.
+      { a: cursor.name, b: faults.name, why: 'a recorded failure has killed the queue' },
+      { a: cursor.name, b: exited.name, why: 'a recorded bail or pause has killed the queue' },
+      { a: cursor.name, b: suspensions.name, why: 'a recorded suspension has killed the queue; a carried one joins only once the cursor is gone' },
+      ...laneList.map((l, i) => ({ a: l.permit.name, b: l.slot.name, why: `lane ${i} is idle or busy, never both` })),
+    ],
+  };
 };
 
 /**

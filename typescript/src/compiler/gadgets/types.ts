@@ -1,6 +1,15 @@
 import type { Place, Transition } from 'libpetri';
 import type { NameVocabulary, EntryPath } from '../names.js';
-import type { EntryDescription, Exits, FlowToken, ResumeSite, StepDescription } from '../types.js';
+import type {
+  EntryDescription,
+  ExclusionClaim,
+  Exits,
+  FlowToken,
+  PlaceClaim,
+  ResumeSite,
+  StepChain,
+  StepDescription,
+} from '../types.js';
 
 /**
  * What a gadget emitted.
@@ -16,6 +25,10 @@ export interface GadgetResult {
   readonly places?: readonly Place<unknown>[];
   /** The resume sites this gadget registers ([ADR 0007]) — its arms, or itself. */
   readonly resumeSites?: readonly ResumeSite[];
+  /** Bounds other than 1 on this gadget's own places ([ADR 0009]). A nested step's are its own. */
+  readonly claims?: readonly PlaceClaim[];
+  /** Pairs of this gadget's places that are never marked together ([ADR 0009]). */
+  readonly exclusions?: readonly ExclusionClaim[];
 }
 
 /**
@@ -56,6 +69,8 @@ export interface GadgetContext {
   readonly permits: Place<null> | undefined;
   /** Registers a step-attempt transition by name — the leaf calls it for every attempt it emits. */
   readonly stepAttempt: (transitionName: string) => void;
+  /** Registers a step's whole attempt chain ([ADR 0009]) — the leaf calls it once per step. */
+  readonly stepChain: (chain: StepChain) => void;
   readonly names: NameVocabulary;
   /**
    * Where this entry's non-success outcomes go. At the top level these are the workflow's

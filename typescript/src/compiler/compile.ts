@@ -26,14 +26,18 @@ import type {
   CompiledWorkflow,
   EntryDescription,
   EntrySite,
+  ExclusionClaim,
   Exits,
   FailureToken,
   FlowToken,
   PauseToken,
+  PlaceClaim,
   ResumeSite,
+  StepChain,
   StepDescription,
   SuspendToken,
   Terminals,
+  TopLevelEntry,
   WorkflowDescription,
 } from './types.js';
 
@@ -107,6 +111,9 @@ export function compile(description: WorkflowDescription, options: CompileOption
   const extraPlaces: Place<unknown>[] = [];
   const transitions: Transition[] = [];
   const stepAttempts: string[] = [];
+  const steps: StepChain[] = [];
+  const claims = new Map<string, PlaceClaim>();
+  const exclusions: ExclusionClaim[] = [];
   // Resume sites ([ADR 0007]), keyed by path; a gadget registers its own through GadgetResult.
   const resumeSites = new Map<string, ResumeSite>();
   const pathToEntry = new Map<string, { entryId: string; kind: EntryDescription['kind'] }>();
@@ -202,6 +209,9 @@ export function compile(description: WorkflowDescription, options: CompileOption
       stepAttempt: (transitionName) => {
         stepAttempts.push(transitionName);
       },
+      stepChain: (chain) => {
+        steps.push(chain);
+      },
       names,
       exits,
       nextIsResult,
@@ -219,6 +229,11 @@ export function compile(description: WorkflowDescription, options: CompileOption
     }
     if (result.places) extraPlaces.push(...result.places);
     for (const site of result.resumeSites ?? []) registerSite(site);
+    for (const claim of result.claims ?? []) {
+      if (claims.has(claim.place)) throw new Error(`two bound claims on place '${claim.place}'`);
+      claims.set(claim.place, claim);
+    }
+    exclusions.push(...(result.exclusions ?? []));
     return result;
   };
 
@@ -226,9 +241,11 @@ export function compile(description: WorkflowDescription, options: CompileOption
   // top-level entry is gated: Mastra checks its signal before each one (`default.ts:815`).
   const last = description.entries.length - 1;
   let next: Place<FlowToken> = settleDone;
+  const nextOf: string[] = [];
   for (let i = last; i >= 0; i--) {
     const entry = description.entries[i]!;
     pathToEntry.set(String(i), { entryId: entry.id, kind: entry.kind });
+    nextOf[i] = next.name;
     next = emit(entry, [i], next, topLevelExits, i === last, { cancel }).inPlace;
     const site = entrySite(entry, i, next);
     if (site) registerSite(site);
@@ -250,6 +267,20 @@ export function compile(description: WorkflowDescription, options: CompileOption
     .transitions(...transitions)
     .build();
 
+  // An entry owns every place named under its index, its arms' and lanes' included (`s.1.` and
+  // `s.1-0.`): the vocabulary names nothing else there, and nothing it owns is named elsewhere.
+  const placeNames = [...net.places].map((p) => p.name);
+  const entries: TopLevelEntry[] = description.entries.map((entry, index) => ({
+    index,
+    id: entry.id,
+    kind: entry.kind,
+    interior: placeNames.filter((n) => n.startsWith(`s.${index}.`) || n.startsWith(`s.${index}-`)),
+    next: nextOf[index]!,
+  }));
+  for (const name of [...claims.keys(), ...exclusions.flatMap((e) => [e.a, e.b])]) {
+    if (!placeNames.includes(name)) throw new Error(`a claim names '${name}', which is not a place of the net`);
+  }
+
   return {
     net,
     program: PrecompiledNet.compile(net),
@@ -260,6 +291,10 @@ export function compile(description: WorkflowDescription, options: CompileOption
     cancelRequest,
     ...(permits && k !== undefined ? { budget: { permits, k } } : {}),
     stepAttempts,
+    steps,
+    claims,
+    exclusions,
+    entries,
     resumeSites,
     structuralHash: structuralHash(description, names.names()),
   };

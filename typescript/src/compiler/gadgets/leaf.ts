@@ -82,6 +82,8 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
   const transitions: Transition[] = [];
   if (cancel !== undefined) transitions.push(sweep(names.entryTransition(path, entry.id, 'cancel'), inPlace, cancel, exits, entry.id, viewPath));
 
+  const attempts: string[] = [];
+  const hops: string[] = [];
   let attemptIn = inPlace;
   for (let attempt = 0; attempt <= retries; attempt++) {
     const retry =
@@ -103,6 +105,7 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
     if (attempt === 0 && cancel !== undefined) run.inhibitor(cancel);
     const built = run.build();
     ctx.stepAttempt(built.name);
+    attempts.push(built.name);
     transitions.push(built);
 
     if (retry !== undefined) {
@@ -114,10 +117,13 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
           tctx.output(nextAttempt, tctx.input(retry));
         });
       if (delayMs > 0) wait.timing(delayed(delayMs));
-      transitions.push(wait.build());
+      const hop = wait.build();
+      hops.push(hop.name);
+      transitions.push(hop);
       attemptIn = nextAttempt;
     }
   }
+  ctx.stepChain({ stepId: entry.id, path, retries, inPlace: inPlace.name, attempts, hops });
 
   return { inPlace, transitions };
 };

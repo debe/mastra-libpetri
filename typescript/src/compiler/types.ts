@@ -561,6 +561,60 @@ export interface ForeachResume {
 }
 
 /**
+ * One step's attempts, in order, as the leaf emitted them ([ADR 0009]). A step with `retries: R`
+ * is `R + 1` attempt transitions joined by `R` retry hops, and nothing else can start an attempt —
+ * which is the retry ceiling, checked on the arcs by `retryCeilingViolations`. Recorded for every
+ * step occurrence: a `.parallel()` arm, a loop body and each `.foreach()` lane included.
+ */
+export interface StepChain {
+  readonly stepId: string;
+  /** The naming path — a foreach lane's own, not the view path. */
+  readonly path: EntryPath;
+  readonly retries: number;
+  /** The step's input place: the only way into attempt 0. */
+  readonly inPlace: string;
+  /** Attempt transition names, attempt 0 first: `retries + 1` of them. */
+  readonly attempts: readonly string[];
+  /** Retry hop transition names: hop `j` moves a failed attempt `j` into attempt `j + 1`. */
+  readonly hops: readonly string[];
+}
+
+/**
+ * A gadget's claim about how many tokens one of its places can hold ([ADR 0009]). A place nobody
+ * claims for is claimed at 1 — so a gadget states only its exceptions, and a new place is held to
+ * the strictest bound until someone says otherwise.
+ *
+ * `unclaimed` is for a place whose count is **data** (a foreach's results, one per item) or is
+ * deposited several at a time by one firing, which the analyses count as one ([IO-016]): a proof
+ * of any bound there would be a proof about the model and not about the run, so the report lists
+ * the place and its reason instead of a verdict.
+ */
+export type PlaceClaim =
+  | { readonly place: string; readonly bound: number; readonly why: string }
+  | { readonly place: string; readonly bound: 'unclaimed'; readonly why: string };
+
+/** Two places a gadget says are never marked together ([ADR 0009]). */
+export interface ExclusionClaim {
+  readonly a: string;
+  readonly b: string;
+  readonly why: string;
+}
+
+/**
+ * A top-level entry as the barrier sees it ([ADR 0009]): Mastra's `for` loop runs entry `i + 1`
+ * only once entry `i` has returned, so no place of `interior` is marked while `next` is.
+ */
+export interface TopLevelEntry {
+  readonly index: number;
+  readonly id: string;
+  readonly kind: EntryDescription['kind'];
+  /** Every place the entry's gadget owns, its input included: named under `s.<index>`. */
+  readonly interior: readonly string[];
+  /** Where its success goes: the next entry's input, or the success settle place. */
+  readonly next: string;
+}
+
+/**
  * Relates net structure back to the workflow it came from, so a counterexample trace, an event
  * or a restored marking can be reported in Mastra's terms rather than in place names.
  */
@@ -611,6 +665,14 @@ export interface CompiledWorkflow {
    * already touching the permits cannot see an attempt compiled with none.
    */
   readonly stepAttempts: readonly string[];
+  /** Every step occurrence's attempt chain, in emission order ([ADR 0009]). */
+  readonly steps: readonly StepChain[];
+  /** The gadgets' bound claims, by place name; every other place is claimed at 1 ([ADR 0009]). */
+  readonly claims: ReadonlyMap<string, PlaceClaim>;
+  /** The gadgets' exclusion claims ([ADR 0009]). The barrier's are derived from `entries`. */
+  readonly exclusions: readonly ExclusionClaim[];
+  /** The top-level entries, in order ([ADR 0009]). */
+  readonly entries: readonly TopLevelEntry[];
   /** Every resume site, keyed by its path joined with `.` ([ADR 0007]). */
   readonly resumeSites: ReadonlyMap<string, ResumeSite>;
   /** Stable over structure alone, so it keys a compile cache across runs. */

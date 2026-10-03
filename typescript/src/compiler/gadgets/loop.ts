@@ -490,5 +490,12 @@ export const loopGadget: Gadget = (entry, next, ctx) => {
     ...sweeps,
   );
 
-  return { inPlace, transitions };
+  return {
+    inPlace,
+    transitions,
+    // `start` deposits the whole allowance in one firing, which every analysis counts as one token
+    // ([IO-016]); a proven bound on it would be about the model. It never exceeds `iterationBound`
+    // by construction: `start` is the only producer and `enter` only takes.
+    claims: [{ place: budget.name, bound: 'unclaimed', why: `the allowance is deposited ${bound} at once, which the analyses count as one ([IO-016])` }],
+  };
 };

@@ -125,7 +125,9 @@ skips.
   `PetriExecutionEngine extends ExecutionEngine`, the runner that fires steps on Mastra's own
   `StepExecutor`, result formatting and persistence. `@mastra/core` is a peer dependency and a tsup
   external; `compiler/`, `engine/` and `verify/` stay host-free, enforced by a source guard test.
-- `verify/` — property derivation and the CLI.
+- `verify/` — the claims ([ADR 0009]): `verify(compiled)` proves completion, bounds, exclusion
+  and liveness per segment; `claims.ts` derives them and holds the retry-ceiling check.
+- `cli.ts` — `mastra-libpetri verify <module>`, over `mastra/verify.ts`'s `verifyMastraWorkflow`.
 - `conformance/` — the classifier and the differential harness.
 - `internal/` — the libpetri surface assertion and shared helpers.
 

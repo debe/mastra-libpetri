@@ -174,6 +174,17 @@ export class PetriExecutionEngine extends ExecutionEngine implements SpanLifecyc
     this.#debug = options.debug;
   }
 
+  /**
+   * The two options that shape the net `execute()` compiles — read by `verifyMastraWorkflow`, so
+   * what it proves is the net this engine runs. Omitted keys were not configured.
+   */
+  settings(): { readonly concurrency?: number; readonly iterationBound?: number } {
+    return {
+      ...(this.#concurrency === undefined ? {} : { concurrency: this.#concurrency }),
+      ...(this.#iterationBound === undefined ? {} : { iterationBound: this.#iterationBound }),
+    };
+  }
+
   async execute<_TState, _TInput, TOutput>(params: ExecuteParams): Promise<TOutput> {
     const span = new SpanOnce(params.workflowSpan);
     try {

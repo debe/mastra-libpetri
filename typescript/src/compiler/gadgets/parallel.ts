@@ -20,7 +20,7 @@ import type {
   StepRecord,
   SuspendToken,
 } from '../types.js';
-import { blockReentry, suspendedBlock, type ArmArrival } from './reentry.js';
+import { blockClaims, blockReentry, suspendedBlock, type ArmArrival } from './reentry.js';
 import type { Gadget } from './types.js';
 
 /**
@@ -348,6 +348,7 @@ export const parallelGadget: Gadget = (entry, next, ctx) => {
   return {
     inPlace,
     resumeSites: reentry.resumeSites,
+    claims: blockClaims([arrived, armExits.failed, armExits.bailed, armExits.suspended, armExits.paused, errSeen, suspSeen], armCount),
     transitions: [
       fork,
       ...cancelSweep,

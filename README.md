@@ -107,6 +107,29 @@ npm publishes 6.0.0. `package.json` therefore declares
 publishes. `scripts/libpetri-pin` records the sibling revision, and
 `scripts/link-libpetri.sh --check` verifies it.
 
+## Verifying a workflow
+
+```bash
+npx mastra-libpetri verify ./src/mastra/index.ts          # every exported Workflow, and a Mastra's
+npx mastra-libpetri verify ./flows.ts --export orders --concurrency 4 --json
+```
+
+or `verifyMastraWorkflow(workflow)` from code. Either compiles the workflow exactly as the engine
+would, nested workflows included, and proves four families of claims about the net
+([ADR 0009](docs/adr/0009-verification-claims.md)):
+
+| family | what it says |
+|---|---|
+| completion | no run strands a token; every run that comes to rest ends in exactly one terminal; nothing is canceled unasked; a budget's permits are conserved |
+| bounds | every place holds at most its claimed count — 1 unless a gadget says why more; a count that is data is listed as unclaimed, not proven |
+| exclusion | Mastra's barrier: no entry holds work once the next has started or an outcome is on its way out; plus each gadget's own pairs |
+| liveness | every step attempt, every retry included, has a confirmed run that reaches it: no dead steps, and each retry ceiling is reached |
+
+Each is proven for a fresh run, a run canceled at any point, and a run resumed at each resume
+site. The CLI exits 0 only when every claim holds; `unknown` exits 1, and a missing solver 2.
+Every workflow of the differential corpus is gated this way in CI
+([`tests/verify/corpus.test.ts`](typescript/tests/verify/corpus.test.ts)).
+
 ## Repository map
 
 | Path | Role |

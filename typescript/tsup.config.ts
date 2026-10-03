@@ -8,6 +8,7 @@ export default defineConfig({
     'src/verify/index.ts',
     'src/codec/index.ts',
     'src/conformance/index.ts',
+    'src/cli.ts',
   ],
   format: ['esm'],
   target: 'es2022',
