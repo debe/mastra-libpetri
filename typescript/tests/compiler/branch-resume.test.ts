@@ -10,7 +10,6 @@ import {
   resumeTimingViolations,
   segmentLabel,
   suspensionCoverageViolations,
-  thresholdOnlyViolations,
   verifyWorkflow,
 } from '../../src/verify/index.js';
 import type {
@@ -147,7 +146,6 @@ describe('branch resume: structure', () => {
       expect(cancelStructureViolations(compiled)).toStrictEqual([]);
       expect(budgetStructureViolations(compiled)).toStrictEqual([]);
       expect(resumeGateViolations(compiled)).toStrictEqual([]);
-      expect(thresholdOnlyViolations(compiled)).toStrictEqual([]);
       expect(suspensionCoverageViolations(compiled)).toStrictEqual([]);
       expect(resumeTimingViolations(compiled)).toStrictEqual([]);
     }
@@ -400,7 +398,7 @@ const BUDGET = ['permitsBounded', 'permitsReturned'];
 
 async function expectAllProven(name: string, compiled: CompiledWorkflow, sites: readonly string[]): Promise<void> {
   expect([...compiled.resumeSites.keys()].sort()).toStrictEqual([...sites].sort());
-  const reports = await verifyWorkflow(compiled, { timeoutMs: 120_000 });
+  const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000 });
   const budget = compiled.budget ? BUDGET : [];
   const expected = ['closed', 'cancel', ...sites.flatMap((s) => [`resume@${s}`, `resume@${s}+cancel`])].flatMap((segment) =>
     (segment.endsWith('cancel') ? CANCEL : CLOSED).concat(budget).map((p) => `${segment}/${p}`),
@@ -455,7 +453,7 @@ describe('branch resume: every site is proven as its own segment, with and witho
       return { ...result, transitions };
     };
     const compiled = compile(wf(branch('route', step('email'), step('sms'))), { gadgets: { branch: mutant } });
-    const reports = await verifyWorkflow(compiled, { timeoutMs: 120_000 });
+    const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000 });
     for (const r of reports) proofLines.push(`mutant replay-0 drops arrival: ${describeReport(r)}`);
     const verdict = (key: string) => reports.find((r) => `${segmentLabel(r.segment)}/${r.property}` === key)!.result.verdict.type;
     expect(verdict('closed/deadlockFree')).toBe('proven');

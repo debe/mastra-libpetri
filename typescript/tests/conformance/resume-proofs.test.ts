@@ -11,7 +11,6 @@ import {
   segmentLabel,
   segmentsFor,
   suspensionCoverageViolations,
-  thresholdOnlyViolations,
   verifyWorkflow,
 } from '../../src/verify/index.js';
 import { BUDGETS, engineConfig, ITERATION_BOUND, Recorder, RESUME_FIXTURES, type ResumeFixture } from '../fixtures/mastra-workflows.js';
@@ -29,12 +28,8 @@ import { BUDGETS, engineConfig, ITERATION_BOUND, Recorder, RESUME_FIXTURES, type
 /** One net per distinct shape: the falsy fixtures share one. */
 const SHAPES: readonly ResumeFixture[] = [...new Map(RESUME_FIXTURES.map((f) => [f.id, f])).values()];
 
-/**
- * A `.foreach()` shape (two or three lanes) is a large shape: as in `tests/verify/foreach.test.ts`
- * and `foreach-resume.test.ts`, its proofs run only with `SLOW_PROOFS=1`, with the same property
- * set and 600s per query. Without it they are untested here, and the fast lane says so by name.
- */
-const SLOW_LANE = process.env['SLOW_PROOFS'] === '1';
+/** 30 s a query, every shape: a proof that does not close in that is a net to redesign ([ADR 0009]). */
+const BUDGET_MS = 30_000;
 const isForeach = (f: ResumeFixture) => f.id.startsWith('rs-fe-');
 
 function compiledFor(fixture: ResumeFixture, k: number | undefined): CompiledWorkflow {
@@ -47,7 +42,6 @@ const STRUCTURE = [
   ['cancel', cancelStructureViolations],
   ['budget', budgetStructureViolations],
   ['resumeGate', resumeGateViolations],
-  ['thresholdOnly', thresholdOnlyViolations],
   ['suspensionCoverage', suspensionCoverageViolations],
   ['resumeTiming', resumeTimingViolations],
 ] as const;
@@ -55,7 +49,7 @@ const STRUCTURE = [
 for (const k of BUDGETS) {
   describe(`the resume corpus' nets, proven at k = ${k ?? 'unbounded'}`, () => {
     for (const fixture of SHAPES.filter(isForeach)) {
-      it(`${fixture.id}: sites ${fixture.sites.join(', ')} registered, every structural check clean (fast lane)`, () => {
+      it(`${fixture.id}: sites ${fixture.sites.join(', ')} registered, every structural check clean`, () => {
         const compiled = compiledFor(fixture, k);
         expect([...compiled.resumeSites.keys()].sort()).toEqual([...fixture.sites].sort());
         const structure = Object.fromEntries(STRUCTURE.map(([name, check]) => [name, check(compiled)]));
@@ -63,8 +57,7 @@ for (const k of BUDGETS) {
       });
     }
     for (const fixture of SHAPES) {
-      const lane = isForeach(fixture) ? it.runIf(SLOW_LANE) : it;
-      lane(`${fixture.id}: sites ${fixture.sites.join(', ')}${isForeach(fixture) ? ' (SLOW_PROOFS=1)' : ''}`, async () => {
+      it(`${fixture.id}: sites ${fixture.sites.join(', ')}`, async () => {
         const compiled = compiledFor(fixture, k);
         expect(compiled.budget?.k).toBe(k);
         expect([...compiled.resumeSites.keys()].sort()).toEqual([...fixture.sites].sort());
@@ -73,7 +66,7 @@ for (const k of BUDGETS) {
         expect(structure).toEqual(Object.fromEntries(STRUCTURE.map(([name]) => [name, []])));
 
         const t0 = performance.now();
-        const reports = await verifyWorkflow(compiled, { timeoutMs: isForeach(fixture) ? 600_000 : 120_000 });
+        const reports = await verifyWorkflow(compiled, { timeoutMs: BUDGET_MS });
         const ms = performance.now() - t0;
         const routes = reports.map(describeReport).join('\n');
         console.log(`[proof] ${fixture.id} k=${k ?? 'unbounded'} ${ms.toFixed(0)}ms:\n${routes}`);

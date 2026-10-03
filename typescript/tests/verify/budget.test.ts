@@ -30,9 +30,8 @@ import type { CompiledWorkflow, EntryDescription, StepDescription } from '../../
  *
  * `proven` is compared by string, everywhere: `isViolated()` is false for `unknown` too.
  *
- * **Cost.** Everything but `.foreach` proves in well under a second per shape (enumeration or
- * SMT). A two-lane foreach takes ~30-40s per budget on SMT, most of it `deadlockFree`; three lanes
- * run only in the slow lane (`SLOW_PROOFS=1`), as in `foreach.test.ts`.
+ * **Cost.** Every query has a 30 s budget; every shape here, the three-lane foreach included,
+ * settles well inside it (the foreach's net is bounded — [ADR 0009], amended).
  */
 
 const step = (id: string, extra: Partial<Omit<StepDescription, 'kind' | 'id'>> = {}): StepDescription => ({ kind: 'step', id, ...extra });
@@ -59,7 +58,7 @@ const build = (entries: readonly EntryDescription[], concurrency: number, gadget
   compile({ id: 'budget', entries }, { concurrency, ...(gadgets ? { gadgets } : {}) });
 
 /** Structure clean (cancel and budget), then every property of every segment `proven`, resume sites included. */
-async function prove(expect: ExpectStatic, label: string, compiled: CompiledWorkflow, timeoutMs = 300_000): Promise<void> {
+async function prove(expect: ExpectStatic, label: string, compiled: CompiledWorkflow, timeoutMs = 30_000): Promise<void> {
   expect(cancelStructureViolations(compiled)).toEqual([]);
   expect(budgetStructureViolations(compiled)).toEqual([]);
   const reports = await verifyWorkflow(compiled, { timeoutMs });
@@ -74,7 +73,7 @@ async function prove(expect: ExpectStatic, label: string, compiled: CompiledWork
  * check refuses once it is wired into `verifyWorkflow`; each test asserts that check itself.
  */
 async function verdicts(label: string, compiled: CompiledWorkflow): Promise<Record<string, string>> {
-  const reports = await verifyWorkflow(compiled, { timeoutMs: 120_000, structure: 'skip' });
+  const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000, structure: 'skip' });
   proofLog(`[budget mutant ${label}] ${reports.map(describeReport).join('; ')}`);
   return Object.fromEntries(reports.map((r) => [keyOf(r), r.result.verdict.type]));
 }
@@ -121,7 +120,6 @@ describe.concurrent('every gadget shape is proven under a budget (both segments,
 });
 
 const foreach = (c: number, body: StepDescription = step('body')): EntryDescription => ({ kind: 'foreach', id: 'items', body, concurrency: c });
-const SLOW_LANE = process.env['SLOW_PROOFS'] === '1';
 
 describe.concurrent('foreach under a budget (both segments, all properties)', () => {
   for (const k of [1, 2]) {
@@ -133,12 +131,12 @@ describe.concurrent('foreach under a budget (both segments, all properties)', ()
   }
 });
 
-describe.runIf(SLOW_LANE).concurrent('SLOW LANE (SLOW_PROOFS=1): foreach c=3 under a budget, 600s per query', () => {
+describe.concurrent('foreach c=3 under a budget (every segment, all properties)', () => {
   for (const k of [1, 2]) {
-    it(`k=${k}: foreach c=3`, { timeout: 11 * 600_000 + 60_000 }, async ({ expect }) => {
+    it(`k=${k}: foreach c=3`, { timeout: 600_000 }, async ({ expect }) => {
       const compiled = build([foreach(3)], k);
       expect(permitConsumers(compiled)).toHaveLength(3);
-      await prove(expect, `k=${k} foreach c=3`, compiled, 600_000);
+      await prove(expect, `k=${k} foreach c=3`, compiled, 30_000);
     });
   }
 });
@@ -261,20 +259,17 @@ describe.concurrent('non-vacuity: mutants of the step gadget', () => {
     expect(v['cancel/permitsBounded']).toBe('violated');
   });
 
-  it('a branch naming the permit twice is ONE permit to every proof ([IO-016]); only the structure sees it', async ({ expect }) => {
-    // Why the structural check exists. The analyses deposit one token per named place of a branch,
-    // so `and(outcome, permits, permits)` proves exactly like the intact net — every property of
-    // both segments, same initial markings — while the arcs say the branch mints a permit.
-    const compiled = build([step('a'), step('b')], 1, {
-      step: mutantStep('a', (t, permits) => rebuild(t, { output: withBranch(t, 0, (b) => and(b, outPlace(permits))) })),
-    });
-    expect(budgetStructureViolations(compiled)).toEqual([
-      "'t.0.a.run' branch 0 (s.1.b.in + wf.permits×2) returns 2 permits; every branch returns exactly one",
-    ]);
-    const reports = await verifyWorkflow(compiled, { timeoutMs: 120_000, structure: 'skip' });
-    proofLog(`[budget mutant double-named] ${reports.map(describeReport).join('; ')}`);
-    expect(reports.map(keyOf)).toEqual(keysFor(compiled));
-    for (const r of reports) expect(r.result.verdict.type, describeReport(r)).toBe('proven');
+  it('a branch naming the permit twice cannot be built ([IO-011], libpetri 8.0.0)', ({ expect }) => {
+    // Through libpetri 7.0.0, `and(outcome, permits, permits)` built and proved exactly like the
+    // intact net — the analyses read one token per named place — and only
+    // `budgetStructureViolations`' multiset walk saw the minted permit. 8.0.0 refuses the spec when
+    // the transition is built, so the mutant no longer exists to be missed; the walk stays as a
+    // second line, and this pins the first.
+    expect(() =>
+      build([step('a'), step('b')], 1, {
+        step: mutantStep('a', (t, permits) => rebuild(t, { output: withBranch(t, 0, (b) => and(b, outPlace(permits))) })),
+      }),
+    ).toThrow(/names place 'wf\.permits' twice in one AND branch/);
   });
 });
 
@@ -316,8 +311,9 @@ describe('budgetStructureViolations: each rule', () => {
     expect(budgetStructureViolations(withIn(exactly(2, permits)))).toEqual(["'t.0.a.run' consumes the permits with exactly(2); a step takes exactly one"]);
     expect(budgetStructureViolations(withIn(all(permits)))).toEqual(["'t.0.a.run' consumes the permits with all(); a step takes exactly one"]);
     expect(budgetStructureViolations(withIn(exactly(1, permits)))).toEqual([]);
-    const twice = edited(onRun('t.0.a.run', (t) => rebuild(t, { inputs: [...t.inputSpecs, one(permits)] })));
-    expect(budgetStructureViolations(twice)).toEqual(["'t.0.a.run' has 2 input arcs on the permits; a step takes exactly one"]);
+    // A second arc on the permits is refused when the transition is built ([CORE-030], libpetri
+    // 8.0.0), before any net exists to check; the rule's own line stays for a net built otherwise.
+    expect(() => edited(onRun('t.0.a.run', (t) => rebuild(t, { inputs: [...t.inputSpecs, one(permits)] })))).toThrow(/two input arcs on place 'wf\.permits'/);
   });
 
   it('flags a transition that reads the permits, and one that resets them', () => {

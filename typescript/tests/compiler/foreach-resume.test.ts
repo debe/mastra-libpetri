@@ -172,9 +172,12 @@ describe('foreach resume: structure', () => {
         's.0.items.frame',
         's.0.items.lane0.permit',
         's.0.items.lane1.permit',
-        's.0.items.cursor',
-        's.0.items.results',
-        's.0.items.parked',
+        's.0.items.queue.open',
+        's.0.items.queue.closed',
+        's.0.items.no-fault',
+        's.0.items.no-exit',
+        's.0.items.no-susp',
+        's.0.items.susp',
         'wf.settle.failed',
       ].sort(),
     );
@@ -186,58 +189,43 @@ describe('foreach resume: structure', () => {
     }
   });
 
-  it('parks carried suspensions where no start sees them; unpark joins them only once the cursor is gone and every lane is home', () => {
+  it('a carried suspension raises `susp` and leaves the queue open: only a settle of this segment kills it', () => {
     for (const lanes of [1, 2, 3]) {
       const compiled = build([foreach(lanes)]);
-      const byName = new Map([...compiled.net.transitions].map((t) => [t.name, t]));
-      const unpark = byName.get('t.0.items.unpark')!;
-      const permits = Array.from({ length: lanes }, (_, l) => `s.0.items.lane${l}.permit`);
-      expect(unpark.inputSpecs.map((i) => [i.type, i.place.name])).toStrictEqual([
-        ['all', 's.0.items.parked'],
-        ...permits.map((p) => ['one', p]),
+      const transitions = [...compiled.net.transitions];
+      const gate = transitions.find((t) => t.name === 't.0.items.re-enter')!;
+      // The four reopenings: the queue open or closed, `susp` on (a suspension stays) or off.
+      if (gate.outputSpec?.type !== 'xor') throw new Error('re-enter must decide among reopenings');
+      const branches = gate.outputSpec.children.map((c) => (c.type === 'and' ? c.children.map((x) => (x.type === 'place' ? x.place.name : '?')).filter((n) => /queue|susp/.test(n)).sort().join('+') : c.type === 'place' ? c.place.name : '?'));
+      expect(branches, `lanes=${lanes}`).toStrictEqual([
+        's.0.items.no-susp+s.0.items.queue.open',
+        's.0.items.queue.open+s.0.items.susp',
+        's.0.items.no-susp+s.0.items.queue.closed',
+        's.0.items.queue.closed+s.0.items.susp',
+        'wf.settle.failed',
       ]);
-      expect(unpark.inhibitors.map((a) => a.place.name)).toStrictEqual(['s.0.items.cursor']);
-      expect([...unpark.outputPlaces()].map((p) => p.name).sort()).toStrictEqual(['s.0.items.suspensions', ...permits].sort());
-
-      // Every arc on `parked`, by transition: only the gate produces it, only unpark consumes it,
-      // the success and suspend finishers wait for it to drain, the others clear it.
-      const touching = [...compiled.net.transitions]
-        .map((t) => {
-          const roles = [
-            ...t.inputSpecs.filter((i) => i.place.name === 's.0.items.parked').map((i) => `in:${i.type}`),
-            ...t.inhibitors.filter((a) => a.place.name === 's.0.items.parked').map(() => 'inhibitor'),
-            ...t.resets.filter((a) => a.place.name === 's.0.items.parked').map(() => 'reset'),
-            ...[...t.outputPlaces()].filter((p) => p.name === 's.0.items.parked').map(() => 'out'),
-          ];
-          return roles.length === 0 ? undefined : `${t.name.replace('t.0.items.', '')}=${roles.join('+')}`;
-        })
-        .filter((x) => x !== undefined)
-        .sort();
-      expect(touching, `lanes=${lanes}`).toStrictEqual(
-        [
-          'canceled-empty=reset',
-          'canceled=reset',
-          'exit=reset',
-          'fail=reset',
-          'join-empty=inhibitor',
-          'join=inhibitor',
-          're-enter=out',
-          'suspend=inhibitor',
-          'unpark=in:all',
-        ].sort(),
+      // Who raises `susp`: the gate, and each lane's suspend settle — nothing a start reads.
+      const raising = transitions.filter((t) => [...t.outputPlaces()].some((p) => p.name === 's.0.items.susp')).map((t) => t.name.replace('t.0.items.', '')).sort();
+      expect(raising, `lanes=${lanes}`).toStrictEqual(
+        ['re-enter', ...Array.from({ length: lanes }, (_, l) => ['', '.queue-closed', '.again', '.queue-closed.again'].map((v) => `lane${l}.suspend${v}`)).flat()].sort(),
       );
+      for (const t of transitions.filter((x) => /\.lane\d+\.start$/.test(x.name))) {
+        expect([...t.inputSpecs, ...t.reads, ...t.inhibitors].some((a) => /susp/.test(a.place.name)), t.name).toBe(false);
+      }
     }
   });
 
-  it('adds a constant number of inhibitor arcs per foreach, whatever the lane count — none O(lanes²)', () => {
+  it('inhibitors: one per lane start, a constant number otherwise — none between lanes', () => {
     const inhibitors = (lanes: number): number =>
       [...build([foreach(lanes)]).net.transitions].reduce((n, t) => n + t.inhibitors.length, 0);
-    // Before M4, a foreach's inhibitors were: split 1; per lane, start.l's signal plus 4 per other
-    // lane; join 5 + 1 (empty) + 5; fail 1; exit 2; suspend 3; plus the top-level settle's own.
-    // Resume adds re-enter (signal), unpark (cursor), and `parked` on join, join-empty and suspend.
-    const added = (lanes: number): number => inhibitors(lanes) - (1 + lanes * (1 + 4 * (lanes - 1)) + 11 + 1 + 2 + 3);
-    const baseline = added(1);
-    for (const lanes of [2, 3, 4, 8]) expect(added(lanes), `lanes=${lanes}`).toBe(baseline);
+    // Every inhibitor is on the signal: split, each start, re-enter, and the ordinary finishers
+    // (join, fail x4, exit x2, suspend); plus the top-level settle's own. None is on a lane's
+    // outcome or a recorded one: precedence lives in the flags, which every arc takes one at a time.
+    const baseline = inhibitors(1) - 1;
+    for (const lanes of [2, 3, 4, 8]) expect(inhibitors(lanes) - lanes, `lanes=${lanes}`).toBe(baseline);
+    for (const t of build([foreach(3)]).net.transitions) {
+      for (const a of t.inhibitors) expect(a.place.name, t.name).toBe('wf.cancel');
+    }
   });
 });
 

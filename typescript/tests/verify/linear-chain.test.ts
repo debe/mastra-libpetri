@@ -193,7 +193,7 @@ describe('fixed sleeps around every gadget, proved', () => {
     const description: WorkflowDescription = { id: 'sleepy', entries: [nap('before'), entry, nap('after')] };
     expect(cancelStructureViolations(compile(description))).toEqual([]);
     const compiled = compile(description);
-    const reports = await verifyWorkflow(compiled, { timeoutMs: 300_000 });
+    const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000 });
     expect(reports.map(keyOf)).toEqual(allReports(compiled));
     for (const report of reports) expect(report.result.verdict.type, describeReport(report)).toBe('proven');
   });

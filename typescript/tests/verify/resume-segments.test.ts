@@ -4,9 +4,7 @@ import {
   PetriNet,
   Transition,
   and,
-  atLeast,
   delayed,
-  exactly,
   one,
   outPlace,
   place,
@@ -25,7 +23,6 @@ import {
   segmentLabel,
   segmentsFor,
   suspensionCoverageViolations,
-  thresholdOnlyViolations,
   verifyWorkflow,
   type PropertyReport,
   type Segment,
@@ -203,7 +200,7 @@ describe('segments', () => {
   });
 
   it('the property set: neverCanceled only without a cancel; the report names segment, marking and route', async () => {
-    const reports = await verifyWorkflow(compile(wf(step('a')), { concurrency: 1 }), { timeoutMs: 60_000 });
+    const reports = await verifyWorkflow(compile(wf(step('a')), { concurrency: 1 }), { timeoutMs: 30_000 });
     expect(reports.map((r) => `${r.segment}/${r.property}`)).toEqual([
       'closed/deadlockFree', 'closed/terminatesAtSink', 'closed/exactlyOneTerminal', 'closed/neverCanceled',
       'closed/permitsBounded', 'closed/permitsReturned',
@@ -240,12 +237,11 @@ const cleanShapes: ReadonlyArray<readonly [string, WorkflowDescription]> = [
   ['a foreach', wf(foreach('each', step('x')))],
 ];
 
-describe('negative controls: every compiled shape passes all four checks', () => {
+describe('negative controls: every compiled shape passes all three checks', () => {
   it.each(cleanShapes)('%s', (_label, description) => {
     for (const k of [undefined, 1, 2]) {
       const c = compile(description, k === undefined ? {} : { concurrency: k });
       expect(resumeGateViolations(c), `gate k=${k}`).toEqual([]);
-      expect(thresholdOnlyViolations(c), `threshold k=${k}`).toEqual([]);
       expect(suspensionCoverageViolations(c), `coverage k=${k}`).toEqual([]);
       expect(resumeTimingViolations(c), `timing k=${k}`).toEqual([]);
     }
@@ -329,7 +325,7 @@ describe('resumeGateViolations', () => {
 
     // What the check is for: with it skipped, the mutant's own segments are proven, every property.
     const segments = [resumeSegment('1.0', false), resumeSegment('1.0', true)];
-    const reports = await verifyWorkflow(mutant, { segments, structure: 'skip', timeoutMs: 60_000 });
+    const reports = await verifyWorkflow(mutant, { segments, structure: 'skip', timeoutMs: 30_000 });
     for (const r of reports) proofLog(`rule-6 mutant ${describeReport(r)}`);
     expect(reports.map((r) => `${segmentLabel(r.segment)}/${r.property}`)).toStrictEqual(
       segmentsFor(mutant, { segments }).flatMap((seg) =>
@@ -390,57 +386,6 @@ describe('resumeGateViolations', () => {
       "resume site 0 ('s.1-0.x.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
       "resume site 0 ('s.1-0.x.in') is not the input place of the entry at [0]",
     ]);
-  });
-});
-
-describe('thresholdOnlyViolations', () => {
-  const each = compile(wf(foreach('each', step('x'))));
-  const results = [...each.net.places].find((p) => p.name === 's.0.each.results')!;
-  const suspensions = [...each.net.places].find((p) => p.name === 's.0.each.suspensions')!;
-
-  it('the compiled foreach touches results and suspensions only with threshold arcs', () => {
-    expect(results).toBeDefined();
-    expect(suspensions).toBeDefined();
-    expect(thresholdOnlyViolations(each)).toEqual([]);
-  });
-
-  it('flags one() on results — the mutant the proof story names — and verifyWorkflow refuses it', async () => {
-    const join = transitionNamed(each, 't.0.each.join');
-    const mutant = edited(each, (t) =>
-      t.name === join.name ? rebuild(t, { inputs: t.inputSpecs.map((i) => (i.place.name === results.name ? one(results) : i)) }) : t,
-    );
-    expect(thresholdOnlyViolations(mutant)).toEqual([
-      "'t.0.each.join' consumes 's.0.each.results' with one(); a foreach results place takes only all()",
-    ]);
-    await expect(verifyWorkflow(mutant, { resume: 'none', structure: 'check' })).rejects.toThrow(/threshold structure is unsound/);
-  });
-
-  it('flags exactly(n) and atLeast(n > 1) on suspensions; atLeast(1) is a threshold and passes', () => {
-    const extra = (spec: In, name: string) =>
-      Transition.builder(name).inputs(spec).outputs(outPlace(each.terminals.suspended)).action(noop).build();
-    expect(thresholdOnlyViolations(edited(each, undefined, [extra(exactly(1, suspensions), 't.x1'), extra(atLeast(2, suspensions), 't.x2')]))).toEqual([
-      "'t.x1' consumes 's.0.each.suspensions' with exactly(1); a foreach suspensions place takes only all()",
-      "'t.x2' consumes 's.0.each.suspensions' with atLeast(2); a foreach suspensions place takes only all()",
-    ]);
-    expect(thresholdOnlyViolations(edited(each, undefined, [extra(atLeast(1, suspensions), 't.x3')]))).toEqual([]);
-  });
-
-  it("requires a foreach's counting places, and 'parked' once the foreach has a site", () => {
-    const noResults = { ...each, net: PetriNet.builder('w').places(...[...each.net.places].filter((p) => p.name !== results.name)).transitions(...[...each.net.transitions].filter((t) => ![...t.inputSpecs, ...t.resets, ...t.inhibitors].some((a) => a.place.name === results.name) && ![...t.outputPlaces()].some((p) => p.name === results.name))).build() };
-    expect(thresholdOnlyViolations(noResults)).toContain("foreach 'each' at [0] has no 'results' place ('s.0.each.results')");
-    const hasParked = [...each.net.places].some((p) => p.name === 's.0.each.parked');
-    const site: ForeachSite = { kind: 'foreach', path: [0], stepId: 'x', place: place('s.0.each.resume') };
-    const sited = thresholdOnlyViolations(withSites(each, new Map([['0', site]])));
-    expect(sited).toEqual(hasParked ? [] : ["foreach 'each' at [0] has no 'parked' place ('s.0.each.parked')"]);
-  });
-
-  it('flags one() on parked', () => {
-    const parked = place<unknown>('s.0.each.parked');
-    const has = [...each.net.places].some((p) => p.name === parked.name);
-    const unpark = Transition.builder('t.bad-unpark').inputs(one(parked)).outputs(outPlace(each.terminals.suspended)).action(noop).build();
-    expect(thresholdOnlyViolations(edited(each, undefined, [unpark], has ? [] : [parked]))).toContain(
-      "'t.bad-unpark' consumes 's.0.each.parked' with one(); a foreach parked place takes only all()",
-    );
   });
 });
 
@@ -573,16 +518,15 @@ describe('every resume site of every shape, proven at k in {1, 2, unbounded}', (
   for (const [label, description, sites] of proofShapes) {
     for (const k of KS) {
       it.concurrent(`${label}, ${kLabel(k)}`, async () => {
-        await proveAll(`${label}, ${kLabel(k)}`, description, k, sites, 120_000);
+        await proveAll(`${label}, ${kLabel(k)}`, description, k, sites, 30_000);
       }, 600_000);
     }
   }
 });
 
-/** The slow lane: larger shapes, 600s per query. Opt in with `SLOW_PROOFS=1`. */
-const SLOW_LANE = process.env['SLOW_PROOFS'] === '1';
-
-describe.runIf(SLOW_LANE).concurrent('SLOW LANE (SLOW_PROOFS=1): larger shapes, every site, 600s per query', () => {
+// One at a time: each proof is a few seconds alone, and twelve of them at once beside the rest of
+// the suite starve the solver past its 30 s — which reads as `unknown`, not as a slow proof.
+describe('larger shapes, every site, 30 s per query', () => {
   const slowShapes: ReadonlyArray<readonly [string, WorkflowDescription, readonly string[]]> = [
     ['parallel n=4, every arm retrying twice with a timed delay', wf(fan('fan', ['a', 'b', 'c', 'd'].map((id) => step(id, { retries: 2, retryDelayMs: 5 })))), ['0.0', '0.1', '0.2', '0.3']],
     ['branch k=3, every arm retrying once', wf(branch('br', ['a', 'b', 'c'].map((id) => step(id, { retries: 1 })))), ['0.0', '0.1', '0.2']],
@@ -595,7 +539,7 @@ describe.runIf(SLOW_LANE).concurrent('SLOW LANE (SLOW_PROOFS=1): larger shapes, 
   for (const [label, description, sites] of slowShapes) {
     for (const k of [...KS, 4]) {
       it(`${label}, ${kLabel(k)}`, async () => {
-        await proveAll(`${label}, ${kLabel(k)}`, description, k, sites, 600_000);
+        await proveAll(`${label}, ${kLabel(k)}`, description, k, sites, 30_000);
       }, 3_600_000);
     }
   }
@@ -620,7 +564,7 @@ describe('non-vacuity: the resume segments discriminate', () => {
     const reports = await verifyWorkflow(mutant, {
       structure: 'skip',
       segments: [resumeSegment('0.1', false), resumeSegment('0.1', true)],
-      timeoutMs: 120_000,
+      timeoutMs: 30_000,
     });
     // Without a cancel the gate always fires: the sweep's absence is invisible.
     for (const p of ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', 'neverCanceled']) {
@@ -649,13 +593,13 @@ describe('non-vacuity: the resume segments discriminate', () => {
         ? rebuild(t, { output: xor(outPlace(arrived), outPlace(suspSeen), and(outPlace(arrived), outPlace(errSeen))) })
         : t,
     );
-    const reports = await verifyWorkflow(mutant, { segments: [resumeSegment('0.0', false), resumeSegment('0.1', false)], timeoutMs: 120_000 });
+    const reports = await verifyWorkflow(mutant, { segments: [resumeSegment('0.0', false), resumeSegment('0.1', false)], timeoutMs: 30_000 });
     for (const site of ['0.0', '0.1']) {
       expect(verdictOf(reports, `resume@${site}/deadlockFree`), site).toBe('violated');
       expect(verdictOf(reports, `resume@${site}/exactlyOneTerminal`), site).toBe('violated');
     }
     // The fresh segments never reach `replay-2`: only a resume segment can see this defect.
-    const fresh = await verifyWorkflow(mutant, { resume: 'none', timeoutMs: 120_000 });
+    const fresh = await verifyWorkflow(mutant, { resume: 'none', timeoutMs: 30_000 });
     for (const r of fresh) expect(r.result.verdict.type, describeReport(r)).toBe('proven');
   }, 300_000);
 

@@ -48,7 +48,7 @@
     "bench": "vitest bench --run"
   },
   "dependencies": {
-    "libpetri": "^7.0.0"
+    "libpetri": "^8.0.0"
   },
   "devDependencies": {
     "@mastra/core": "^1.67.0",

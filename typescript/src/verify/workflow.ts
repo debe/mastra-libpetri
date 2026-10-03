@@ -1,6 +1,7 @@
 import { availableParallelism } from 'node:os';
 import {
   SmtVerifier,
+  StateSpaceCache,
   Z3Unavailable,
   mutualExclusion,
   placeBound,
@@ -45,15 +46,6 @@ import {
  */
 export type Family = 'completion' | 'bounds' | 'exclusion' | 'liveness';
 
-/** The quick phase's budget per query. Its verdict is kept only when it settles the claim. */
-const QUICK_MS = 5_000;
-
-/**
- * A completion proof that enumerated within this is a segment small enough to enumerate every
- * claim in: the quick phase is skipped there. Only speed turns on it, never a verdict.
- */
-const CHEAP_ENUMERATION_MS = 250;
-
 export const FAMILIES: readonly Family[] = ['completion', 'bounds', 'exclusion', 'liveness'];
 
 export interface WorkflowVerifyOptions extends VerifyOptions {
@@ -61,6 +53,12 @@ export interface WorkflowVerifyOptions extends VerifyOptions {
   readonly families?: readonly Family[];
   /** Queries run at once. Each is a z3 process or an in-process enumeration. Default: half the cores. */
   readonly jobs?: number;
+  /**
+   * Re-ask a proof that came back `unknown` once more assuming atomic firing
+   * (`assumeAtomicFiring(true)`), and attach the answer as `assumingAtomic` ([ADR 0009], amended
+   * on the libpetri 8.0.0 upgrade). It never makes a claim hold. Default: true.
+   */
+  readonly atomicFallback?: boolean;
 }
 
 /**
@@ -82,6 +80,20 @@ export interface ClaimReport {
   readonly marking: string;
   readonly result: SmtVerificationResult;
   readonly holds: boolean;
+  /**
+   * Present only on a `proof` whose `result` is `unknown`: the same query under libpetri's opt-out
+   * that reads every firing as one step (`assumeAtomicFiring(true)`). Since libpetri 8.0.0 the
+   * verifier splits a firing whose outputs another transition tests into a start and a completion
+   * ([VER-004]), as the executor runs it, and some proofs no longer close in budget on the split net.
+   * A `proven` here is the weaker claim — it holds of every run in which no such firing is
+   * overtaken while in flight — and never makes the claim hold.
+   */
+  readonly assumingAtomic?: SmtVerificationResult;
+}
+
+/** The claim is `unknown` under in-flight firing and `proven` assuming atomic firing. */
+export function provenOnlyAssumingAtomic(claim: ClaimReport): boolean {
+  return claim.result.verdict.type === 'unknown' && claim.assumingAtomic?.verdict.type === 'proven';
 }
 
 export interface VerificationReport {
@@ -131,46 +143,36 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
 
   const t = compiled.terminals;
   const sinks: Place<unknown>[] = [t.done, t.failed, t.bailed, t.suspended, t.paused, t.canceled, compiled.cancel, ...(compiled.budget ? [compiled.budget.permits] : [])];
-  const query = (segment: Segment, property: SmtProperty, phase: 'quick' | 'full' | 'state-equation'): Promise<SmtVerificationResult> => {
+  // One state-space cache per call ([VER-017]): the graph depends only on the net and the initial
+  // marking, so a segment's is built once and every claim on it reuses it — or, when it outgrew the
+  // budget, goes straight to the solver pipeline, whose linear bound ([VER-015]) settles most claims
+  // in milliseconds. Every query lists its marking from `segmentInitialMarking`, in the same order
+  // and with the net's own places, which is what the cache keys on.
+  const cache = new StateSpaceCache();
+  const query = (segment: Segment, property: SmtProperty, phase: 'plain' | 'state-equation' | 'atomic' | 'atomic-state-equation'): Promise<SmtVerificationResult> => {
     const initial = segmentInitialMarking(compiled, segment);
-    const verifier = SmtVerifier.forNet(compiled.net)
+    let verifier = SmtVerifier.forNet(compiled.net)
       .initialMarking((m) => {
         for (const [p, n] of initial) m.tokens(p, n);
       })
       .sinkPlaces(...sinks)
       .semiflowInvariants(true)
+      .stateSpaceCache(cache)
+      .timeout(timeout)
       .property(property);
-    // The quick phase skips the enumeration route, which libpetri tries first and which declines
-    // only after exhausting its class budget — seconds per query on a wide net, where the linear
-    // bound of [VER-015] settles most of these claims in milliseconds.
-    if (phase === 'quick') return verifier.enumerationMaxClasses(0).timeout(Math.min(timeout, QUICK_MS)).verify();
-    // [VER-016]'s firing counters: what closes a foreach's completion proofs at five lanes, which
-    // time out without them. Opt-in in libpetri because it slows a violated query's witness search,
-    // so it is asked only of a completion proof that came back `unknown`.
-    if (phase === 'state-equation') return verifier.stateEquation(true).timeout(timeout).verify();
-    return verifier.timeout(timeout).verify();
+    // [VER-016]'s firing counters: opt-in in libpetri because they slow a violated query's witness
+    // search, so asked only of a completion proof that came back `unknown`.
+    if (phase === 'state-equation' || phase === 'atomic-state-equation') verifier = verifier.stateEquation(true);
+    if (phase === 'atomic' || phase === 'atomic-state-equation') verifier = verifier.assumeAtomicFiring(true);
+    return verifier.verify();
   };
   const settles = (kind: 'proof' | 'witness', result: SmtVerificationResult): boolean =>
     kind === 'proof' ? result.verdict.type === 'proven' : result.verdict.type === 'violated' && result.counterexampleConfirmed === true;
-  /**
-   * The quick phase's answer stands only when it settles the claim — a `proven`, or a confirmed
-   * witness, is sound however short its budget. Anything else is asked again in full, so the
-   * verdict a claim reports never depends on the quick phase's timeout, only its speed does.
-   */
-  const decide = async (job: { readonly kind: 'proof' | 'witness'; readonly segment: Segment; readonly smt: SmtProperty }): Promise<SmtVerificationResult> => {
-    // A segment whose completion proofs enumerated cheaply has a small state space, which
-    // enumeration settles faster than any solver: ask in full straight away.
-    if (enumerates.has(segmentLabel(job.segment))) return query(job.segment, job.smt, 'full');
-    const quick = await query(job.segment, job.smt, 'quick');
-    return settles(job.kind, quick) ? quick : query(job.segment, job.smt, 'full');
-  };
 
   const claims: ClaimReport[] = [];
   const width = options.jobs ?? Math.max(1, Math.floor(availableParallelism() / 2));
   const markings = new Map(segments.map((s) => [segmentLabel(s), describeMarking(segmentInitialMarking(compiled, s))]));
   const markingOf = (segment: Segment): string => markings.get(segmentLabel(segment)) ?? describeMarking(segmentInitialMarking(compiled, segment));
-  /** Segments whose completion proofs enumerated cheaply — the route hint `decide` reads. */
-  const enumerates = new Set<string>();
 
   // The structural checks, which the other families stand on too: `segments: []` runs them and no
   // query. Completion is then asked here rather than through `verifyWorkflow`'s sequential loop —
@@ -179,7 +181,7 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
   if (families.includes('completion')) {
     const asked = segments.flatMap((segment) => completionProperties(compiled, segment).map(([property, smt]) => ({ segment, property, smt })));
     const answers = await pool(asked, width, async ({ segment, smt }) => {
-      const first = await query(segment, smt, 'full');
+      const first = await query(segment, smt, 'plain');
       if (first.verdict.type !== 'unknown') return first;
       const retried = await query(segment, smt, 'state-equation');
       // A retry that settles nothing keeps the first answer: it is the one the options asked for.
@@ -188,9 +190,6 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
     asked.forEach(({ segment, property }, i) => {
       const result = answers[i]!;
       claims.push({ family: 'completion', kind: 'proof', property, segment, marking: markingOf(segment), result, holds: result.verdict.type === 'proven' });
-      // Enumeration first only where it was cheap: `parallel-wide` enumerates too, at 3 s a query,
-      // and asking 5,183 claims that way took 44 min against 149 s through the quick phase.
-      if (result.route === 'enumeration' && result.elapsedMs <= CHEAP_ENUMERATION_MS) enumerates.add(segmentLabel(segment));
     });
   }
 
@@ -218,12 +217,33 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
     }
   }
 
-  const results = await pool(jobs, width, decide);
+  const results = await pool(jobs, width, (job) => query(job.segment, job.smt, 'plain'));
   jobs.forEach((job, i) => {
     const result = results[i]!;
     const holds = settles(job.kind, result);
     claims.push({ family: job.family, kind: job.kind, property: job.property, segment: job.segment, marking: markingOf(job.segment), result, holds });
   });
+
+  // The labelled fallback: a proof the split net could not decide, asked again assuming atomic
+  // firing. Attached, never counted — `holds` is already false for every one of them.
+  if (options.atomicFallback !== false) {
+    const undecided = claims.map((c, i) => [c, i] as const).filter(([c]) => c.kind === 'proof' && c.result.verdict.type === 'unknown');
+    const smtOf = (c: ClaimReport): SmtProperty | undefined =>
+      c.family === 'completion' ? completionProperties(compiled, c.segment).find(([name]) => name === c.property)?.[1]
+      : jobs.find((j) => j.property === c.property && segmentLabel(j.segment) === segmentLabel(c.segment))?.smt;
+    const atomic = await pool(undecided, width, async ([c]) => {
+      const smt = smtOf(c);
+      if (smt === undefined) return undefined;
+      const first = await query(c.segment, smt, 'atomic');
+      // As for completion above: a five-lane foreach's atomic `deadlockFree` closes only with
+      // [VER-016] counters (346 s on libpetri 7.0.0).
+      return first.verdict.type === 'unknown' ? query(c.segment, smt, 'atomic-state-equation') : first;
+    });
+    undecided.forEach(([c, i], n) => {
+      const answer = atomic[n];
+      if (answer !== undefined) claims[i] = { ...c, assumingAtomic: answer };
+    });
+  }
 
   return {
     workflow: compiled.net.name,
@@ -268,5 +288,7 @@ export function describeClaim(claim: ClaimReport): string {
     : claim.result.verdict.type === 'proven' ? ' (the step is proven dead)'
     : claim.result.verdict.type === 'violated' ? ' (a run was found but not confirmed)'
     : ' (no witness found)';
-  return `${claim.holds ? 'holds' : 'FAILS'} ${claim.family}: ${line}${reading}`;
+  const atomic = claim.assumingAtomic === undefined ? ''
+    : ` [assuming atomic firing: ${claim.assumingAtomic.verdict.type} via ${claim.assumingAtomic.route} in ${claim.assumingAtomic.elapsedMs}ms]`;
+  return `${claim.holds ? 'holds' : 'FAILS'} ${claim.family}: ${line}${reading}${atomic}`;
 }

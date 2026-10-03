@@ -170,7 +170,7 @@ describe('compile: entry sites', () => {
     );
     expect([...composite.resumeSites.keys()].sort()).toStrictEqual(['0', '2', '3']);
     expect(cancelStructureViolations(composite)).toStrictEqual([]);
-    const reports = await verifyWorkflow(composite, { timeoutMs: 120_000 });
+    const reports = await verifyWorkflow(composite, { timeoutMs: 30_000 });
     const key = (r: PropertyReport) => `${String(r.segment)}/${r.property}`;
     const props = (segment: string, cancel: boolean) => [
       `${segment}/deadlockFree`, `${segment}/terminatesAtSink`, `${segment}/exactlyOneTerminal`,

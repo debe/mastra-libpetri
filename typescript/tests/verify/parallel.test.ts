@@ -34,7 +34,7 @@ const verify = (
   description: WorkflowDescription,
   gadget: Gadget = parallelGadget,
   segments?: readonly Segment[],
-) => verifyWorkflow(build(description, gadget), { timeoutMs: 120_000, ...(segments ? { segments } : {}) });
+) => verifyWorkflow(build(description, gadget), { timeoutMs: 30_000, ...(segments ? { segments } : {}) });
 
 /** The property set `verifyWorkflow` proves in a segment with no cancel arriving, and in one with. */
 const UNCANCELED = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', 'neverCanceled'] as const;
@@ -358,7 +358,7 @@ describe('compiled parallel, cancellation non-vacuity', () => {
         `'${name}' competes with sweep '${sweepName}' for [s.1.fan.in] without an inhibitor on '${mutant.cancel.name}'`,
       ]);
       // And the default proof refuses the net before proving anything about it.
-      await expect(verifyWorkflow(mutant, { timeoutMs: 120_000 })).rejects.toThrow(`'${name}' competes with sweep`);
+      await expect(verifyWorkflow(mutant, { timeoutMs: 30_000 })).rejects.toThrow(`'${name}' competes with sweep`);
     }, 60_000);
   }
 });

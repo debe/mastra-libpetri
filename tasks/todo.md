@@ -423,7 +423,9 @@
       120,972 claims, every one holding** — completion 4,410, bounds 25,840, exclusion 90,300,
       liveness 422; routes enumeration 71,572, structural 41,674, smt 7,726. Shards 66/66 in 91 min
       and 66/66 in 134 min; the longest workflow `emit-step-events-off` (a timed foreach) at 18 min,
-      `foreach-c5` 13 min, `parallel-wide` 10.5 min. Fast lane alone: 154 passed, 28 skipped, 87 s
+      `foreach-c5` 13 min, `parallel-wide` 10.5 min. Fast lane alone: 154 passed, 28 skipped, 87 s.
+      *Superseded on the libpetri 8.0.0 upgrade (U13):* one lane, every workflow in `npm test`,
+      30 s a query, no CI matrix — see U13 for the figures
 - [x] Final integration: `npm run check` exit 0; `npm run build` exit 0; `npm test` "Test Files 64
       passed (64)", "Tests 2477 passed | 63 skipped (2540)" in 1,141 s. CI's `typescript` job timeout
       raised 20 -> 45 min for the fast lane; the `proofs` matrix has not run on GitHub — the repo is
@@ -536,7 +538,7 @@ bump not yet run):
       token left beside a terminal. The drain-on-terminal watcher stays. `executionScope` pinning is
       moot while no compiled net uses `freshName`
 
-- [ ] U10 — a caller-owned `StateSpaceCache` for the [VER-017] enumeration route, raised from M6's
+- [x] U10 — a caller-owned `StateSpaceCache` (shipped in 8.0.0; adopted with U13) for the [VER-017] enumeration route, raised from M6's
       cost finding (enumeration tried before the linear bound, 3–5 s a query on `parallel-wide`):
       the state-class graph built once per net and marking, a truncation remembered, verdicts
       unchanged. In progress upstream in all four languages (temporal-terminal-places-refactor,
@@ -552,7 +554,7 @@ bump not yet run):
       do not apply: reaping touches only `deadline`/`window`, and our nets use `delayed` and
       immediate only; libpetri will say first if that widens
 
-- [ ] U12 — libpetri-87 round 2 (2026-09-29, uncommitted and unreleased). Item 1, the VER-004
+- [x] U12 — libpetri-87 round 2 (2026-09-29, uncommitted and unreleased). Item 1, the VER-004
       in-flight split: a transition is split into start → `inflight:t` → `complete:t` when another
       transition tests one of its OUTPUT places by inhibitor, reset, `all()` or `atLeast()`
       (`exactly` does not count). In our nets that is `t.cancel.arrive`, every foreach lane's step
@@ -575,11 +577,45 @@ bump not yet run):
       this would leave residue beside a terminal. The window is narrow and untested; no executor
       repro yet. Split vs atomic cost (closed segment): c1 deadlockFree 86 s vs 5.7 s; c5
       neverCanceled 90 s vs 4 s; the rest 1.5–2x; no unknowns
-- [ ] **Foreach cursor revived by an in-flight start** (found by U12): remove a cursor that
-      coexists with a recorded outcome — a sweep that reads faults/exits/suspensions and consumes
-      the cursor — and have the fail/exit/suspend finishers reset it. Otherwise a revived cursor
-      also blocks `unpark` (it needs no cursor) and so the suspend finisher on a resumed foreach.
-      Needs an executor repro first, and must re-prove under the split
+- [x] **Foreach cursor revived by an in-flight start** (found by U12; fixed with U13): every lane
+      `start` is also inhibited by `faults` / `exits` / `suspensions`; the `fail` / `exit` /
+      `suspend` finishers reset the cursor; `unpark-killed` joins carried suspensions beside a
+      recorded one. The TypeScript executor did not show it in 2,400 runs (2/3/5 lanes, the failure
+      synchronous or after a tick); libpetri's model covers executors that interleave more. The
+      cursor/record exclusion claims are withdrawn; a mutant shows the start inhibitors are what keep
+      `faults` <= lanes
+
+- [x] U13 — **libpetri 8.0.0** (released 2026-09-30), taken after M6. Breaking for us: the
+      in-flight split ([VER-004]); `And(P, P)` and a second input arc on one place refused at build
+      (two budget tests pin the refusal). Not applicable: deadline reaping, ν mint declarations,
+      `Bounded(k)` premises, timeout forwards. The old foreach became unprovable on the split net
+      (2 lanes `unknown` at 900 s); rebuilt rather than given a bigger budget — see the entry below.
+      `verify` attaches an `assumingAtomic` answer to an `unknown` proof, never counting it; the gate
+      admits no exception. The quick phase is retired for 8.0.0's `StateSpaceCache` (closes U10);
+      the slow lanes and the CI `proofs` matrix are gone; every proof budget in the suite is 30 s.
+      **Figures, libpetri 8.0.0 from npm (not linked), z3 on PATH, 10 cores:** corpus gate — 132
+      cases (66 workflows x 2 budgets) + 8 nested, **124,388 claims, every one holding** under
+      in-flight firing, no exception admitted; routes enumeration 95,080, structural 28,440, smt 868;
+      769 s for the whole corpus, slowest `parallel-wide` k=1 102 s, `foreach-c5` 72 s, `foreach-c3`
+      1.1 s (63 min before the redesign). `npm run check` exit 0; `npm run build` exit 0; `npm test`
+      "Test Files 64 passed (64)", "Tests 2514 passed (2514)" — nothing skipped — in 832 s (19 min on
+      7.0.0 with the slow lanes skipped)
+- [x] **Foreach redesigned for the split** (2026-10-03, from libpetri-66's suggestions; the user's
+      rule: a proof that does not close in 30 s means redesign). Results and recorded outcomes ride
+      the frame as data; recorded kinds are complement pairs (`no-fault`/`fault`, `no-exit`/`exit`,
+      `no-susp`/`susp`) taken one token at a time; the queue is `queue.open`/`queue.closed`, taken
+      by a non-success settle (waiting for an in-flight start, so no revival); every place 1-bounded,
+      no settle split, `unpark`, `join-empty`, `canceled-empty` and `thresholdOnlyViolations` gone.
+      Fail-fast proven again: `mutualExclusion(queue.open, fault | exit)` in every segment. Measured
+      on libpetri 8.0.0 (npm), closed + cancel + resume segments, completion set, 30 s budget: 1 lane
+      slowest query 6 ms, 2 lanes 29 ms, 3 lanes 0.4 s, 5 lanes 7.9 s — all proven (was `unknown` at
+      900 s from 2 lanes). Gadget suites: verify/foreach 38 tests in 75 s, verify/foreach-resume 15 in
+      5 s. Behaviour unchanged: every engine and Mastra-level test green; the window between an
+      outcome and its settle is closed by priority at run time, as before by inhibitors
+- [ ] `tests/mastra/events.test.ts` "concurrency 3 … progress per item": the differential's oracle
+      (Mastra's own engine) settled items out of the delays' designed order once under load ~20+
+      (2026-10-03), ours in it; 3/3 green at normal load. The 3 ms / 10 ms / 13 ms / 25 ms spacing
+      is too tight for a loaded machine — widen it rather than retry
 
 **Not pursued, deliberately:**
 

@@ -1,4 +1,4 @@
-import { Transition, all, and, one, outPlace, place, xor, type Out, type Place } from 'libpetri';
+import { Transition, and, one, outPlace, place, xor, type Out, type Place, type TransitionContext } from 'libpetri';
 import { scopeOf, type RunScope } from '../scope.js';
 import type {
   BailToken,
@@ -19,11 +19,11 @@ import { HostPreconditionError } from './leaf.js';
 import type { Gadget } from './types.js';
 
 /**
- * The undispatched tail of the input — Mastra's fastq queue.
+ * The undispatched tail of the input — Mastra's fastq queue, the colour of `queue.open`.
  *
  * One token, consumed and re-emitted by whichever lane starts the next item, so items *start* in
- * input order because there is only ever one cursor, not because anything iterates. Removing it
- * is `queue.kill()`: nothing queued can start again.
+ * input order because there is only ever one cursor, not because anything iterates. A settle taking
+ * it and leaving `queue.closed` is `queue.kill()`: nothing queued can start again.
  */
 interface ForeachCursor {
   readonly items: readonly unknown[];
@@ -66,6 +66,29 @@ interface ForeachFrame {
   readonly base?: readonly unknown[];
   /** Every item settled in this segment, latest first — each one's `foreachOutput` entry. */
   readonly settled?: Settled;
+  /** Every item that succeeded, latest first — the `results` array's cells. */
+  readonly results?: Cell<ForeachResult>;
+  /** Every failure recorded, latest first: the earliest is Mastra's `errorResult`. */
+  readonly faults?: Cell<FaultRecord>;
+  /** Every bail or pause recorded, latest first: the earliest is Mastra's `exitResult`. */
+  readonly exits?: Cell<ExitRecord>;
+  /** Every suspension — recorded in this segment, or carried by a resume — latest first. */
+  readonly suspensions?: Cell<SuspensionRecord>;
+}
+
+/** A list cell: the frame is re-emitted by every settle, and consing is O(1) where copying is not. */
+interface Cell<T> {
+  readonly value: T;
+  readonly prev: Cell<T> | undefined;
+}
+
+const cons = <T>(list: Cell<T> | undefined, value: T): Cell<T> => ({ value, prev: list });
+
+/** The list's values, earliest first. */
+function listOf<T>(list: Cell<T> | undefined): T[] {
+  const out: T[] = [];
+  for (let c = list; c !== undefined; c = c.prev) out.push(c.value);
+  return out.reverse();
 }
 
 /**
@@ -133,12 +156,6 @@ interface SuspensionRecord {
  */
 export const MAX_FOREACH_LANES = 256;
 
-/**
- * The most lanes at which a foreach claims its record bounds ([ADR 0009]); see the claim itself.
- * A measured limit of the solver, not of the net.
- */
-export const MAX_PROVEN_RECORD_LANES = 2;
-
 /** The largest item count that is still an array length; past it, `results[k]` stops being an index. */
 const MAX_ITEMS = 2 ** 32 - 1;
 
@@ -148,33 +165,29 @@ const MAX_ITEMS = 2 ** 32 - 1;
  * any item does not succeed, or the run is canceled**.
  *
  * ```text
- *   sweep          in, ?cancel                 -> exits.canceled                        (given a signal)
- *   split          in              ¬cancel     -> xor( frame + cursor + permit.* | frame + permit.* [no items] | exits.failed )
- *   start.l        cursor, permit.l ¬cancel    -> xor( body.l + slot.l + cursor | body.l + slot.l )
- *                  inhibited by every *other* lane's failed/bailed/suspended/paused
- *   refuse.l       cursor, permit.l ?cancel    -> permit.l                              (given a signal)
- *   (body.l)       body.l                      -> done.l | failed.l | bailed.l | suspended.l | paused.l
- *   collect.l      done.l, slot.l, frame              -> results + permit.l + frame
- *   fail.l         failed.l, slot.l, frame,    reset(cursor) -> faults + permit.l + frame
- *   bail.l         bailed.l, slot.l, frame,    reset(cursor) -> exits + permit.l + frame
- *   pause.l        paused.l, slot.l, frame,    reset(cursor) -> exits + permit.l + frame
- *   suspend.l      suspended.l, slot.l, frame, reset(cursor) -> suspensions + permit.l + frame
+ *   sweep        in, ?cancel                  -> exits.canceled                               (given a signal)
+ *   split        in              ¬cancel      -> xor( open(queue.open) | open(queue.closed) [no items] | exits.failed )
+ *                                                open(q) = frame + q + no-fault + no-exit + no-susp + permit.*
+ *   start.l      queue.open, permit.l ¬cancel -> xor( body.l + slot.l + queue.open | body.l + slot.l + queue.closed )
+ *   refuse.l     queue.open, permit.l ?cancel -> queue.closed + permit.l                      (given a signal)
+ *   (body.l)     body.l                       -> done.l | failed.l | bailed.l | suspended.l | paused.l
+ *   collect.l    done.l, slot.l, frame        -> frame + permit.l                     (the result onto the frame)
+ *   K.l          K-outcome.l, slot.l, frame, queue.{open|closed}, {no-|}flag(K)
+ *                                             -> frame + permit.l + queue.closed + flag(K)    (priority 1)
+ *                for K in fail -> fault, bail -> exit, pause -> exit, suspend -> susp; four variants each
  *
- *   join     all(results), frame, permit.*  ¬cancel ¬cursor ¬faults ¬exits ¬suspensions ¬parked -> next
- *   join-empty           frame, permit.*    ¬cancel ¬cursor ¬faults ¬exits ¬suspensions ¬parked ¬results -> next
- *   fail     all(faults), frame, permit.*   ¬cancel reset(exits, suspensions, results, parked)  -> exits.failed
- *   exit     all(exits), frame, permit.*    ¬cancel ¬faults reset(suspensions, results, parked) -> exits.bailed | exits.paused
- *   suspend  all(suspensions), frame, permit.* ¬cancel ¬faults ¬exits ¬parked reset(results)   -> exits.suspended
- *   cancel   all(results), frame, permit.*  ?cancel reset(cursor, faults, exits, suspensions, parked) -> exits.canceled
- *   cancel-empty        frame, permit.*     ?cancel ¬results reset(cursor, faults, exits, suspensions, parked) -> exits.canceled
+ *   join         queue.closed, frame, permit.*, no-fault, no-exit, no-susp     ¬cancel -> next
+ *   fail.*       queue.closed, frame, permit.*, fault, {no-}exit, {no-}susp    ¬cancel -> exits.failed
+ *   exit.*       queue.closed, frame, permit.*, no-fault, exit, {no-}susp      ¬cancel -> exits.bailed | exits.paused
+ *   suspend      queue.closed, frame, permit.*, no-fault, no-exit, susp        ¬cancel -> exits.suspended
+ *   canceled.*   queue.closed, frame, permit.*, {no-}fault, {no-}exit, {no-}susp ?cancel -> exits.canceled
  *
  *   resume ([ADR 0007]; a top-level foreach only, marked only by a resume seed):
- *   re-enter.cancel  resume, ?cancel        -> exits.canceled                              (not started)
- *   re-enter         resume  ¬cancel        -> xor( frame + permit.* [+ cursor] [+ results] [+ parked]  (all 8)
- *                                                 | exits.failed [a seed that does not fit] )
- *   unpark   all(parked), permit.*  ¬cursor -> suspensions + permit.*
+ *   re-enter.cancel  resume, ?cancel  -> exits.canceled                                       (not started)
+ *   re-enter         resume  ¬cancel  -> xor( open(queue.{open|closed}) with susp on or off (4) | exits.failed )
  * ```
- * (`¬` an inhibitor arc, `?` a read arc; the arcs on `cancel` exist only given a signal.)
+ * (`¬` an inhibitor arc, `?` a read arc; the arcs on `cancel` exist only given a signal. Every
+ * other arc takes one token.)
  *
  * **What Mastra does** (`executeForeach`, `handlers/control-flow.ts:952-1495`). Every item is
  * pushed onto a `fastq` queue of width `concurrency` (`:1225`, `:1228-1272`); fastq starts the
@@ -192,31 +205,32 @@ const MAX_ITEMS = 2 ** 32 - 1;
  * failure, bail or suspension. Both return `status: 'canceled'` with `output: results` — the same
  * array the workers fill, so it holds every success that finished **before the drain**, in-flight
  * ones included, at its input index, with holes. Here: `split` and every `start.l` are inhibited
- * by the signal, and each lane's `refuse.l` reads it and consumes the cursor — the worker's
- * `killQueue()` — handing the permit back; the body is **not** gated,
- * because Mastra never checks between an item's start and its end; the four ordinary finishers are
- * inhibited by it and the two cancel finishers read it, so exactly one decides. The cancel
- * finishers wait, like every finisher, for every permit — in-flight items finish first — and put
- * the partial array on `exits.canceled`. The foreach's input place has a sweep: that is Mastra's
- * check before the entry (`default.ts:815`), where the foreach never starts at all.
+ * by the signal, and each lane's `refuse.l` reads it and closes the queue — the worker's
+ * `killQueue()` — handing the permit back; the body is **not** gated, because Mastra never checks
+ * between an item's start and its end; the ordinary finishers are inhibited by it and the cancel
+ * finishers read it, so exactly one decides. The cancel finishers wait, like every finisher, for
+ * every permit and the closed queue — in-flight items finish first — and put the partial array on
+ * `exits.canceled`. The foreach's input place has a sweep: that is Mastra's check before the entry
+ * (`default.ts:815`), where the foreach never starts at all.
  *
- * **The stop is structural, in two halves.**
+ * **The stop is the queue token.** A non-success settle *takes* the queue — open or already closed
+ * — and puts back a closed one: that is `queue.kill()`, and `start.l` needs the open queue, so no
+ * item starts afterwards. It is race-free under in-flight firing ([VER-004]): a sibling `start` in
+ * flight holds the queue token, so the settle waits for it to come back rather than resetting an
+ * empty place the start would then refill — the revival libpetri 8.0.0's verifier found in an
+ * earlier version of this gadget, which the TypeScript executor never showed in 2,400 runs. The
+ * claim is a marking property again: `mutualExclusion(queue.open, fault | exit)`, proven in every
+ * segment. Between an item's outcome and its settle there is a window: the settle carries
+ * priority 1 over every `start` (0), so at run time it fires the instant the outcome lands
+ * ([EXEC-002]); Mastra has the same window — it awaits a progress publish (`:1126`, `:1129`,
+ * `:1135`) before `killQueue()` — and the priority-blind verifier explores it.
  *
- * - *Once an outcome is recorded*, the cursor is gone: every non-success settle carries a reset
- *   arc on it, which is `queue.kill()` — the undispatched tail is dropped in the same firing that
- *   records the outcome ([EXEC-013]: resets drain during the firing, before the action). `start.l`
- *   needs the cursor, so no item can start afterwards. The verifier checks this as
- *   `mutualExclusion(cursor, faults | exits | suspensions)`.
- * - *Between an item's outcome and its settle*, every `start.m` is inhibited by the four
- *   non-success places of every other lane, so the stop takes effect the instant the body's
- *   action writes its outcome, not one firing later. (A lane's own outcome needs no arc: while it
- *   is pending the lane holds its slot, not its permit. Leaving those `4c` redundant arcs out is
- *   not cosmetic: at three lanes they took `DeadlockFree` from 8s to 189s, measured against the
- *   linked libpetri tree at `808171c`, not a release.) Mastra has a window
- *   here — it awaits a progress-event publish (`:1126`, `:1129`, `:1135`) before `killQueue()`, and
- *   a sibling finishing in that await releases a queued item — which we close rather than
- *   reproduce: it is a race, not a behaviour anyone can rely on. This half is by construction, not
- *   by a marking property: a marking cannot say which of two firings came first.
+ * **Why no inhibitors and no drains.** Every result and recorded outcome rides the frame as data,
+ * and what has been recorded is a complement pair per kind (`no-fault` / `fault`, …), so every
+ * place holds at most one token and every arc takes one. Under libpetri 8.0.0 a transition whose
+ * outputs another transition tests by an inhibitor, reset or drain is verified as a start and a
+ * completion; none of the settles is, and the net is bounded, so its proofs enumerate or settle in
+ * seconds ([ADR 0009], amended).
  *
  * **Why lanes, not one body and N permits.** An anonymous permit cannot say *which* body is free,
  * so a result could not be paired with its slot once completion order differs from dispatch
@@ -234,16 +248,16 @@ const MAX_ITEMS = 2 ** 32 - 1;
  * both proves that no item is still running — so no outcome can arrive after the decision — and
  * clears the lanes that never started.
  *
- * **Which outcome is reported** — each an explicit Mastra rule, each a transition, the precedence
- * enforced by inhibitors and resets rather than by a choice inside one action:
+ * **Which outcome is reported** — each an explicit Mastra rule, each a finisher, the precedence in
+ * which flags it accepts rather than in a choice inside one action:
  *
- * - *Canceled beats everything* (`:1283-1312` run before the error check), as above.
+ * - *Canceled beats everything* (`:1283-1312` run before the error check), as above: the cancel
+ *   finishers accept every combination of flags.
  * - *Failure beats the rest, first in time.* `if (!errorResult) errorResult = result`
- *   (`:1130`, `:1210`) keeps the first failure to settle, not the lowest index. `all(faults)`
- *   hands the action every recorded failure in arrival order ([CORE-013] FIFO), and the head is
- *   taken. (`.parallel()` differs: it reports the lowest arm index.) The failure token is
- *   forwarded whole, so a `tripwire` and a `nonRetryable` both survive (`:1360-1369` spreads the
- *   item's own result).
+ *   (`:1130`, `:1210`) keeps the first failure to settle, not the lowest index. The frame lists
+ *   failures in settle order, and the earliest is taken. (`.parallel()` differs: it reports the
+ *   lowest arm index.) The failure token is forwarded whole, so a `tripwire` and a `nonRetryable`
+ *   both survive (`:1360-1369` spreads the item's own result).
  * - *Then a bail or a pause, first in time*: `if (!exitResult) exitResult = result` (`:1136`),
  *   and the foreach returns that result as its own (`:1406`). A bail therefore ends the run as a
  *   success carrying the bail output; the array is never produced.
@@ -251,9 +265,7 @@ const MAX_ITEMS = 2 ** 32 - 1;
  *   (`foreachIndexObj[k]`, `:1119-1124`) and `Object.keys(...)[0]` is its **lowest** key
  *   (`:1411-1412`), whatever order they suspended in.
  *
- * Losers are reset, not stranded: a higher-precedence finisher resets the lower-precedence
- * records, and every non-success finisher resets `results` — Mastra returns no array in those
- * cases either (the cancel finishers consume `results` instead: the partial array is theirs).
+ * Every finisher takes one token of each flag, so nothing is left behind whichever decides.
  *
  * **The run-scoped step results.** The body's leaf records each item's outcome under the body id
  * as the item settles, exactly as Mastra's `Object.assign(stepResults, ...)` does (`:1179`).
@@ -292,13 +304,13 @@ const MAX_ITEMS = 2 ** 32 - 1;
  * host holds; the gadget writes none. On a resume, `stepInfo` is the stored aggregate's.
  *
  * **Resume** ([ADR 0007], `:1227-1272`). A top-level foreach is a resume site. One
- * `ForeachResume` token re-enters it: `re-enter` re-opens the frame and every permit and emits
- * whichever of the cursor (the queue, the resumed items flagged), `results` (the items that
- * succeeded, reused) and `parked` (the suspensions this segment does not re-run) the seed has. A
- * parked suspension inhibits no `start` — Mastra's `killQueue()` fires only for this segment's
- * outcomes — and joins `suspensions` through `unpark` once nothing can start and every lane is
- * home, so `mutualExclusion(cursor, suspensions)` still holds; `join` and `suspend` wait for it,
- * the other finishers clear it.
+ * `ForeachResume` token re-enters it: `re-enter` re-opens the frame — carrying the items that
+ * succeeded (reused) and the suspensions this segment does not re-run — every permit, the queue
+ * (open over the items still to run, the resumed ones flagged, or closed), and `susp` on exactly
+ * when a suspension stays. A carried suspension raises the flag but kills no queue — only a settle
+ * of this segment takes the queue, as Mastra's `killQueue()` fires only for this segment's
+ * outcomes — and the suspend finisher reports the lowest index across both, as Mastra's one
+ * `foreachIndexObj` does.
  * - *canceled*: `{...stepInfo, status: 'canceled', output: results, endedAt}` (`:1164-1169`,
  *   `:1298-1312`) — the foreach's payload and start, the partial array. A `canceled` record is a
  *   combinator's alone: it is a `StepRecord`, never a `StepOutcome`. `endedAt` is the drain's;
@@ -318,10 +330,10 @@ const MAX_ITEMS = 2 ** 32 - 1;
  * Here the streams are already disjoint — one lane, one item, one slot — and a combinator cannot
  * contain a combinator, so no second group is ever live over these places.
  *
- * **What is not bounded.** `results` grows with the input, which is data the model cannot see, so
- * `start.l`'s "more items" branch is value-blind and a proof covers every item count at once. The
- * three outcome records are each bounded by the lane count: once one exists no item starts, and
- * each lane holds at most one item.
+ * **Everything is bounded.** The input's length is data the model cannot see, so `start.l`'s
+ * "more items" branch is value-blind and a proof covers every item count at once — but no place
+ * grows with it: results and recorded outcomes ride the frame, and every place holds at most one
+ * token, so no bound is claimed above 1 and nothing is left unclaimed.
  */
 export const foreachGadget: Gadget = (entry, next, ctx) => {
   if (entry.kind !== 'foreach') throw new Error(`foreachGadget received a '${entry.kind}' entry`);
@@ -343,18 +355,27 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
   const t = (role: string): string => names.entryTransition(path, entry.id, role);
 
   const inPlace = place<FlowToken>(names.entryIn(path, entry.id));
-  const frame = place<ForeachFrame>(p('frame'));
-  const cursor = place<ForeachCursor>(p('cursor'));
-  const results = place<ForeachResult>(p('results'));
-  const faults = place<FaultRecord>(p('faults'));
-  const exited = place<ExitRecord>(p('exits'));
-  const suspensions = place<SuspensionRecord>(p('suspensions'));
   /**
-   * A resume's carried suspensions — items suspended before this segment that it does not re-run
-   * (`:1242-1250`). Unlike `suspensions` they inhibit no `start`: Mastra's `killQueue()` fires only
-   * for an outcome of this segment, never for a carried one. Marked only by `re-enter`.
+   * The foreach's one data token, from `split` to its finisher: everything the aggregate is built
+   * from rides here — results, recorded outcomes, carried suspensions — so the net holds at most one
+   * token per place, and every settle, which consumes and re-emits it, is ordered by it.
    */
-  const parked = place<SuspensionRecord>(p('parked'));
+  const frame = place<ForeachFrame>(p('frame'));
+  /** Items remain to start: the cursor over them — Mastra's fastq queue. */
+  const queueOpen = place<ForeachCursor>(p('queue.open'));
+  /** No item will start again: the queue ran out, or a non-success settle killed it. */
+  const queueClosed = place<null>(p('queue.closed'));
+  /**
+   * What has been recorded, as complement pairs — exactly one place of each marked from `split` to
+   * the finisher. A settle moves its kind's token to `on`; the finishers' arcs on them encode
+   * Mastra's precedence. Every arc on them takes one token, so no settle has an output another
+   * transition tests by inhibitor, reset or drain, and none is split under [VER-004].
+   */
+  const flag = (kind: string) => ({ off: place<null>(p(`no-${kind}`)), on: place<null>(p(kind)) });
+  const fault = flag('fault');
+  const exit = flag('exit');
+  /** A recorded suspension — this segment's, or one a resume carries. */
+  const susp = flag('susp');
   /** The resume site: one {@link ForeachResume}, marked only by a resume seed ([ADR 0007]). */
   const resume = place<ForeachResume>(p('resume'));
 
@@ -395,9 +416,8 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
     });
   }
 
-  /** A lane's non-success outcome places: its item has finished badly and is not yet recorded. */
-  const pending = (l: Lane): Place<unknown>[] => [l.out.failed, l.out.bailed, l.out.suspended, l.out.paused];
   const everyPermit = laneList.map((l) => one(l.permit));
+  const permitsBack = laneList.map((l) => outPlace(l.permit));
   /** What the canceled token names: the step the foreach runs, at the foreach's path. */
   const origin = { stepId: bodyId, path: viewPath };
 
@@ -425,35 +445,46 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
     );
   }
 
+  /** The foreach opened: the frame, the queue, every flag off but `susp` as given, every permit. */
+  const opened = (queue: 'open' | 'closed', suspended: boolean): Out =>
+    and(
+      outPlace(frame),
+      outPlace(queue === 'open' ? queueOpen : queueClosed),
+      outPlace(fault.off),
+      outPlace(exit.off),
+      outPlace(suspended ? susp.on : susp.off),
+      ...permitsBack,
+    );
+  const emitOpened = (tctx: TransitionContext, f: ForeachFrame, cursor: ForeachCursor | undefined, suspended: boolean): void => {
+    tctx.output(frame, f);
+    if (cursor === undefined) tctx.output(queueClosed, null);
+    else tctx.output(queueOpen, cursor);
+    tctx.output(fault.off, null);
+    tctx.output(exit.off, null);
+    tctx.output(suspended ? susp.on : susp.off, null);
+    for (const l of laneList) tctx.output(l.permit, null);
+  };
+
   /**
-   * Opens the foreach: seeds the frame, the cursor **and** every permit in one firing, so no
-   * marking exists with permits and no cursor (outputs of a firing land together, [EXEC-001]).
+   * Opens the foreach: seeds the frame, the queue, the flags **and** every permit in one firing,
+   * so no marking exists with permits and no queue (outputs of a firing land together, [EXEC-001]).
    *
    * Three declared branches for three outcomes: items to run; no items at all; and an input
    * Mastra cannot iterate either (see {@link itemsOf}), where Mastra's `execute()` rejects and we
    * fail the run.
    *
-   * **No items still opens the foreach** — frame and permits, no cursor — and a finisher decides
-   * it, exactly as the non-empty case is decided (row 49). Mastra enqueues nothing (`:1228`), skips
-   * the wait (`:1276`) and still runs its check after the drain (`:1298-1312`) before it returns
-   * `[]` (`:1486-1494`): an abort that lands anywhere between the check before the entry
-   * (`default.ts:815`) and that check — while `executeForeach` awaits its span and its
-   * `workflow-step-start` publish (`:998-1027`), or while it reads `prevOutput.length` (`:1053`) —
-   * makes an empty foreach `canceled` with `output: []`, not `success []`. Deciding it here, inside
-   * this firing, would give that window no marking to land in. Opened, the empty foreach is
-   * decided by `join-empty` (¬cancel) or `canceled-empty` (?cancel), the same pair of arcs that
-   * decides every other foreach — no action ever reads the signal.
+   * **No items still opens the foreach** — with the queue closed — and a finisher decides it,
+   * exactly as the non-empty case is decided (row 49). Mastra enqueues nothing (`:1228`), skips the
+   * wait (`:1276`) and still runs its check after the drain (`:1298-1312`) before it returns `[]`
+   * (`:1486-1494`): an abort that lands anywhere between the check before the entry
+   * (`default.ts:815`) and that check makes an empty foreach `canceled` with `output: []`, not
+   * `success []`. Opened, the empty foreach is decided by `join` (¬cancel) or a `canceled`
+   * finisher (?cancel), the arcs that decide every other foreach — no action reads the signal.
    */
   transitions.push(
     unlessCanceled(Transition.builder(t('split')))
       .inputs(one(inPlace))
-      .outputs(
-        xor(
-          and(outPlace(frame), outPlace(cursor), ...laneList.map((l) => outPlace(l.permit))),
-          and(outPlace(frame), ...laneList.map((l) => outPlace(l.permit))),
-          outPlace(exits.failed),
-        ),
-      )
+      .outputs(xor(opened('open', false), opened('closed', false), outPlace(exits.failed)))
       .action(async (tctx) => {
         const incoming = tctx.input(inPlace);
         const scope = scopeOf(tctx);
@@ -494,10 +525,7 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
           tctx.output(exits.failed, { stepId: bodyId, path: viewPath, error });
           return;
         }
-        tctx.output(frame, { input: incoming.data, startedAt });
-        // No items: no cursor, so no lane can start and `join-empty` / `canceled-empty` decide.
-        if (items.length > 0) tctx.output(cursor, { items, next: 0 });
-        for (const l of laneList) tctx.output(l.permit, null);
+        emitOpened(tctx, { input: incoming.data, startedAt }, items.length > 0 ? { items, next: 0 } : undefined, false);
       })
       .build(),
   );
@@ -518,19 +546,18 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
     settled: { index, record, prev: f.settled },
   });
 
-  // Settles are declared before starts. Nothing depends on it — the inhibitors close the window
-  // structurally — but it keeps the executor's tie-break ([EXEC-002]) pointing the same way.
   laneList.forEach((l, lane) => {
     /**
      * A success: places the output at the index the leaf carried through, and returns the permit,
      * in one firing — so no marking has the lane idle and its result missing, which is what lets
-     * `join` read "every permit is back" as "every result is in". The frame passes through, taking
-     * the item's `foreachOutput` entry, as Mastra's worker writes `prevForeachOutput[k]` (`:1198`).
+     * a finisher read "every permit is back" as "every result is in". The frame takes the result
+     * and the item's `foreachOutput` entry, as Mastra's worker writes `results[k]` and
+     * `prevForeachOutput[k]` (`:1189-1198`).
      */
     transitions.push(
       Transition.builder(t(`lane${lane}.collect`))
         .inputs(one(l.done), one(l.slot), one(frame))
-        .outputs(and(outPlace(results), outPlace(l.permit), outPlace(frame)))
+        .outputs(and(outPlace(frame), outPlace(l.permit)))
         .action(async (tctx) => {
           const produced = tctx.input(l.done);
           const s = tctx.input(l.slot);
@@ -545,60 +572,81 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
             endedAt: scope.epochNow(),
             metadata: { foreachIndex: index },
           }));
-          tctx.output(results, { index, value: produced.data });
+          const withResult: ForeachFrame = { ...f, results: cons(f.results, { index, value: produced.data }) };
+          tctx.output(frame, settleInto(withResult, index, record));
           tctx.output(l.permit, null);
-          tctx.output(frame, settleInto(f, index, record));
         })
         .build(),
     );
 
-    /** One non-success settle: records the outcome, kills the queue, frees the lane. */
+    /**
+     * One non-success settle: records the outcome on the frame, kills the queue, raises its kind's
+     * flag, frees the lane. Four variants — the queue open or already closed, the flag off or
+     * already on — because each arc takes one token: no reset, no inhibitor, no drain, so the settle
+     * is never split ([VER-004]). Taking the queue token is the kill, and it is race-free: a
+     * sibling's `start` in flight holds the queue, and the settle waits for it to come back rather
+     * than resetting an empty place and letting the start revive it.
+     *
+     * Priority 1, above every `start` (0): when an item's outcome lands while the queue is open and
+     * a lane is idle, the executor kills the queue before it starts another item ([EXEC-002]).
+     * Mastra has a window here — it awaits a progress-event publish (`:1126`, `:1129`, `:1135`)
+     * before `killQueue()`, and a sibling finishing in that await releases a queued item. The
+     * verifier, which ignores priority, explores that window too; nothing it proves depends on it.
+     */
     const settle = <T extends { readonly foreachIndex?: number }, R>(
       role: string,
       from: Place<T>,
-      into: Place<R>,
+      kind: { readonly off: Place<null>; readonly on: Place<null> },
       status: StepRecord['status'],
+      append: (f: ForeachFrame, recorded: R) => ForeachFrame,
       record: (token: T, item: ItemFrame, entry: StepRecord) => R,
       entryOf: (token: T, item: ItemFrame) => StepRecord,
-    ) =>
-      Transition.builder(t(`lane${lane}.${role}`))
-        .inputs(one(from), one(l.slot), one(frame))
-        .reset(cursor)
-        .outputs(and(outPlace(into), outPlace(l.permit), outPlace(frame)))
-        .action(async (tctx) => {
-          const arrived = tctx.input(from);
-          const s = tctx.input(l.slot);
-          const f = tctx.input(frame);
-          const scope = scopeOf(tctx);
-          // The item as the step validated it, when the runner said: Mastra's aggregate record
-          // for a deciding item takes that item's own payload (`handlers/step.ts:173`).
-          // ... and that item's own start, `handlers/step.ts:166,174`, which `{...finalErrorResult}`
-          // and `return exitResult` hand on unchanged (`:1360-1369`, `:1406`; row 49). The slot's
-          // stamp is the *dispatch*, which a run budget ([ADR 0006]) can hold apart from the
-          // item's first attempt; it stands in only while the leaf does not report the start.
-          // The start is the aggregate record's alone, so it goes no further than this settle.
-          const { stepStartedAt: reported, ...rest } = arrived as T & { stepStartedAt?: unknown };
-          const refused = hostRefusal(rest);
-          const token = (refused === undefined ? rest : { ...rest, error: refused.cause }) as unknown as T;
-          const item = 'stepPayload' in (token as object) ? (token as { stepPayload?: unknown }).stepPayload : s.item;
-          const startedAt = typeof reported === 'number' ? reported : s.startedAt;
-          const frameOf: ItemFrame = { item, startedAt, endedAt: scope.epochNow() };
-          const index = token.foreachIndex;
-          // The item's own record — the leaf's, or rebuilt from the token — decided once: its
-          // `foreachOutput` entry and, should this item decide the foreach, the aggregate. A host
-          // refusal wrote no record: Mastra's worker catches the throw as `thrownResult`
-          // (`handlers/control-flow.ts:1200-1217`) — the error, no payload, stamped now.
-          const entryRecord =
-            refused !== undefined
-              ? ({ status: 'failed', error: refused.cause, payload: undefined, startedAt: frameOf.endedAt, endedAt: frameOf.endedAt, ...(index === undefined ? {} : { metadata: { foreachIndex: index } }) } as StepRecord)
-              : index === undefined
-                ? entryOf(token, frameOf)
-                : itemRecordOf(scope, index, status, () => entryOf(token, frameOf));
-          tctx.output(into, record(token, frameOf, entryRecord));
-          tctx.output(l.permit, null);
-          tctx.output(frame, index === undefined ? f : settleInto(f, index, entryRecord));
-        })
-        .build();
+    ): Transition[] =>
+      (['open', 'closed'] as const).flatMap((queue) =>
+        ([false, true] as const).map((again) =>
+          Transition.builder(t(`lane${lane}.${role}${queue === 'closed' ? '.queue-closed' : ''}${again ? '.again' : ''}`))
+            .inputs(one(from), one(l.slot), one(frame), one(queue === 'open' ? queueOpen : queueClosed), one(again ? kind.on : kind.off))
+            .outputs(and(outPlace(frame), outPlace(l.permit), outPlace(queueClosed), outPlace(kind.on)))
+            .priority(1)
+            .action(async (tctx) => {
+              const arrived = tctx.input(from);
+              const s = tctx.input(l.slot);
+              const f = tctx.input(frame);
+              tctx.input(queue === 'open' ? queueOpen : queueClosed);
+              tctx.input(again ? kind.on : kind.off);
+              const scope = scopeOf(tctx);
+              // The item as the step validated it, when the runner said: Mastra's aggregate record
+              // for a deciding item takes that item's own payload (`handlers/step.ts:173`) — and that
+              // item's own start, `handlers/step.ts:166,174`, which `{...finalErrorResult}` and
+              // `return exitResult` hand on unchanged (`:1360-1369`, `:1406`; row 49). The slot's
+              // stamp is the *dispatch*, which a run budget ([ADR 0006]) can hold apart from the
+              // item's first attempt; it stands in only while the leaf does not report the start.
+              const { stepStartedAt: reported, ...rest } = arrived as T & { stepStartedAt?: unknown };
+              const refused = hostRefusal(rest);
+              const token = (refused === undefined ? rest : { ...rest, error: refused.cause }) as unknown as T;
+              const item = 'stepPayload' in (token as object) ? (token as { stepPayload?: unknown }).stepPayload : s.item;
+              const startedAt = typeof reported === 'number' ? reported : s.startedAt;
+              const frameOf: ItemFrame = { item, startedAt, endedAt: scope.epochNow() };
+              const index = token.foreachIndex;
+              // The item's own record — the leaf's, or rebuilt from the token — decided once: its
+              // `foreachOutput` entry and, should this item decide the foreach, the aggregate. A host
+              // refusal wrote no record: Mastra's worker catches the throw as `thrownResult`
+              // (`handlers/control-flow.ts:1200-1217`) — the error, no payload, stamped now.
+              const entryRecord =
+                refused !== undefined
+                  ? ({ status: 'failed', error: refused.cause, payload: undefined, startedAt: frameOf.endedAt, endedAt: frameOf.endedAt, ...(index === undefined ? {} : { metadata: { foreachIndex: index } }) } as StepRecord)
+                  : index === undefined
+                    ? entryOf(token, frameOf)
+                    : itemRecordOf(scope, index, status, () => entryOf(token, frameOf));
+              const recorded = append(f, record(token, frameOf, entryRecord));
+              tctx.output(frame, index === undefined ? recorded : settleInto(recorded, index, entryRecord));
+              tctx.output(l.permit, null);
+              tctx.output(queueClosed, null);
+              tctx.output(kind.on, null);
+            })
+            .build(),
+        ),
+      );
 
     /** The fields every rebuilt item entry shares: the item's input, start and index. */
     const itemBase = (item: ItemFrame, foreachIndex: number | undefined) => ({
@@ -607,11 +655,12 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
       ...(foreachIndex === undefined ? {} : { metadata: { foreachIndex } }),
     });
     transitions.push(
-      settle(
+      ...settle(
         'fail',
         l.out.failed,
-        faults,
+        fault,
         'failed',
+        (f, r: FaultRecord) => ({ ...f, faults: cons(f.faults, r) }),
         (failure, item, entry): FaultRecord => ({ ...item, failure, entry }),
         (failure, item) => ({
           status: 'failed',
@@ -622,27 +671,30 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
           endedAt: item.endedAt,
         }),
       ),
-      settle(
+      ...settle(
         'bail',
         l.out.bailed,
-        exited,
+        exit,
         'bailed',
+        (f, r: ExitRecord) => ({ ...f, exits: cons(f.exits, r) }),
         (bail, item, entry): ExitRecord => ({ ...item, status: 'bailed', bail, entry }),
         (bail, item) => ({ status: 'bailed', output: bail.output, ...itemBase(item, bail.foreachIndex), endedAt: item.endedAt }),
       ),
-      settle(
+      ...settle(
         'pause',
         l.out.paused,
-        exited,
+        exit,
         'paused',
+        (f, r: ExitRecord) => ({ ...f, exits: cons(f.exits, r) }),
         (pause, item, entry): ExitRecord => ({ ...item, status: 'paused', pause, entry }),
         (pause, item) => ({ status: 'paused', ...itemBase(item, pause.foreachIndex) }),
       ),
-      settle(
+      ...settle(
         'suspend',
         l.out.suspended,
-        suspensions,
+        susp,
         'suspended',
+        (f, r: SuspensionRecord) => ({ ...f, suspensions: cons(f.suspensions, r) }),
         // The item's input and start served its entry; the foreach's own suspension carries neither.
         ({ stepPayload: _payload, ...suspension }): SuspensionRecord => ({ suspension }),
         (suspension, item) => ({
@@ -658,35 +710,37 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
   laneList.forEach((l, lane) => {
     /**
      * Admits the next item into this lane. Competing with the other lanes' `start` for the one
-     * cursor is the whole scheduler: which lane runs an item is the marking's decision, and no
-     * priority is involved. Inhibited by the signal: Mastra's worker checks it before each task
-     * (`:1160`), and that is the only place an item can be stopped.
+     * queue token is the whole scheduler: which lane runs an item is the marking's decision, and
+     * no priority is involved among lanes. Inhibited by the signal: Mastra's worker checks it
+     * before each task (`:1160`), and that is the only place an item can be stopped. Once a
+     * non-success settle has taken the queue, it is closed and no start is enabled.
      *
-     * The `xor` is "more items" versus "this was the last": the last drops the cursor, which is
-     * what eventually lets `join` fire. A value-blind analysis that takes the short branch early
-     * merely dispatches fewer items, which strands nothing.
+     * The `xor` is "more items" versus "this was the last": the last closes the queue, which is
+     * what eventually lets a finisher fire. A value-blind analysis that takes the short branch
+     * early merely dispatches fewer items, which strands nothing.
      *
      * On a resume the cursor carries the queue Mastra built (`:1227-1272`): the head of `order`
      * starts, flagged `resumed` when it is the attempt the resume feeds. The flag is colour only.
      */
     transitions.push(
       unlessCanceled(Transition.builder(t(`lane${lane}.start`)))
-        .inputs(one(cursor), one(l.permit))
-        .inhibitors(...laneList.filter((other) => other !== l).flatMap(pending))
+        .inputs(one(queueOpen), one(l.permit))
         .outputs(
           xor(
-            and(outPlace(l.bodyIn), outPlace(l.slot), outPlace(cursor)),
-            and(outPlace(l.bodyIn), outPlace(l.slot)),
+            and(outPlace(l.bodyIn), outPlace(l.slot), outPlace(queueOpen)),
+            and(outPlace(l.bodyIn), outPlace(l.slot), outPlace(queueClosed)),
           ),
         )
         .action(async (tctx) => {
-          const c = tctx.input(cursor);
+          const c = tctx.input(queueOpen);
+          tctx.input(l.permit);
           const head: CursorItem = c.order === undefined ? { index: c.next } : c.order[c.next]!;
           const item = c.items[head.index];
           tctx.output(l.bodyIn, { data: item, foreachIndex: head.index, ...(head.resumed === true ? { resumed: true as const } : {}) });
           tctx.output(l.slot, { item, startedAt: scopeOf(tctx).epochNow() });
           const length = c.order === undefined ? c.items.length : c.order.length;
-          if (c.next + 1 < length) tctx.output(cursor, { ...c, next: c.next + 1 });
+          if (c.next + 1 < length) tctx.output(queueOpen, { ...c, next: c.next + 1 });
+          else tctx.output(queueClosed, null);
         })
         .build(),
     );
@@ -694,19 +748,20 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
     if (cancel !== undefined) {
       /**
        * Mastra's worker when the signal has fired (`:1160-1172`): it refuses the task, kills the
-       * queue and hands the worker back — `killQueue(); inFlight--; cb(null)`. Here: the cursor
-       * is consumed, so nothing queued can ever start, and the lane's permit is handed straight
-       * back. It is the sweep `start.l` competes with, which is what makes `start.l`'s inhibitor
-       * on the signal checkable from the arcs alone (`cancelStructureViolations`).
+       * queue and hands the worker back — `killQueue(); inFlight--; cb(null)`. Here: the queue
+       * closes, so nothing queued can ever start, and the lane's permit is handed straight back.
+       * It is the sweep `start.l` competes with, which is what makes `start.l`'s inhibitor on the
+       * signal checkable from the arcs alone (`cancelStructureViolations`).
        */
       transitions.push(
         Transition.builder(t(`lane${lane}.refuse`))
-          .inputs(one(cursor), one(l.permit))
+          .inputs(one(queueOpen), one(l.permit))
           .read(cancel)
-          .outputs(outPlace(l.permit))
+          .outputs(and(outPlace(queueClosed), outPlace(l.permit)))
           .action(async (tctx) => {
-            tctx.input(cursor);
+            tctx.input(queueOpen);
             tctx.input(l.permit);
+            tctx.output(queueClosed, null);
             tctx.output(l.permit, null);
           })
           .build(),
@@ -734,42 +789,63 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
   });
 
   /**
-   * Every item that succeeded. Enabled only with nothing left to start (¬cursor), no lane busy (every
-   * permit consumed), nothing recorded against the foreach (¬faults ¬exits ¬suspensions ¬parked)
-   * and no cancel (Mastra's check after the drain, `:1298`). `all(results)` is honest: the domain
-   * really is "take every result", and nothing can add to it while this firing holds every permit.
-   *
-   * Two transitions, as the cancel finishers are, because `all()` needs at least one token:
-   * `join` with results, `join-empty` inhibited by them — the foreach that had no items
-   * (`:1486-1494` with nothing enqueued). Every dispatched item leaves exactly one token in
-   * `results`, `faults`, `exits` or `suspensions`, and only a canceled run refuses one, so
-   * `join-empty` can fire only for a foreach that never dispatched.
+   * A finisher's arcs: the queue closed — nothing can start — every permit — no item still running,
+   * so no outcome can arrive after the decision — the frame, and one token of each flag, which is
+   * where Mastra's precedence lives. `flags` lists, per kind, the states this finisher accepts;
+   * one transition is emitted per combination, each taking its tokens with one arc, and every
+   * combination of flags is decided by exactly one finisher.
    */
-  const joined = (role: string, withResults: boolean): Transition => {
-    const b = unlessCanceled(Transition.builder(t(role)))
-      .inputs(...(withResults ? [all(results)] : []), one(frame), ...everyPermit)
-      .inhibitors(cursor, faults, exited, suspensions, parked)
-      .outputs(outPlace(next));
-    if (!withResults) b.inhibitor(results);
-    return b
-      .action(async (tctx) => {
-        const output = withResults ? assemble(tctx.inputs(results)) : [];
-        const f = tctx.input(frame);
-        const scope = scopeOf(tctx);
-        const record = {
-          ...stepInfo(f),
-          status: 'success',
-          output,
-          endedAt: scope.epochNow(),
-        } as StepRecord;
-        scope.recordStepResult(bodyId, record);
-        const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record });
-        if (observed !== undefined) await observed;
-        tctx.output(next, { data: output });
-      })
-      .build();
+  type FlagState = 'off' | 'on';
+  const flagPlace = (kind: { readonly off: Place<null>; readonly on: Place<null> }, state: FlagState): Place<null> => kind[state];
+  const finisher = (
+    role: string,
+    accepts: { readonly fault: readonly FlagState[]; readonly exit: readonly FlagState[]; readonly susp: readonly FlagState[] },
+    build: (b: ReturnType<typeof Transition.builder>, flags: readonly Place<null>[]) => Transition,
+  ): Transition[] => {
+    const out: Transition[] = [];
+    for (const fs of accepts.fault) for (const es of accepts.exit) for (const ss of accepts.susp) {
+      const flags = [flagPlace(fault, fs), flagPlace(exit, es), flagPlace(susp, ss)];
+      const suffix = [fs === 'on' ? 'f' : '', es === 'on' ? 'e' : '', ss === 'on' ? 's' : ''].join('');
+      const name = accepts.fault.length * accepts.exit.length * accepts.susp.length === 1 ? role : `${role}.${suffix === '' ? 'clean' : suffix}`;
+      out.push(build(Transition.builder(t(name)).inputs(one(queueClosed), one(frame), ...flags.map((f) => one(f)), ...everyPermit), flags));
+    }
+    return out;
   };
-  transitions.push(joined('join', true), joined('join-empty', false));
+  /** Takes the finisher's queue, frame, flags and permits; returns the frame. */
+  const takeAll = (tctx: TransitionContext, flags: readonly Place<null>[]): ForeachFrame => {
+    tctx.input(queueClosed);
+    for (const f of flags) tctx.input(f);
+    for (const l of laneList) tctx.input(l.permit);
+    return tctx.input(frame);
+  };
+
+  /**
+   * Every item succeeded. Enabled only with nothing left to start (the queue closed), no lane busy
+   * (every permit), nothing recorded (every flag off) and no cancel (Mastra's check after the
+   * drain, `:1298`) — the foreach with no items included (`:1486-1494`).
+   */
+  transitions.push(
+    ...finisher('join', { fault: ['off'], exit: ['off'], susp: ['off'] }, (b, flags) =>
+      unlessCanceled(b)
+        .outputs(outPlace(next))
+        .action(async (tctx) => {
+          const f = takeAll(tctx, flags);
+          const output = assemble(listOf(f.results));
+          const scope = scopeOf(tctx);
+          const record = {
+            ...stepInfo(f),
+            status: 'success',
+            output,
+            endedAt: scope.epochNow(),
+          } as StepRecord;
+          scope.recordStepResult(bodyId, record);
+          const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record });
+          if (observed !== undefined) await observed;
+          tctx.output(next, { data: output });
+        })
+        .build(),
+    ),
+  );
 
   /**
    * A failure was recorded: the first in time wins, and outranks every outcome but a cancel.
@@ -777,79 +853,62 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
    * The aggregate is the failing item's own result plus Mastra's `__workflow_meta.foreachOutput`
    * — every item settled so far, succeeded and suspended ones included (`:1355-1369`), which the
    * frame has carried since `split`. Its `resumeLabels` are the run's, which only the host holds.
+   * The frame lists failures in settle order, so the first is the first in time — Mastra's
+   * `if (!errorResult) errorResult = result` (`:1130`, `:1210`).
    */
   transitions.push(
-    unlessCanceled(Transition.builder(t('fail')))
-      .inputs(all(faults), one(frame), ...everyPermit)
-      .resets(exited, suspensions, results, parked)
-      .outputs(outPlace(exits.failed))
-      .action(async (tctx) => {
-        const first = tctx.inputs(faults)[0]!;
-        const f = tctx.input(frame);
-        const { failure } = first;
-        const foreachOutput = foreachOutputOf(f);
-        // The item's own result, as `{...finalErrorResult}` is (`:1360-1370`) — the very record its
-        // `foreachOutput` entry was made from, so the two agree on its payload and start (a
-        // resumed item's payload is the stored aggregate's) — plus Mastra's meta.
-        const { suspendPayload: _none, ...own } = first.entry as StepRecord & { readonly suspendPayload?: unknown };
-        const record = { ...own, suspendPayload: { __workflow_meta: { foreachOutput } } } as StepRecord;
-        const scope = scopeOf(tctx);
-        scope.recordStepResult(bodyId, record);
-        const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record });
-        if (observed !== undefined) await observed;
-        const meta: ForeachMeta = { foreachIndex: failure.foreachIndex ?? 0, foreachOutput: itemRecordsOf(foreachOutput) };
-        tctx.output(exits.failed, { ...failure, foreach: meta });
-      })
-      .build(),
+    ...finisher('fail', { fault: ['on'], exit: ['off', 'on'], susp: ['off', 'on'] }, (b, flags) =>
+      unlessCanceled(b)
+        .outputs(outPlace(exits.failed))
+        .action(async (tctx) => {
+          const f = takeAll(tctx, flags);
+          const first = listOf(f.faults)[0]!;
+          const { failure } = first;
+          const foreachOutput = foreachOutputOf(f);
+          // The item's own result, as `{...finalErrorResult}` is (`:1360-1370`) — the very record its
+          // `foreachOutput` entry was made from, so the two agree on its payload and start (a
+          // resumed item's payload is the stored aggregate's) — plus Mastra's meta.
+          const { suspendPayload: _none, ...own } = first.entry as StepRecord & { readonly suspendPayload?: unknown };
+          const record = { ...own, suspendPayload: { __workflow_meta: { foreachOutput } } } as StepRecord;
+          const scope = scopeOf(tctx);
+          scope.recordStepResult(bodyId, record);
+          const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record });
+          if (observed !== undefined) await observed;
+          const meta: ForeachMeta = { foreachIndex: failure.foreachIndex ?? 0, foreachOutput: itemRecordsOf(foreachOutput) };
+          tctx.output(exits.failed, { ...failure, foreach: meta });
+        })
+        .build(),
+    ),
   );
 
   /** No failure, and a bail or pause was recorded: the first in time is the foreach's result. */
   transitions.push(
-    unlessCanceled(Transition.builder(t('exit')))
-      .inputs(all(exited), one(frame), ...everyPermit)
-      .inhibitor(faults)
-      .resets(suspensions, results, parked)
-      .outputs(xor(outPlace(exits.bailed), outPlace(exits.paused)))
-      .action(async (tctx) => {
-        const first = tctx.inputs(exited)[0]!;
-        tctx.input(frame);
-        // `return exitResult` (`:1406`): the item's own record — a paused one has no `endedAt`
-        // (`handlers/step.ts:525`) — whose `foreachOutput` entry was made from the same record.
-        const scope = scopeOf(tctx);
-        scope.recordStepResult(bodyId, first.entry);
-        const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record: first.entry });
-        if (observed !== undefined) await observed;
-        if (first.status === 'bailed') {
-          tctx.output(exits.bailed, first.bail);
-          return;
-        }
-        tctx.output(exits.paused, first.pause);
-      })
-      .build(),
+    ...finisher('exit', { fault: ['off'], exit: ['on'], susp: ['off', 'on'] }, (b, flags) =>
+      unlessCanceled(b)
+        .outputs(xor(outPlace(exits.bailed), outPlace(exits.paused)))
+        .action(async (tctx) => {
+          const f = takeAll(tctx, flags);
+          const first = listOf(f.exits)[0]!;
+          // `return exitResult` (`:1406`): the item's own record — a paused one has no `endedAt`
+          // (`handlers/step.ts:525`) — whose `foreachOutput` entry was made from the same record.
+          const scope = scopeOf(tctx);
+          scope.recordStepResult(bodyId, first.entry);
+          const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record: first.entry });
+          if (observed !== undefined) await observed;
+          if (first.status === 'bailed') {
+            tctx.output(exits.bailed, first.bail);
+            return;
+          }
+          tctx.output(exits.paused, first.pause);
+        })
+        .build(),
+    ),
   );
 
   /**
-   * A resume's carried suspensions join this segment's, once nothing can start and no lane is
-   * busy (¬cursor, every permit) — so `suspensions` still never holds a token beside the cursor,
-   * which is what `mutualExclusion(cursor, suspensions)` proves. Mastra puts both in one
-   * `foreachIndexObj` (`:1119-1124`, `:1246-1250`); the join of the two is this transition.
-   * `all(parked)`: every carried suspension at once, as one firing ([IO-016], threshold arcs only).
-   */
-  transitions.push(
-    Transition.builder(t('unpark'))
-      .inputs(all(parked), ...everyPermit)
-      .inhibitor(cursor)
-      .outputs(and(outPlace(suspensions), ...laneList.map((l) => outPlace(l.permit))))
-      .action(async (tctx) => {
-        for (const r of tctx.inputs(parked)) tctx.output(suspensions, r);
-        for (const l of laneList) tctx.output(l.permit, null);
-      })
-      .build(),
-  );
-
-  /**
-   * Only suspensions were recorded: the lowest index is the foreach's suspension. Inhibited by
-   * `parked`: a carried suspension joins first (`unpark`), so none is left behind.
+   * Only suspensions were recorded — this segment's and the ones a resume carries, which Mastra
+   * keeps in one `foreachIndexObj` (`:1119-1124`, `:1246-1250`): the lowest index is the foreach's
+   * suspension (`Object.keys(...)[0]`, `:1411-1412`).
    *
    * `{...stepInfo, suspendedAt, status, suspendPayload}` (`:1432-1450`): the foreach's own payload
    * and start, the lowest item's suspend payload with Mastra's `__workflow_meta` merged in — that
@@ -859,79 +918,73 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
    * `resumeLabels` are the run's, which only the host holds. The token carries the same meta.
    */
   transitions.push(
-    unlessCanceled(Transition.builder(t('suspend')))
-      .inputs(all(suspensions), one(frame), ...everyPermit)
-      .inhibitors(faults, exited, parked)
-      .reset(results)
-      .outputs(outPlace(exits.suspended))
-      .action(async (tctx) => {
-        const recorded = tctx.inputs(suspensions).map((r) => r.suspension);
-        const f = tctx.input(frame);
-        let lowest = recorded[0]!;
-        for (const r of recorded) if ((r.foreachIndex ?? 0) < (lowest.foreachIndex ?? 0)) lowest = r;
-        const foreachIndex = lowest.foreachIndex ?? 0;
-        const foreachOutput = foreachOutputOf(f);
-        const own = lowest.payload as { readonly __workflow_meta?: object } | null | undefined;
-        const scope = scopeOf(tctx);
-        const record = {
-          ...stepInfo(f),
-          status: 'suspended',
-          // Spread exactly as Mastra spreads it: a primitive payload spreads as JS spreads it.
-          suspendPayload: {
-            ...(lowest.payload as object),
-            __workflow_meta: { ...(own ?? {})?.__workflow_meta, foreachIndex, foreachOutput },
-          },
-          suspendedAt: scope.epochNow(),
-        } as StepRecord;
-        scope.recordStepResult(bodyId, record);
-        const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record });
-        if (observed !== undefined) await observed;
-        const meta: ForeachMeta = { foreachIndex, foreachOutput: itemRecordsOf(foreachOutput) };
-        tctx.output(exits.suspended, { ...lowest, foreach: meta });
-      })
-      .build(),
+    ...finisher('suspend', { fault: ['off'], exit: ['off'], susp: ['on'] }, (b, flags) =>
+      unlessCanceled(b)
+        .outputs(outPlace(exits.suspended))
+        .action(async (tctx) => {
+          const f = takeAll(tctx, flags);
+          const recorded = listOf(f.suspensions).map((r) => r.suspension);
+          let lowest = recorded[0]!;
+          for (const r of recorded) if ((r.foreachIndex ?? 0) < (lowest.foreachIndex ?? 0)) lowest = r;
+          const foreachIndex = lowest.foreachIndex ?? 0;
+          const foreachOutput = foreachOutputOf(f);
+          const own = lowest.payload as { readonly __workflow_meta?: object } | null | undefined;
+          const scope = scopeOf(tctx);
+          const record = {
+            ...stepInfo(f),
+            status: 'suspended',
+            // Spread exactly as Mastra spreads it: a primitive payload spreads as JS spreads it.
+            suspendPayload: {
+              ...(lowest.payload as object),
+              __workflow_meta: { ...(own ?? {})?.__workflow_meta, foreachIndex, foreachOutput },
+            },
+            suspendedAt: scope.epochNow(),
+          } as StepRecord;
+          scope.recordStepResult(bodyId, record);
+          const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record });
+          if (observed !== undefined) await observed;
+          const meta: ForeachMeta = { foreachIndex, foreachOutput: itemRecordsOf(foreachOutput) };
+          tctx.output(exits.suspended, { ...lowest, foreach: meta });
+        })
+        .build(),
+    ),
   );
 
   if (cancel !== undefined) {
     /**
      * The run was canceled while the foreach ran: Mastra's `canceledResult` (`:1160-1172`) or its
-     * check after the drain (`:1298-1312`), which outranks every other outcome. Waits for every
-     * permit — in-flight items finish, as Mastra's do — and then clears whatever the queue and the
-     * lanes left: the undispatched tail, any recorded outcome and any carried suspension. Two
-     * transitions only because `all()` needs at least one token: one with results, one inhibited
-     * by them.
+     * check after the drain (`:1298-1312`), which outranks every other outcome — so it takes every
+     * combination of flags, one transition each. Waits for every permit — in-flight items finish,
+     * as Mastra's do — and for the queue to close, which `refuse.l` does once the signal is up.
      *
      * Records `{...stepInfo, status: 'canceled', output: results, endedAt}` under the body id, as
      * both of Mastra's canceled returns are (`:1164-1169`, `:1298-1312`), stored by
      * `entry.ts:811-812`: the foreach's input and start, the partial array. The same array rides
      * the `exits.canceled` token.
      */
-    const canceled = (role: string, withResults: boolean): Transition => {
-      const b = Transition.builder(t(role))
-        .inputs(...(withResults ? [all(results)] : []), one(frame), ...everyPermit)
-        .read(cancel)
-        .resets(cursor, faults, exited, suspensions, parked)
-        .outputs(outPlace(exits.canceled));
-      if (!withResults) b.inhibitor(results);
-      return b
-        .action(async (tctx) => {
-          const output = withResults ? assemble(tctx.inputs(results)) : [];
-          const f = tctx.input(frame);
-          const scope = scopeOf(tctx);
-          const record: StepRecord = {
-            ...stepInfo(f),
-            status: 'canceled',
-            output,
-            endedAt: scope.epochNow(),
-          };
-          scope.recordStepResult(bodyId, record);
-          const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record });
-          if (observed !== undefined) await observed;
-          tctx.output(exits.canceled, { origin, output, started: true });
-        })
-        .build();
-    };
-    transitions.push(canceled('canceled', true), canceled('canceled-empty', false));
+    transitions.push(
+      ...finisher('canceled', { fault: ['off', 'on'], exit: ['off', 'on'], susp: ['off', 'on'] }, (b, flags) =>
+        b
+          .read(cancel)
+          .outputs(outPlace(exits.canceled))
+          .action(async (tctx) => {
+            const f = takeAll(tctx, flags);
+            const output = assemble(listOf(f.results));
+            const scope = scopeOf(tctx);
+            const record: StepRecord = {
+              ...stepInfo(f),
+              status: 'canceled',
+              output,
+              endedAt: scope.epochNow(),
+            };
+            scope.recordStepResult(bodyId, record);
+            const observed = scope.observe({ kind: 'foreach-settled', stepId: bodyId, path: viewPath, record });
+            if (observed !== undefined) await observed;
+            tctx.output(exits.canceled, { origin, output, started: true });
+          })
+          .build(),
+      ),
+    );
   }
 
   // -------------------------------------------------------------------------------------------
@@ -958,34 +1011,27 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
     );
 
     /**
-     * Re-opens the foreach where the resume left it (`:1227-1272`), in one firing: the frame and
-     * every lane permit, as `split` opens it, plus whichever of these the seed has — the cursor
-     * over the items still to run, one `results` token per item that succeeded (their outputs
-     * reused, `:1252-1254`), one `parked` token per suspension that stays. The choice among the
-     * eight subsets is an `xor` decided from the seed and then emitted, so a value-blind proof
-     * explores every one of them from the single seed. A seed that does not fit the stored input
-     * fails the run by name instead of throwing, which would strand it.
+     * Re-opens the foreach where the resume left it (`:1227-1272`), in one firing, as `split`
+     * opens it: the frame — carrying the items that succeeded (their outputs reused, `:1252-1254`)
+     * and the suspensions that stay — every permit, the queue open over the items still to run or
+     * closed, and `susp` on exactly when a suspension stays. A carried suspension raises the flag
+     * but kills no queue: only a settle of this segment takes the queue, as Mastra's `killQueue()`
+     * fires only for this segment's outcomes. The four combinations are an `xor` decided from the
+     * seed, so a value-blind proof explores every one of them from the single seed. A seed that
+     * does not fit the stored input fails the run by name instead of throwing, which would strand it.
      *
      * The frame takes the stored aggregate as Mastra's `stepInfo` does (`:990-996`) — read from
      * the run's records like a loop's `start` reads its own, data only — and its
      * `__workflow_meta.foreachOutput` as the base every settle writes over (`:1040-1041`).
      */
-    const opened = (withCursor: boolean, withResults: boolean, withParked: boolean): Out =>
-      and(
-        outPlace(frame),
-        ...laneList.map((l) => outPlace(l.permit)),
-        ...(withCursor ? [outPlace(cursor)] : []),
-        ...(withResults ? [outPlace(results)] : []),
-        ...(withParked ? [outPlace(parked)] : []),
-      );
-    const subsets: Out[] = [];
-    for (const c of [true, false]) for (const r of [true, false]) for (const k of [true, false]) subsets.push(opened(c, r, k));
+    const reopenings: Out[] = [];
+    for (const queue of ['open', 'closed'] as const) for (const suspended of [false, true]) reopenings.push(opened(queue, suspended));
 
     transitions.push(
       Transition.builder(t('re-enter'))
         .inputs(one(resume))
         .inhibitor(cancel)
-        .outputs(xor(...subsets, outPlace(exits.failed)))
+        .outputs(xor(...reopenings, outPlace(exits.failed)))
         .action(async (tctx) => {
           const seed = tctx.input(resume);
           const scope = scopeOf(tctx);
@@ -1011,11 +1057,10 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
             resumed: true,
           });
           if (observed !== undefined) await observed;
-          tctx.output(frame, reopened);
-          for (const l of laneList) tctx.output(l.permit, null);
-          if (seed.order.length > 0) tctx.output(cursor, { items: seed.items, order: seed.order, next: 0 });
-          for (const d of seed.done) tctx.output(results, { index: d.index, value: (d.record as { output?: unknown }).output });
-          for (const suspension of seed.parked) tctx.output(parked, { suspension });
+          let f: ForeachFrame = reopened;
+          for (const d of seed.done) f = { ...f, results: cons(f.results, { index: d.index, value: (d.record as { output?: unknown }).output }) };
+          for (const suspension of seed.parked) f = { ...f, suspensions: cons(f.suspensions, { suspension }) };
+          emitOpened(tctx, f, seed.order.length > 0 ? { items: seed.items, order: seed.order, next: 0 } : undefined, seed.parked.length > 0);
         })
         .build(),
     );
@@ -1024,30 +1069,21 @@ export const foreachGadget: Gadget = (entry, next, ctx) => {
   }
 
   // The body's transitions are collected by the builder as `emitNested` returns them; repeating
-  // them here would register each one twice.
-  const lanesWhy = `at most one outcome per lane in flight (${lanes} lanes)`;
+  // them here would register each one twice. Every place holds at most one token — the data rides
+  // the frame — so the default bound of 1 is claimed everywhere, and nothing is left unclaimed.
   return {
     inPlace,
     transitions,
     resumeSites,
-    claims: [
-      { place: results.name, bound: 'unclaimed', why: 'one result per item: the count is the input array, which is data' },
-      { place: parked.name, bound: 'unclaimed', why: 'one per carried suspension, deposited by a single re-enter ([IO-016]): data' },
-      { place: suspensions.name, bound: 'unclaimed', why: `at most ${lanes} in a fresh run, plus every carried suspension unpark moves in at once ([IO-016]): data` },
-      // At most one per lane: once an outcome is recorded no `start` fires, so only the items
-      // already in flight can add one. That rests on the inhibitors, which no linear invariant
-      // captures — z3 settles it at two lanes and returns unknown at three within 600 s
-      // (`foreach-c3`, libpetri 7.0.0, [ADR 0009]). Above two it is listed, not claimed.
-      ...[faults, exited].map((record) =>
-        lanes <= MAX_PROVEN_RECORD_LANES
-          ? { place: record.name, bound: lanes, why: lanesWhy }
-          : { place: record.name, bound: 'unclaimed' as const, why: `${lanesWhy}, by the dispatch inhibitors; unknown to z3 above ${MAX_PROVEN_RECORD_LANES} lanes` }),
-    ],
     exclusions: [
-      // `queue.kill()`: every non-success settle resets the cursor in the firing that records it.
-      { a: cursor.name, b: faults.name, why: 'a recorded failure has killed the queue' },
-      { a: cursor.name, b: exited.name, why: 'a recorded bail or pause has killed the queue' },
-      { a: cursor.name, b: suspensions.name, why: 'a recorded suspension has killed the queue; a carried one joins only once the cursor is gone' },
+      { a: queueOpen.name, b: queueClosed.name, why: 'the queue is open or closed, never both' },
+      // Fail-fast: a failure, bail or pause is recorded only by a settle that took the queue —
+      // waiting for any start in flight to give it back — and nothing reopens a closed queue, so no
+      // item can start after one, under in-flight firing too ([VER-004]). Not a suspension: a resume
+      // carries suspensions beside an open queue, as Mastra's does.
+      { a: queueOpen.name, b: fault.on.name, why: 'a recorded failure has killed the queue' },
+      { a: queueOpen.name, b: exit.on.name, why: 'a recorded bail or pause has killed the queue' },
+      ...[fault, exit, susp].map((k) => ({ a: k.off.name, b: k.on.name, why: `'${k.on.name}' is recorded or not, never both` })),
       ...laneList.map((l, i) => ({ a: l.permit.name, b: l.slot.name, why: `lane ${i} is idle or busy, never both` })),
     ],
   };

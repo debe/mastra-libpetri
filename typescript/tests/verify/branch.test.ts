@@ -66,7 +66,7 @@ const everyReport = (compiled: CompiledWorkflow): string[] =>
  * branch, and every top-level step ([ADR 0007]). Every report `proven`, asserted explicitly:
  * `isViolated()` is false on `unknown` too.
  */
-async function expectProvenBoth(compiled: CompiledWorkflow, timeoutMs = 120_000): Promise<readonly PropertyReport[]> {
+async function expectProvenBoth(compiled: CompiledWorkflow, timeoutMs = 30_000): Promise<readonly PropertyReport[]> {
   const reports = await verifyWorkflow(compiled, { timeoutMs });
   expect(reports.map(keyOf)).toEqual(everyReport(compiled));
   for (const report of reports) expect(report.result.verdict.type, describeReport(report)).toBe('proven');
@@ -148,7 +148,7 @@ describe('compiled branch, scaling in the number of arms', () => {
       const transitions = [...compiled.net.transitions];
       const branches = transitions.reduce((sum, t) => sum + enumerateBranches(t.outputSpec!).length, 0);
 
-      const reports = await expectProvenBoth(compiled, 600_000);
+      const reports = await expectProvenBoth(compiled, 30_000);
 
       // Block: decide, its sweep, four exit collects, three joins — 9; per arm gate-i, collect-i,
       // the arm's run, and the resume trio replay-i, re-enter-i and its sweep re-enter-i.cancel
@@ -240,7 +240,7 @@ const twoArms = workflow(branch('route', step('a'), step('b')));
 
 /** A join mutant is a closed-segment defect: it shows without any cancel arriving. */
 async function verifyMutant(gadget: Gadget): Promise<readonly PropertyReport[]> {
-  return verifyWorkflow(compile(twoArms, { gadgets: { branch: gadget } }), { timeoutMs: 120_000, segments: ['closed'] });
+  return verifyWorkflow(compile(twoArms, { gadgets: { branch: gadget } }), { timeoutMs: 30_000, segments: ['closed'] });
 }
 
 describe('compiled branch, non-vacuity', () => {
@@ -446,7 +446,7 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
       // Not a structural violation — the check is about a start that *competes* with a sweep, and
       // there is no sweep left. The cancel segment is what refutes it.
       expect(cancelStructureViolations(mutant)).toEqual([]);
-      const reports = await verifyWorkflow(mutant, { timeoutMs: 120_000 });
+      const reports = await verifyWorkflow(mutant, { timeoutMs: 30_000 });
       expect(verdicts(reports), reports.map(describeReport).join('; ')).toMatchObject({
         'closed/deadlockFree': 'proven',
         'closed/terminatesAtSink': 'proven',
@@ -627,7 +627,7 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
         [twoArms, { ...armSegments('0.0'), ...armSegments('0.1') }],
         [middle, { ...asFresh('0'), ...armSegments('1.0'), ...armSegments('1.1'), ...allProven('2') }],
       ] as const) {
-        const reports = await verifyWorkflow(compile(description, { gadgets: { branch: gatedArms } }), { timeoutMs: 120_000 });
+        const reports = await verifyWorkflow(compile(description, { gadgets: { branch: gatedArms } }), { timeoutMs: 30_000 });
         expect(verdicts(reports), reports.map(describeReport).join('; ')).toEqual({
           'closed/deadlockFree': 'proven',
           'closed/terminatesAtSink': 'proven',

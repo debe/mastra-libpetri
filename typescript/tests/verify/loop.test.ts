@@ -118,14 +118,14 @@ const seeded = (compiled: CompiledWorkflow, allowance: number, segment: Segment 
     })
     .sinkPlaces(...terminalsOf(compiled), compiled.cancel)
     .semiflowInvariants(true)
-    .timeout(120_000);
+    .timeout(30_000);
 
 const fromEntry = (compiled: CompiledWorkflow) =>
   SmtVerifier.forNet(compiled.net)
     .initialMarking((m) => m.tokens(compiled.entryPlace, 1))
     .sinkPlaces(...terminalsOf(compiled), compiled.cancel)
     .semiflowInvariants(true)
-    .timeout(120_000);
+    .timeout(30_000);
 
 const verdict = async (builder: ReturnType<typeof seeded>, property: SmtProperty): Promise<SmtVerificationResult> =>
   builder.property(property).verify();
@@ -217,7 +217,7 @@ describe('loop, proved from the entry place', () => {
     const compiled = compile(description);
     expect(cancelStructureViolations(compiled)).toEqual([]);
 
-    const reports = await verifyWorkflow(compiled, { timeoutMs: 120_000 });
+    const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000 });
     record(`entry | ${name} | bound ${bound}`, reports);
     expectAllProven(reports, keysFor(compiled));
   }, 300_000);
@@ -372,8 +372,8 @@ describe('loop: removing a safeguard flips a verdict (non-vacuity)', () => {
     expect(await runWorkflow(broken, 0, { runner: runner() })).toEqual({ status: 'success', output: 2 });
     expect(await runWorkflow(compile(description), 0, { runner: runner() })).toEqual({ status: 'success', output: 2 });
 
-    const real = await verifyWorkflow(compile(description), { timeoutMs: 120_000, segments: ['closed'] });
-    const mutant = await verifyWorkflow(broken, { timeoutMs: 120_000, segments: ['closed'] });
+    const real = await verifyWorkflow(compile(description), { timeoutMs: 30_000, segments: ['closed'] });
+    const mutant = await verifyWorkflow(broken, { timeoutMs: 30_000, segments: ['closed'] });
     expectAllProven(real, CLOSED);
     expect(verdicts(mutant), described(mutant)).toMatchObject({ 'closed/deadlockFree': 'violated' });
   }, 300_000);
@@ -386,7 +386,7 @@ describe('loop: removing a safeguard flips a verdict (non-vacuity)', () => {
     const description = only(loop(2));
     const broken = compile(description, { gadgets: { loop: mutated('finish', { dropReset: '.budget' }) } });
 
-    expectAllProven(await verifyWorkflow(broken, { timeoutMs: 120_000 }), keysFor(broken));
+    expectAllProven(await verifyWorkflow(broken, { timeoutMs: 30_000 }), keysFor(broken));
 
     const real = await verdict(seeded(compile(description), 2), deadlockFree());
     const mutant = await verdict(seeded(broken, 2), deadlockFree());
@@ -409,7 +409,7 @@ describe('loop: removing a safeguard flips a verdict (non-vacuity)', () => {
   it('needs every body exit to consume the pending marker, even at an allowance of one', async () => {
     const broken = compile(only(loop(2)), { gadgets: { loop: mutated('leave-bailed', { dropInput: '.running' }) } });
 
-    const mutant = await verifyWorkflow(broken, { timeoutMs: 120_000, segments: ['closed'] });
+    const mutant = await verifyWorkflow(broken, { timeoutMs: 30_000, segments: ['closed'] });
     expect(verdicts(mutant), described(mutant)).toMatchObject({ 'closed/deadlockFree': 'violated' });
   }, 300_000);
 });
@@ -441,7 +441,7 @@ describe('loop: removing a cancellation safeguard is caught — by structure, by
     const violations = cancelStructureViolations(broken);
     expect(violations).toHaveLength(1);
     expect(violations[0]).toMatch(new RegExp(`'t\\.0\\.poll\\.${transitionRole}' competes with sweep 't\\.0\\.poll\\.${sweep}'`));
-    await expect(verifyWorkflow(broken, { timeoutMs: 120_000 })).rejects.toThrow(/cancellation structure is unsound/);
+    await expect(verifyWorkflow(broken, { timeoutMs: 30_000 })).rejects.toThrow(/cancellation structure is unsound/);
   });
 
   // Each sweep is the only way out of its place once the signal is marked, because the transition
@@ -462,7 +462,7 @@ describe('loop: removing a cancellation safeguard is caught — by structure, by
       expect(resumeGateViolations(broken)).toEqual(gate);
 
       // Only the mutant the gate check refuses skips it; the rest still pass every structural check.
-      const reports = await verifyWorkflow(broken, { timeoutMs: 120_000, structure: gate.length > 0 ? 'skip' : 'check' });
+      const reports = await verifyWorkflow(broken, { timeoutMs: 30_000, structure: gate.length > 0 ? 'skip' : 'check' });
       record(`mutant without ${sweep} | entry`, reports);
       expectAllProven(reports.filter((r) => r.segment === 'closed'), CLOSED);
       expect(verdicts(reports), described(reports)).toMatchObject({
@@ -497,7 +497,7 @@ describe('loop: removing a cancellation safeguard is caught — by structure, by
       expect(resumeGateViolations(broken)).toEqual(gate);
 
       const reports = await verifyWorkflow(broken, {
-        timeoutMs: 120_000,
+        timeoutMs: 30_000,
         segments: ['closed'],
         structure: gate.length > 0 ? 'skip' : 'check',
       });
@@ -528,7 +528,7 @@ describe('loop: removing a cancellation safeguard is caught — by structure, by
       expect(verdicts(canceled), described(canceled)).toMatchObject({ 'cancel/deadlockFree': 'violated' });
 
       // The entry-seeded route: the blind spot for two of the three, measured.
-      const entry = await verifyWorkflow(broken, { timeoutMs: 120_000 });
+      const entry = await verifyWorkflow(broken, { timeoutMs: 30_000 });
       record(`mutant ${sweep} without reset | entry`, entry);
       expectAllProven(entry.filter((r) => r.segment === 'closed'), CLOSED);
       expect(verdicts(entry)['cancel/deadlockFree'], described(entry)).toBe(fromEntryVerdict);
@@ -539,7 +539,7 @@ describe('loop: removing a cancellation safeguard is caught — by structure, by
   it('needs cancel-produced to consume the pending marker', async () => {
     const broken = compile(only(loop(2)), { gadgets: { loop: mutated('cancel-produced', { dropInput: '.running' }) } });
 
-    const reports = await verifyWorkflow(broken, { timeoutMs: 120_000 });
+    const reports = await verifyWorkflow(broken, { timeoutMs: 30_000 });
     expectAllProven(reports.filter((r) => r.segment === 'closed'), CLOSED);
     expect(verdicts(reports), described(reports)).toMatchObject({ 'cancel/deadlockFree': 'violated' });
   }, 300_000);
@@ -556,7 +556,7 @@ describe('loop: removing a cancellation safeguard is caught — by structure, by
       });
     const broken = compile(only(loop(2)), { gadgets: { loop: gatedBody } });
 
-    const reports = await verifyWorkflow(broken, { timeoutMs: 120_000 });
+    const reports = await verifyWorkflow(broken, { timeoutMs: 30_000 });
     expectAllProven(reports.filter((r) => r.segment === 'closed'), CLOSED);
     expect(verdicts(reports), described(reports)).toMatchObject({ 'cancel/deadlockFree': 'violated' });
   }, 300_000);

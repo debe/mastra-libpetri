@@ -126,9 +126,11 @@ would, nested workflows included, and proves four families of claims about the n
 | liveness | every step attempt, every retry included, has a confirmed run that reaches it: no dead steps, and each retry ceiling is reached |
 
 Each is proven for a fresh run, a run canceled at any point, and a run resumed at each resume
-site. The CLI exits 0 only when every claim holds; `unknown` exits 1, and a missing solver 2.
-Every workflow of the differential corpus is gated this way in CI
-([`tests/verify/corpus.test.ts`](typescript/tests/verify/corpus.test.ts)).
+site, under libpetri's model of the executor in which an action is in flight between consuming its
+inputs and depositing its outputs. The CLI exits 0 only when every claim holds; `unknown` exits 1,
+and a missing solver 2. Every workflow of the differential corpus is gated this way in `npm test`
+([`tests/verify/corpus.test.ts`](typescript/tests/verify/corpus.test.ts)), 30 s a query: a proof
+that does not close in that is a net to redesign, not a budget to raise.
 
 ## Repository map
 

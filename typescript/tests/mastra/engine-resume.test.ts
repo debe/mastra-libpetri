@@ -336,7 +336,7 @@ function compiledFor(shape: Shape, config: EngineConfig = shape.engine ?? {}): C
  */
 async function expectProven(compiled: CompiledWorkflow, sites: readonly string[]): Promise<void> {
   expect([...compiled.resumeSites.keys()].sort()).toEqual([...sites].sort());
-  const reports = await verifyWorkflow(compiled, { timeoutMs: 60_000 });
+  const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000 });
   const routes = reports.map(describeReport).join('\n');
   console.log(`[proof] ${compiled.net.name} k=${compiled.budget?.k ?? 'unbounded'}:\n${routes}`);
   const labels = segmentsFor(compiled).map(segmentLabel);

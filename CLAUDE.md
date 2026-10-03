@@ -55,11 +55,15 @@ requirement IDs (`IO-015`, `EXEC-003`, `MOD-031`, `TIME-015`, …).
 
 ### libpetri
 
-Installed from the registry: `"libpetri": "^7.0.0"`. 6.1.0 was the first release carrying
+Installed from the registry: `"libpetri": "^8.0.0"`. 6.1.0 was the first release carrying
 everything the engine calls — **TIME-015** (injectable clock), the **MOD-031** place-alias fix,
 **NU-011** (resume-safe minting) and **CORE-073**/**ENV-014** snapshot; 7.0.0 adds the
-`PrecompiledNet` word-index fix, so nets past 4096 places run. Figures measured against a release
-are reportable; figures through M5 are 6.1.0's.
+`PrecompiledNet` word-index fix, so nets past 4096 places run. 8.0.0 verifies a firing whose
+outputs another transition tests as a start and a completion (**VER-004**), as the executor runs
+it: never opt out with `assumeAtomicFiring` to make a proof pass. A proof that does not close in
+30 s is a net to redesign, not a budget to raise — the foreach was rebuilt for exactly that
+([ADR 0009], amended). Figures measured against a release are reportable; figures through M5 are
+6.1.0's, M6's 7.0.0's, from the 8.0.0 upgrade on 8.0.0's.
 
 The sibling checkout is linked only on purpose, to try a fix that is not released yet:
 

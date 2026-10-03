@@ -1,5 +1,4 @@
-import type { In, Place, Transition } from 'libpetri';
-import { pathSegment, slug } from '../compiler/names.js';
+import type { Place, Transition } from 'libpetri';
 import type { CompiledWorkflow } from '../compiler/types.js';
 
 /**
@@ -64,7 +63,7 @@ export function cancelStructureViolations(compiled: CompiledWorkflow): readonly 
 
 // ---------------------------------------------------------------------------------------------
 // Resume ([ADR 0007]). A resumed run is a segment seeded with one token at a registered site, and
-// each site is proven as its own segment. These four checks are what those proofs stand on and
+// each site is proven as its own segment. These three checks are what those proofs stand on and
 // cannot see themselves; `verifyWorkflow` runs them before any proof, as it runs the cancel check.
 // Places and transitions are compared by name throughout, for the reason given above.
 // ---------------------------------------------------------------------------------------------
@@ -160,62 +159,6 @@ export function resumeGateViolations(compiled: CompiledWorkflow): readonly strin
     }
   }
   return out;
-}
-
-/**
- * Every arc on a `.foreach()`'s counting places — `results`, `suspensions` and `parked` — is a
- * threshold arc: an `all()` input, a read, an inhibitor, a reset or an output. Never `one()`,
- * `exactly(n)` or `atLeast(n > 1)`.
- *
- * The analyses deposit one token per named place of a firing's branch ([IO-016]), and a resume
- * seeds these places with **one** token standing for any number of items. That model is exact
- * only when no arc can tell one token from many: then enablement depends on "at least one" alone,
- * and every count from one up behaves as the one the proof explored. A `one()` arc breaks it — a
- * run with two parked items fires it twice, the proof once — and nothing in a proof shows that.
- * So it is checked here, structurally, and reported as a structural result, not an SMT one.
- *
- * The places are found by the foreach's registered name, `s.<i>.<id>.<role>`, for every top-level
- * foreach in the net map. `results` and `suspensions` must exist; `parked` must exist wherever the
- * foreach has a resume site, since that is where the seed puts parked items.
- */
-export function thresholdOnlyViolations(compiled: CompiledWorkflow): readonly string[] {
-  const out: string[] = [];
-  const placeNames = new Set([...compiled.net.places].map((p) => p.name));
-  const transitions = [...compiled.net.transitions];
-
-  for (const [key, entry] of compiled.netMap.pathToEntry) {
-    if (entry.kind !== 'foreach') continue;
-    const prefix = `s.${pathSegment(key.split('.').map(Number))}.${slug(entry.entryId)}.`;
-    const hasSite = compiled.resumeSites.get(key)?.kind === 'foreach';
-    for (const role of ['results', 'suspensions', 'parked'] as const) {
-      const name = prefix + role;
-      if (!placeNames.has(name)) {
-        if (role !== 'parked' || hasSite) out.push(`foreach '${entry.entryId}' at [${key}] has no '${role}' place ('${name}')`);
-        continue;
-      }
-      for (const t of transitions) {
-        for (const spec of t.inputSpecs) {
-          if (spec.place.name === name && !isThreshold(spec)) {
-            out.push(`'${t.name}' consumes '${name}' with ${describeInput(spec)}; a foreach ${role} place takes only all()`);
-          }
-        }
-      }
-    }
-  }
-  return out;
-}
-
-function isThreshold(spec: In): boolean {
-  return spec.type === 'all' || (spec.type === 'at-least' && spec.minimum <= 1);
-}
-
-function describeInput(spec: In): string {
-  switch (spec.type) {
-    case 'one': return 'one()';
-    case 'exactly': return `exactly(${spec.count})`;
-    case 'all': return 'all()';
-    case 'at-least': return `atLeast(${spec.minimum})`;
-  }
 }
 
 /**

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { Transition, delayed, one, outPlace, place, type Place, type Timing } from 'libpetri';
+import { Transition, and, delayed, one, outPlace, place, xor, type Out, type Place, type Timing } from 'libpetri';
 import { compile, type Gadget } from '../../src/compiler/index.js';
 import { foreachGadget, itemsOf, MAX_FOREACH_LANES } from '../../src/compiler/gadgets/foreach.js';
 import { runWorkflowDetailed, type RunReport } from '../../src/engine/index.js';
@@ -159,20 +159,52 @@ interface Mutation {
   readonly dropInhibitor?: RegExp;
   readonly dropReset?: RegExp;
   readonly dropInput?: RegExp;
+  /** Removes matching places from every `and` of the output spec. */
+  readonly dropOutput?: RegExp;
   readonly timing?: Timing;
+}
+
+function pruneOut(out: Out, drop: RegExp): Out {
+  switch (out.type) {
+    case 'and':
+      return and(...out.children.filter((c) => !(c.type === 'place' && drop.test(c.place.name))).map((c) => pruneOut(c, drop)));
+    case 'xor':
+      return xor(...out.children.map((c) => pruneOut(c, drop)));
+    default:
+      return out;
+  }
 }
 
 function rebuild(t: Transition, m: Mutation): Transition {
   const b = Transition.builder(t.name)
     .inputs(...t.inputSpecs.filter((spec) => !(m.dropInput?.test(spec.place.name) ?? false)))
-    .outputs(t.outputSpec!)
+    .outputs(m.dropOutput === undefined ? t.outputSpec! : pruneOut(t.outputSpec!, m.dropOutput))
     .timing(m.timing ?? t.timing)
     .priority(t.priority)
-    .action(t.action);
+    .action(m.dropOutput === undefined && m.dropInput === undefined ? t.action : dropping(t.action, m.dropInput, m.dropOutput));
   for (const arc of t.inhibitors) if (!(m.dropInhibitor?.test(arc.place.name) ?? false)) b.inhibitor(arc.place);
   for (const arc of t.reads) b.read(arc.place);
   for (const arc of t.resets) if (!(m.dropReset?.test(arc.place.name) ?? false)) b.reset(arc.place);
   return b.build();
+}
+
+/**
+ * The action, matched to the pruned arcs: an output into a dropped place is swallowed, and a read
+ * of a dropped input gives `null` — the actions read every input they declare, and a mutant that
+ * removes the arc must fail for what the arc did, not because the action could not read it.
+ */
+function dropping(action: Transition['action'], dropIn: RegExp | undefined, dropOut: RegExp | undefined): Transition['action'] {
+  return (tctx) =>
+    action(
+      new Proxy(tctx, {
+        get(target, prop) {
+          if (prop === 'output') return (p: Place<unknown>, value: unknown) => (dropOut?.test(p.name) ? undefined : target.output(p, value));
+          if (prop === 'input') return (p: Place<unknown>) => (dropIn?.test(p.name) ? null : target.input(p));
+          const v: unknown = Reflect.get(target, prop, target);
+          return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+        },
+      }),
+    );
 }
 
 function mutated(...mutations: Mutation[]): Gadget {
@@ -614,22 +646,33 @@ describe('foreach: structure', () => {
     expect(() => build([typed])).toThrow(/body must be a single step/);
   });
 
-  it('inhibits every start on every other lane’s non-success outcome, and kills the queue on each settle', () => {
+  it('starts on the open queue and a permit, gated only by the signal; settles take the queue, one token per arc, ahead of every start', () => {
     const lanes = [0, 1, 2];
     const transitions = [...build([foreach(lanes.length)]).net.transitions];
-    const outcomesOf = (l: number): string[] =>
-      ['failed', 'bailed', 'suspended', 'paused'].map((o) => `s.0.items.lane${l}.${o}`);
-
     for (const lane of lanes) {
       const start = transitions.find((t) => t.name === `t.0.items.lane${lane}.start`)!;
-      // Its own lane needs no arc: while that outcome is pending the lane holds a slot, not a permit.
-      // Plus the signal: Mastra's worker checks it before each task (`:1160`).
-      const others = [...lanes.filter((l) => l !== lane).flatMap(outcomesOf), 'wf.cancel'];
-      expect(start.inhibitors.map((a) => a.place.name).sort()).toEqual(others.sort());
+      expect(start.inputSpecs.map((i) => [i.type, i.place.name])).toEqual([['one', 's.0.items.queue.open'], ['one', `s.0.items.lane${lane}.permit`]]);
+      // Mastra's worker checks the signal before each task (`:1160`); nothing else gates a start —
+      // a killed queue is a closed one.
+      expect(start.inhibitors.map((a) => a.place.name)).toEqual(['wf.cancel']);
     }
-    const settles = transitions.filter((t) => /\.lane\d+\.(fail|bail|pause|suspend)$/.test(t.name));
-    expect(settles).toHaveLength(4 * lanes.length);
-    for (const settle of settles) expect(settle.resets.map((a) => a.place.name)).toEqual(['s.0.items.cursor']);
+    // Four kinds, each with the queue open or already closed and its flag off or already on. Every
+    // arc takes one token: no reset, no inhibitor, no drain — so no settle's output is tested
+    // non-monotonically and none is split under libpetri 8.0.0's in-flight firing ([VER-004]).
+    const settles = transitions.filter((t) => /\.lane\d+\.(fail|bail|pause|suspend)(\.queue-closed)?(\.again)?$/.test(t.name));
+    expect(settles).toHaveLength(4 * 4 * lanes.length);
+    for (const settle of settles) {
+      expect(settle.resets).toEqual([]);
+      expect(settle.inhibitors).toEqual([]);
+      expect(settle.inputSpecs.every((i) => i.type === 'one'), settle.name).toBe(true);
+      expect(settle.inputSpecs.some((i) => /\.queue\.(open|closed)$/.test(i.place.name)), `${settle.name} takes the queue`).toBe(true);
+      expect([...settle.outputPlaces()].map((p) => p.name)).toContain('s.0.items.queue.closed');
+      // Ahead of every start: an item's outcome kills the queue before a free lane takes the next.
+      expect(settle.priority).toBeGreaterThan(0);
+    }
+    for (const t of transitions.filter((x) => x.name.startsWith('t.0.items.') && !x.name.startsWith('t.0.items.lane'))) {
+      expect(t.inputSpecs.every((i) => i.type === 'one'), `${t.name} takes one token per arc`).toBe(true);
+    }
   });
 });
 
@@ -637,39 +680,36 @@ describe('foreach: each safeguard is load-bearing (mutated copies)', () => {
   const failA: Plan = (label) =>
     label === 'a' ? { status: 'failed', error: 'boom:a' } : { status: 'success', output: `${label}!` };
 
-  it('without the reset on the cursor, items after a failure run', async () => {
+  it('a settle taking the queue is what stops dispatch: without it, items after a failure run', async () => {
     const intact = itemRunner(failA);
     await run([foreach(1)], ['a', 'b', 'c'], intact.runner);
     expect(intact.log.started).toEqual(['a']);
 
+    // The failing settle no longer takes the queue: it stays open, and the next start takes it.
     const broken = itemRunner(failA);
-    await run([foreach(1)], ['a', 'b', 'c'], broken.runner, mutated({ transition: /\.lane\d+\.fail$/, dropReset: /cursor/ }));
+    await run([foreach(1)], ['a', 'b', 'c'], broken.runner, mutated({ transition: /\.lane0\.fail$/, dropInput: /\.queue\.open$/, dropOutput: /\.queue\.closed$/ }));
     expect(broken.log.started).toEqual(['a', 'b', 'c']);
   });
 
-  it('without the start inhibitors, an item starts in the window before a failure is recorded', async () => {
-    // The window is ordinarily one firing wide. Widening it — delaying the failure's settle by
-    // 50ms in both copies — makes it observable: `b` finishes inside it and frees its lane.
-    const slowSettle: Mutation = { transition: /\.lane\d+\.fail$/, timing: delayed(50) };
+  it('the window between an outcome and its settle is closed by priority, not by an arc: widened, the next item starts', async () => {
+    // Mastra has this window — it awaits a progress publish before `killQueue()` (`:1126-1135`) —
+    // and the verifier, which ignores priority, explores it. At run time the settle fires the
+    // instant the outcome lands, ahead of every start. Delaying the settle by 50ms opens the window
+    // wide enough for `b` to finish in it and free its lane for `c`, as Mastra's would.
     const plan: Plan = async (label) => {
       if (label === 'a') return { status: 'failed', error: 'boom:a' };
       await sleep(10);
       return { status: 'success', output: `${label}!` };
     };
-
     const intact = itemRunner(plan);
-    const kept = await run([foreach(2)], ['a', 'b', 'c'], intact.runner, mutated(slowSettle));
+    const kept = await run([foreach(2)], ['a', 'b', 'c'], intact.runner);
     expect(intact.log.started).toEqual(['a', 'b']);
     expect(kept.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 0, error: 'boom:a' });
 
-    const broken = itemRunner(plan);
-    await run(
-      [foreach(2)],
-      ['a', 'b', 'c'],
-      broken.runner,
-      mutated(slowSettle, { transition: /\.lane\d+\.start$/, dropInhibitor: /./ }),
-    );
-    expect(broken.log.started).toEqual(['a', 'b', 'c']);
+    const widened = itemRunner(plan);
+    const late = await run([foreach(2)], ['a', 'b', 'c'], widened.runner, mutated({ transition: /\.lane\d+\.fail/, timing: delayed(50) }));
+    expect(widened.log.started).toEqual(['a', 'b', 'c']);
+    expect(late.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 0, error: 'boom:a' });
   });
 
   it('without waiting for every lane, the failure is decided under a running item and a token strands', async () => {
@@ -684,7 +724,7 @@ describe('foreach: each safeguard is load-bearing (mutated copies)', () => {
     expect(kept.outcome).toEqual({ status: 'failed', stepId: 'body', path: [0], foreachIndex: 0, error: 'boom:a' });
 
     const broken = itemRunner(plan);
-    const lost = await run([foreach(2)], ['a', 'b'], broken.runner, mutated({ transition: /\.items\.fail$/, dropInput: /permit/ }));
+    const lost = await run([foreach(2)], ['a', 'b'], broken.runner, mutated({ transition: /\.items\.fail\./, dropInput: /permit/ }));
     expect(lost.outcome).toMatchObject({ status: 'failed', residue: expect.any(Array) });
   });
 });
@@ -1156,8 +1196,8 @@ describe('foreach: cancellation (row 28)', () => {
    */
   it.each<[string, RegExp, Plan, string]>([
     ['join', /\.items\.join$/, (label) => ({ status: 'success', output: `${label}!` }), 'success'],
-    ['fail', /\.items\.fail$/, (label) => (label === 'a' ? { status: 'failed', error: 'boom' } : { status: 'success', output: 'b!' }), 'failed'],
-    ['exit', /\.items\.exit$/, (label) => (label === 'a' ? { status: 'bailed', output: 'early' } : { status: 'success', output: 'b!' }), 'bailed'],
+    ['fail', /\.items\.fail\./, (label) => (label === 'a' ? { status: 'failed', error: 'boom' } : { status: 'success', output: 'b!' }), 'failed'],
+    ['exit', /\.items\.exit\./, (label) => (label === 'a' ? { status: 'bailed', output: 'early' } : { status: 'success', output: 'b!' }), 'bailed'],
     ['suspend', /\.items\.suspend$/, (label) => (label === 'a' ? { status: 'suspended', suspendPayload: 'p' } : { status: 'success', output: 'b!' }), 'suspended'],
   ])('without %s\'s inhibitor on the signal, the foreach does not leave canceled (mutant)', async (_name, transition, outcomeOf, brokenStatus) => {
     const once = async (gadget: Gadget) => {
@@ -1255,7 +1295,7 @@ describe('foreach: a mutant flipping any sweep\'s `started` is caught', () => {
     expect(await once(flippingStarted(foreachGadget, '.cancel'))).toEqual([{ origin, started: true }]);
   });
 
-  it('the finisher with results (`.canceled`): intact true, flipped false', async () => {
+  it('a cancel finisher with nothing recorded (`.canceled.clean`): intact true, flipped false', async () => {
     const once = async (gadget: Gadget) => {
       const ac = new AbortController();
       const c = tapped('canceled', gadget);
@@ -1267,10 +1307,10 @@ describe('foreach: a mutant flipping any sweep\'s `started` is caught', () => {
       return c.seen;
     };
     expect(await once(foreachGadget)).toEqual([{ origin, output: ['a!'], started: true }]);
-    expect(await once(flippingStarted(foreachGadget, '.canceled'))).toEqual([{ origin, output: ['a!'], started: false }]);
+    expect(await once(flippingStarted(foreachGadget, '.canceled.clean'))).toEqual([{ origin, output: ['a!'], started: false }]);
   });
 
-  it('the finisher with no results (`.canceled-empty`): intact true, flipped false', async () => {
+  it('a cancel finisher beside a recorded pause and no results (`.canceled.e`): intact true, flipped false', async () => {
     const once = async (gadget: Gadget) => {
       const ac = new AbortController();
       const c = tapped('canceled', gadget);
@@ -1282,7 +1322,7 @@ describe('foreach: a mutant flipping any sweep\'s `started` is caught', () => {
       return c.seen;
     };
     expect(await once(foreachGadget)).toEqual([{ origin, output: [], started: true }]);
-    expect(await once(flippingStarted(foreachGadget, '.canceled-empty'))).toEqual([{ origin, output: [], started: false }]);
+    expect(await once(flippingStarted(foreachGadget, '.canceled.e'))).toEqual([{ origin, output: [], started: false }]);
   });
 });
 
@@ -1428,7 +1468,7 @@ describe('foreach over no items, canceled (row 49)', () => {
     expect(report.stepResults.get('body')).toEqual({ status: 'success', output: [], payload: [], startedAt: EPOCH + 250, endedAt: EPOCH + 250 });
   });
 
-  it('without join-empty\'s inhibitor on the signal, the abort during an empty foreach is lost to success (mutant)', async () => {
+  it('without join\'s inhibitor on the signal, the abort during an empty foreach is lost to success (mutant)', async () => {
     const once = async (gadget: Gadget) => {
       const ac = new AbortController();
       const c = tapped('canceled', gadget);
@@ -1440,11 +1480,11 @@ describe('foreach over no items, canceled (row 49)', () => {
       return { status: report.outcome.status, recorded: report.stepResults.get('body')?.status, seen: c.seen };
     };
     expect(await once(foreachGadget)).toEqual({ status: 'canceled', recorded: 'canceled', seen: [{ origin, output: [], started: true }] });
-    // `join-empty` is declared before `canceled-empty`, so without the arc the tie-break
+    // `join` is declared before the cancel finishers, so without the arc the tie-break
     // ([EXEC-002]) takes it: the foreach records success though the run was aborted inside it.
     // The kernel still reports the run canceled (the entry-level rule), which is why the record is
     // what this checks.
-    const mutant = await once(mutated({ transition: /\.items\.join-empty$/, dropInhibitor: /^wf\.cancel$/ }));
+    const mutant = await once(mutated({ transition: /\.items\.join$/, dropInhibitor: /^wf\.cancel$/ }));
     expect(mutant.recorded).toBe('success');
     expect(mutant.seen).toEqual([]);
   });

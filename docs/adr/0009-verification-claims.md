@@ -71,7 +71,7 @@ bound, and a missing link would not strand anything.
 run of the model; on a net with timed transitions it may be one the clock rules out — the report
 names the route.
 
-**Two phases per query.** libpetri tries the enumeration route first, and on a wide net it declines
+**Two phases per query** (retired on the libpetri 8.0.0 upgrade in favour of its `StateSpaceCache`). libpetri tries the enumeration route first, and on a wide net it declines
 only after exhausting its class budget — 3–5 s a query on `parallel-wide`, where the linear bound
 of [VER-015] proves the same barrier claim in about 20 ms (measured against libpetri 7.0.0, not
 linked). So each bounds, exclusion and liveness query first runs with enumeration off and a short
@@ -98,6 +98,35 @@ nested workflows too; and the `mastra-libpetri verify <module>` CLI, which exits
 claim that does not hold — `unknown` included — and 2 when no solver resolves. `verify` asserts the
 libpetri surface at entry.
 
+**Amended on the libpetri 8.0.0 upgrade (2026-10-03): in-flight firing, and a foreach that is
+cheap to prove.** 8.0.0 verifies a firing whose outputs another transition tests (inhibitor,
+reset, `all()`, `atLeast()`) as a start and a completion ([VER-004]), as the executor runs it, where
+7.0.0 read every firing as one step. On its unreleased snapshot that found a real gap in the old
+foreach: a lane's `start` in flight held the cursor through a sibling's `queue.kill()` — a reset of
+an empty place — and put it back, stranding the cursor at 2+ lanes and, at 3+, letting a freed lane
+start an item Mastra's killed queue never starts. The TypeScript executor did not show it in 2,400
+runs; the model covers executors that interleave more.
+
+Patching that gap left the old net correct but unprovable: unbounded (results and recorded outcomes
+piled up as tokens, so nothing enumerated) and mostly split (its precedence lived in inhibitors,
+resets and drains), its 2-lane `deadlockFree` was `unknown` after 900 s. **The rule adopted: a
+proof that does not close in 30 s is a net to redesign, not a budget to raise.** The foreach was
+rebuilt on suggestions from the libpetri session: results and recorded outcomes ride the `frame`
+token as data; what has been recorded is a complement pair per kind (`no-fault`/`fault`,
+`no-exit`/`exit`, `no-susp`/`susp`) consumed one token at a time, so precedence is which finisher
+can fire; the queue is `queue.open` / `queue.closed`, and a non-success settle *takes* it — waiting
+for an in-flight start instead of racing it — so the revival is impossible by construction and
+fail-fast is a marking property again (`mutualExclusion(queue.open, fault | exit)`). Every place
+holds at most one token and every arc takes one; no settle is split. The 2-lane closed segment's
+completion proofs went from `unknown` at 900 s to 29 ms, 5 lanes to under 8 s a query — all
+`proven` under in-flight firing. The window between an item's outcome and its settle is closed at
+run time by priority (settles at 1, starts at 0), as Mastra's own window is an `await`; the
+priority-blind verifier explores it.
+
+`verify` keeps one defensive label: a proof that comes back `unknown` is re-asked once assuming
+atomic firing and the answer attached as `assumingAtomic` — never counted, the claim does not hold.
+The gate admits no exception, and every query in it has a 30 s budget.
+
 ## Consequences
 
 - `verifyWorkflow` and its report keys are unchanged: every existing test's verdict map still
@@ -108,8 +137,10 @@ libpetri surface at entry.
   read at runtime.
 - A gadget that adds a place bounded above 1 must say so, or its workflow stops verifying — which
   is the point.
-- The barrier is `O(|places| × 7)` queries per segment. Most settle structurally in milliseconds;
-  the corpus figures are in `tasks/todo.md` M6.
+- The barrier is `O(|places| × 7)` queries per segment. With libpetri 8.0.0's `StateSpaceCache` a
+  segment's state space is built once for all of them; the corpus figures are in `tasks/todo.md`.
+- *Amended on the 8.0.0 upgrade:* the quick phase and its route hint are retired — the cache does
+  their job — and so are the slow lane and its CI matrix: every corpus workflow runs in `npm test`.
 
 ## Evidence
 

@@ -14,7 +14,6 @@ import {
   resumeGateViolations,
   resumeTimingViolations,
   suspensionCoverageViolations,
-  thresholdOnlyViolations,
 } from './structure.js';
 import { budgetStructureViolations } from './budget.js';
 import { initialCounts } from '../engine/kernel.js';
@@ -198,9 +197,8 @@ function compareSiteKeys(a: string, b: string): number {
  * **Structure before behaviour.** A missing inhibitor on the cancel place still drains to exactly
  * one terminal — it only starts work Mastra would not — so no property above can see it.
  * `cancelStructureViolations` checks the net's arcs for it, exactly, and runs first — with the
- * budget check and the four resume checks ([ADR 0007]): every site gated, and swept into
- * `wf.canceled` alone (`resumeGateViolations`), the foreach counting places touched only by threshold arcs
- * (`thresholdOnlyViolations`), every suspendable step under a site
+ * budget check and the three resume checks ([ADR 0007]): every site gated, and swept into
+ * `wf.canceled` alone (`resumeGateViolations`), every suspendable step under a site
  * (`suspensionCoverageViolations`), and no timed transition enabled by a seed
  * (`resumeTimingViolations`).
  *
@@ -226,7 +224,6 @@ export async function verifyWorkflow(
       ['cancellation structure', cancelStructureViolations],
       ['step budget structure', budgetStructureViolations],
       ['resume gate structure', resumeGateViolations],
-      ['foreach threshold structure', thresholdOnlyViolations],
       ['suspension coverage', suspensionCoverageViolations],
       ['resume timing structure', resumeTimingViolations],
     ];

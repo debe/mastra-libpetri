@@ -100,30 +100,20 @@ describe('derivation', () => {
     ));
     const bound = new Map(boundClaims(compiled).claimed.map((c) => [c.place.name, c.bound]));
     for (const role of ['arrived', 'arm-err', 'arm-bail', 'arm-susp', 'arm-pause', 'err-seen', 'susp-seen']) expect(bound.get(`s.0.fan.${role}`), role).toBe(3);
-    expect(bound.get('s.2.items.faults')).toBe(2);
-    expect(bound.get('s.2.items.exits')).toBe(2);
-    expect(bound.get('s.2.items.cursor')).toBe(1);
-    expect(boundClaims(compiled).unclaimed.map((u) => u.place)).toEqual([
-      's.1.poll.budget',
-      's.2.items.parked',
-      's.2.items.results',
-      's.2.items.suspensions',
-    ]);
+    // The foreach claims nothing above 1: its results and recorded outcomes ride the frame.
+    for (const name of [...compiled.net.places].map((p) => p.name).filter((n) => n.startsWith('s.2.items.'))) expect(bound.get(name), name).toBe(1);
+    expect(boundClaims(compiled).unclaimed.map((u) => u.place)).toEqual(['s.1.poll.budget']);
     const declared = exclusions(compiled).filter((e) => e.source === 'gadget').map((e) => `${e.a.name}|${e.b.name}`);
     expect(declared).toEqual([
-      's.2.items.cursor|s.2.items.faults',
-      's.2.items.cursor|s.2.items.exits',
-      's.2.items.cursor|s.2.items.suspensions',
+      's.2.items.queue.open|s.2.items.queue.closed',
+      's.2.items.queue.open|s.2.items.fault',
+      's.2.items.queue.open|s.2.items.exit',
+      's.2.items.no-fault|s.2.items.fault',
+      's.2.items.no-exit|s.2.items.exit',
+      's.2.items.no-susp|s.2.items.susp',
       's.2.items.lane0.permit|s.2.items.lane0.slot',
       's.2.items.lane1.permit|s.2.items.lane1.slot',
     ]);
-  });
-
-  it('lists a foreach\'s record bounds above two lanes as unclaimed, with the reason, rather than claiming what z3 cannot decide', () => {
-    const compiled = compile(wf({ kind: 'foreach', id: 'items', body: step('item'), concurrency: 3 }));
-    const unclaimed = boundClaims(compiled).unclaimed;
-    expect(unclaimed.map((u) => u.place)).toEqual(['s.0.items.exits', 's.0.items.faults', 's.0.items.parked', 's.0.items.results', 's.0.items.suspensions']);
-    expect(unclaimed.find((u) => u.place === 's.0.items.faults')!.why).toMatch(/unknown to z3 above 2 lanes/);
   });
 
   it('records each step\'s chain and targets every attempt, retries included', () => {
@@ -204,7 +194,7 @@ describe('verify: every family holds on real shapes', () => {
     ['a loop', wf(step('a'), { kind: 'loop', id: 'poll', body: step('tick', 1), loopType: 'dowhile', iterationBound: 3 }), undefined],
   ])('%s', async (_label, description, k) => {
     const compiled = compile(description, k === undefined ? {} : { concurrency: k });
-    const report = await verify(compiled, { timeoutMs: 120_000 });
+    const report = await verify(compiled, { timeoutMs: 30_000 });
     expect(report.families).toEqual(['completion', 'bounds', 'exclusion', 'liveness']);
     expect(report.k).toBe(k ?? 'unbounded');
     expectHolds(report);

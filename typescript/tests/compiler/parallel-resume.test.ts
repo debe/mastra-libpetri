@@ -10,7 +10,6 @@ import {
   resumeTimingViolations,
   segmentLabel,
   suspensionCoverageViolations,
-  thresholdOnlyViolations,
   verifyWorkflow,
   type PropertyReport,
 } from '../../src/verify/index.js';
@@ -147,7 +146,6 @@ describe('parallel resume: structure', () => {
       expect(cancelStructureViolations(compiled)).toStrictEqual([]);
       expect(budgetStructureViolations(compiled)).toStrictEqual([]);
       expect(resumeGateViolations(compiled)).toStrictEqual([]);
-      expect(thresholdOnlyViolations(compiled)).toStrictEqual([]);
       expect(suspensionCoverageViolations(compiled)).toStrictEqual([]);
       expect(resumeTimingViolations(compiled)).toStrictEqual([]);
     }
@@ -454,7 +452,7 @@ const BUDGET = ['permitsBounded', 'permitsReturned'];
 /** Every property of every segment — fresh ±cancel and each site ±cancel — must be `proven`. */
 async function expectAllProven(name: string, compiled: CompiledWorkflow, sites: readonly string[]): Promise<readonly PropertyReport[]> {
   expect([...compiled.resumeSites.keys()].sort()).toStrictEqual([...sites].sort());
-  const reports = await verifyWorkflow(compiled, { timeoutMs: 120_000 });
+  const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000 });
   const budget = compiled.budget ? BUDGET : [];
   const expected = ['closed', 'cancel', ...sites.flatMap((s) => [`resume@${s}`, `resume@${s}+cancel`])].flatMap((segment) =>
     (segment.endsWith('cancel') ? PROPERTIES_CANCEL : PROPERTIES_CLOSED).concat(budget).map((p) => `${segment}/${p}`),
@@ -509,7 +507,7 @@ describe('parallel resume: every site is proven as its own segment, with and wit
       return { ...result, transitions };
     };
     const compiled = compile(wf(fan('fan', [step('a'), step('b')])), { gadgets: { parallel: mutant } });
-    const reports = await verifyWorkflow(compiled, { timeoutMs: 120_000 });
+    const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000 });
     const verdict = (key: string) => reports.find((r) => `${segmentLabel(r.segment)}/${r.property}` === key)!.result.verdict.type;
     for (const r of reports) proofLines.push(`mutant replay-1 drops arrival: ${describeReport(r)}`);
     // Fresh segments never fire a replay, so they stay proven; the site that replays arm 1 does not.
