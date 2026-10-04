@@ -8,6 +8,8 @@
  * committed step flow (`adapt.ts`) to one net, and runs every firing on Mastra's `StepExecutor`.
  * `step-result.ts` translates the engine's step records to and from Mastra's `StepResult`;
  * `resume-codec.ts` decodes the `resume` parameter `Run.resume()` hands `execute()` ([ADR 0007]).
+ * `init()` also opens `Run.restart()` to petri runs, and `recovery.ts`'s `restartActiveRuns`
+ * restarts them at boot, beside Mastra's own hook, which skips them ([ADR 0010]).
  * See the root README for the architecture.
  */
 export { init, PETRI_ENGINE_TYPE } from './init.js';

@@ -326,10 +326,19 @@ describe('PetriExecutionEngine.execute — refusals', () => {
     return { outcome, calls };
   }
 
-  // Resume is implemented (ADR 0007), so it is not a mode refused by name; the refusal of one
-  // position it cannot place is asserted on its own below.
+  // Resume and restart are implemented (ADR 0007, ADR 0010), so neither is a mode refused by name;
+  // the refusal of a position either cannot place is asserted on its own below.
+  it('refuses a restart with no stored position as no-position, rejecting, and errors the run span once', async () => {
+    const { outcome, calls } = await direct({ restart: { activePaths: [], activeStepsPath: {}, stepResults: {}, state: {} } });
+    expect(outcome.ok).toBe(false);
+    const error = (outcome as { e: unknown }).e;
+    expect(error).toBeInstanceOf(UnsupportedRunModeError);
+    expect((error as UnsupportedRunModeError).mode).toBe('restart');
+    expect((error as UnsupportedRunModeError).restart).toStrictEqual({ path: [], reason: 'no-position' });
+    expect(calls).toEqual([{ span: 'run', method: 'error', args: { error } }]);
+  });
+
   it.each([
-    ['restart', { restart: { activePaths: [0], activeStepsPath: {}, stepResults: {}, state: {} } }],
     ['timeTravel', { timeTravel: { executionPath: [0], steps: ['a'], stepResults: {}, state: {} } }],
     ['perStep', { perStep: true }],
   ] as const)('refuses %s by name, rejecting, and errors the run span once', async (mode, extra) => {

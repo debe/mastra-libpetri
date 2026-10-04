@@ -120,14 +120,22 @@ const FRESH_PROVEN = {
 } as const;
 
 /**
- * Every report `verifyWorkflow` returns by default for `compiled`, keyed `segment/property`, each
- * `proven`: the fresh segments, then `resume@s` and `resume@s+cancel` for every registered site
- * ([ADR 0007]). The keys come from `segmentsFor`/`segmentLabel` — never by dropping keys — and
- * `neverCanceled` is proven only where no cancel arrives. None of these shapes compiles a budget.
+ * The segments this file proves: `verifyWorkflow`'s default with the restart segments left out —
+ * the fresh segments, then `resume@s` and `resume@s+cancel` for every registered site ([ADR 0007]).
+ * The restart segments ([ADR 0010]) are `tests/verify/restart-segments.test.ts`'s; leaving them out
+ * keeps every mutant's pinned flips about the fresh and resumed runs this file reasons over.
+ */
+const SEGMENTS = { restart: 'none' } as const satisfies VerifyOptions;
+
+/**
+ * Every report `verifyWorkflow` returns for `compiled` under {@link SEGMENTS}, keyed
+ * `segment/property`, each `proven`. The keys come from `segmentsFor`/`segmentLabel` — never by
+ * dropping keys — and `neverCanceled` is proven only where no cancel arrives. None of these shapes
+ * compiles a budget.
  */
 function allProven(compiled: CompiledWorkflow): Record<string, 'proven'> {
   expect(compiled.budget).toBeUndefined();
-  const keys = segmentsFor(compiled).flatMap((segment) => {
+  const keys = segmentsFor(compiled, SEGMENTS).flatMap((segment) => {
     const cancels = typeof segment === 'string' ? segment === 'cancel' : segment.cancel;
     return ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', ...(cancels ? [] : ['neverCanceled'])].map(
       (property) => `${segmentLabel(segment)}/${property}`,
@@ -141,13 +149,13 @@ function allProven(compiled: CompiledWorkflow): Record<string, 'proven'> {
 }
 
 /**
- * Proves with `verifyWorkflow`'s default: the structural checks (they throw on a violation), then
- * both fresh segments and both resume segments of every site, on the one closed net. Returns
+ * Proves with `verifyWorkflow` under {@link SEGMENTS}: the structural checks (they throw on a
+ * violation), then both fresh segments and both resume segments of every site, on the one closed net. Returns
  * every verdict keyed `segment/property`, in the order `segmentsFor` gives.
  */
 async function prove(label: string, compiled: CompiledWorkflow, options: VerifyOptions = {}): Promise<Record<string, string>> {
   const t0 = performance.now();
-  const reports: readonly PropertyReport[] = await verifyWorkflow(compiled, options);
+  const reports: readonly PropertyReport[] = await verifyWorkflow(compiled, { ...SEGMENTS, ...options });
   const ms = Math.round(performance.now() - t0);
   proofLog.push(`${label} (${ms}ms): ${reports.map(describeReport).join('; ')}`);
   const keyed = reports.map((r) => `${segmentLabel(r.segment)}/${r.property}`);
@@ -1009,7 +1017,8 @@ describe('classify precedence with a canceled terminal', () => {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Proofs, through `verifyWorkflow`'s default: the structural cancel check first, then both
+ * Proofs, through `verifyWorkflow` with the restart segments left out ({@link SEGMENTS}): the
+ * structural cancel check first, then both
  * segments on the one closed net — `closed` (initial marking one token in the entry place, the
  * request place empty: `deadlockFree`, `terminatesAtSink`, `exactlyOneTerminal`, `neverCanceled`)
  * and `cancel` (one token in the entry place AND one in `wf.cancel.request`, so `t.cancel.arrive`

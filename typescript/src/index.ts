@@ -24,6 +24,8 @@ export type {
   PetriWorkflow,
   UnsupportedRunMode,
 } from './mastra/index.js';
+export { restartActiveRuns } from './mastra/index.js';
+export type { RestartActiveRunsOptions, RestartActiveRunsReport, RestartRefusalReason } from './mastra/index.js';
 export { isMastraWorkflow, nestedWorkflows, verifyMastraWorkflow, workflowsIn } from './mastra/index.js';
 export type { MastraVerification, MastraVerifyOptions, VerifiableWorkflow } from './mastra/index.js';
 export {

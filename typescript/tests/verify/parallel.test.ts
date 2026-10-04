@@ -290,20 +290,26 @@ describe('compiled parallel, cancellation non-vacuity', () => {
     return { ...result, transitions };
   };
 
-  /** A resume segment pair's seven verdicts, keyed as `verifyWorkflow` reports them. */
-  const resumed = (site: string, cancelDeadlockFree: string, cancelExactlyOne: string) => ({
-    [`resume@${site}/deadlockFree`]: 'proven',
-    [`resume@${site}/terminatesAtSink`]: 'proven',
-    [`resume@${site}/exactlyOneTerminal`]: 'proven',
-    [`resume@${site}/neverCanceled`]: 'proven',
-    [`resume@${site}+cancel/deadlockFree`]: cancelDeadlockFree,
-    [`resume@${site}+cancel/terminatesAtSink`]: 'proven',
-    [`resume@${site}+cancel/exactlyOneTerminal`]: cancelExactlyOne,
+  /** A segment pair's seven verdicts (`segment` and `segment+cancel`), keyed as `verifyWorkflow` reports them. */
+  const pair = (segment: string, cancelDeadlockFree: string, cancelExactlyOne: string) => ({
+    [`${segment}/deadlockFree`]: 'proven',
+    [`${segment}/terminatesAtSink`]: 'proven',
+    [`${segment}/exactlyOneTerminal`]: 'proven',
+    [`${segment}/neverCanceled`]: 'proven',
+    [`${segment}+cancel/deadlockFree`]: cancelDeadlockFree,
+    [`${segment}+cancel/terminatesAtSink`]: 'proven',
+    [`${segment}+cancel/exactlyOneTerminal`]: cancelExactlyOne,
   });
+  const resumed = (site: string, cancelDeadlockFree: string, cancelExactlyOne: string) => pair(`resume@${site}`, cancelDeadlockFree, cancelExactlyOne);
+  const restarted = (boundary: number, cancelDeadlockFree: string, cancelExactlyOne: string) =>
+    pair(`restart@${boundary}`, cancelDeadlockFree, cancelExactlyOne);
 
   // The resume segments ([ADR 0007]). Site 0 is `before`'s input, the entry place itself, so its
   // pair starts where the fresh segments do and sees the stranding too. Every later site — an
   // arm, or `after` — is past the block's input, so the missing sweep is never on its path.
+  // The restart segments ([ADR 0010]): boundary 0 is the entry place (the fresh proofs, cited),
+  // boundary 1 is the block's input itself — the one segment that starts on the stranded place —
+  // and boundary 2 is `after`'s input, site 2's marking (its proofs, cited).
   for (const [label, shape, later] of [
     ['n = 2 between two steps', guarded, ['1.0', '1.1', '2']],
     ['n = 0 between two steps', guardedEmpty, ['2']],
@@ -328,7 +334,17 @@ describe('compiled parallel, cancellation non-vacuity', () => {
         'cancel/exactlyOneTerminal': 'violated',
         ...resumed('0', 'violated', 'violated'),
         ...Object.fromEntries(later.flatMap((site) => Object.entries(resumed(site, 'proven', 'proven')))),
+        ...restarted(0, 'violated', 'violated'),
+        ...restarted(1, 'violated', 'violated'),
+        ...restarted(2, 'proven', 'proven'),
       });
+      const cited = Object.fromEntries(reports.map((r) => [keyOf(r), r.sameProofAs === undefined ? undefined : segmentLabel(r.sameProofAs)]));
+      for (const [property, cancel] of [['deadlockFree', false], ['exactlyOneTerminal', true]] as const) {
+        const suffix = cancel ? '+cancel' : '';
+        expect(cited[`restart@0${suffix}/${property}`], all).toBe(cancel ? 'cancel' : 'closed');
+        expect(cited[`restart@1${suffix}/${property}`], all).toBeUndefined();
+        expect(cited[`restart@2${suffix}/${property}`], all).toBe(`resume@2${suffix}`);
+      }
       proofLog(`[mutant sweep ${label}] ${all}`);
     }, 360_000);
   }

@@ -7,6 +7,7 @@ export {
   segmentInitialMarking,
   segmentsFor,
   completionProperties,
+  markingKey,
 } from './properties.js';
 export type { PropertyReport, RestartSegment, ResumeSegment, Segment, VerifyOptions } from './properties.js';
 export {
@@ -14,6 +15,7 @@ export {
   resumeGateViolations,
   suspensionCoverageViolations,
   resumeTimingViolations,
+  checkpointStructureViolations,
 } from './structure.js';
 export { budgetStructureViolations } from './budget.js';
 export { verify, describeClaim, provenOnlyAssumingAtomic, FAMILIES } from './workflow.js';

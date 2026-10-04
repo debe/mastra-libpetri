@@ -19,6 +19,7 @@ import { parallelGadget } from './gadgets/parallel.js';
 import { branchGadget } from './gadgets/branch.js';
 import { loopGadget } from './gadgets/loop.js';
 import { foreachGadget } from './gadgets/foreach.js';
+import { checkpointGadget, notStartedAt } from './gadgets/checkpoint.js';
 import type { Gadget, GadgetContext, GadgetResult, NestedOptions } from './gadgets/types.js';
 import type {
   BailToken,
@@ -87,10 +88,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
     // Mastra refuses this too, before persisting anything (`WORKFLOW_EXECUTE_EMPTY_GRAPH`).
     throw new Error(`workflow '${description.id}' has no entries; nothing to compile`);
   }
-  if ((description.checkpoints ?? []).length > 0) {
-    // ADR 0010, M4b W1: the checkpoint place, transition and sweep are not emitted yet.
-    throw new Error(`workflow '${description.id}': checkpoints are not compiled yet (M4b W1)`);
-  }
+  const checkpoints = checkpointsOf(description);
 
   const names = new NameVocabulary();
   const gadgets = { ...defaultGadgets(), ...options.gadgets };
@@ -244,14 +242,32 @@ export function compile(description: WorkflowDescription, options: CompileOption
 
   // Right to left: entry i produces into entry i+1's place, so that place must exist first. Every
   // top-level entry is gated: Mastra checks its signal before each one (`default.ts:815`).
+  //
+  // A checkpoint after entry i ([ADR 0010]) sits between the two: entry i's gadget produces into
+  // `s.<i>.checkpoint`, the checkpoint's write into entry i+1's input, and its cancel sweep into
+  // `wf.canceled`, reporting what entry i+1's own sweep would (`gadgets/checkpoint.ts`). An
+  // unmarked entry emits exactly what it did before, so an unmarked workflow is today's net.
   const last = description.entries.length - 1;
+  const marked = new Set(checkpoints);
   let next: Place<FlowToken> = settleDone;
   const nextOf: string[] = [];
   for (let i = last; i >= 0; i--) {
     const entry = description.entries[i]!;
     pathToEntry.set(String(i), { entryId: entry.id, kind: entry.kind });
+    // `nextOf[i]` is the next entry's input even when a checkpoint sits before it: it is what the
+    // barrier names as entry i's `next`, and what `boundaries[i + 1]` resolves to (see `entries`).
     nextOf[i] = next.name;
-    next = emit(entry, [i], next, topLevelExits, i === last, { cancel }).inPlace;
+    let successOf = next;
+    if (marked.has(i)) {
+      // i < last, so entry i + 1 exists: its never-started cancel is what the sweep reports.
+      const checkpoint = checkpointGadget(i, next, cancel, terminals.canceled, notStartedAt(description.entries[i + 1]!, i + 1), names);
+      for (const t of checkpoint.transitions) {
+        transitions.push(t);
+        transitionToEntry.set(t.name, { path: [i], id: entry.id });
+      }
+      successOf = checkpoint.place;
+    }
+    next = emit(entry, [i], successOf, topLevelExits, i === last, { cancel }).inPlace;
     const site = entrySite(entry, i, next);
     if (site) registerSite(site);
   }
@@ -274,6 +290,16 @@ export function compile(description: WorkflowDescription, options: CompileOption
 
   // An entry owns every place named under its index, its arms' and lanes' included (`s.1.` and
   // `s.1-0.`): the vocabulary names nothing else there, and nothing it owns is named elsewhere.
+  //
+  // **A checkpoint belongs to the entry before it.** `s.<i>.checkpoint` is named under `s.<i>.`, so
+  // it is in entry i's interior, and entry i's `next` stays entry i+1's input. Only entry i's success
+  // fills it, so it is entry i's place by the same argument as every other. The barrier then reads
+  // *entry i and its checkpoint have both finished before entry i+1's input is marked* — the
+  // freeze ADR 0010 promises: no effect of entry i+1 before the row is written — and the checkpoint
+  // place is exclusive with every outcome place, so no run ends with a write pending. Making the
+  // checkpoint place entry i's `next` instead would put it in its own boundary (it is interior) and
+  // the claim would be false; leaving it out of the interior would drop the claim that the write
+  // precedes entry i+1.
   const placeNames = [...net.places].map((p) => p.name);
   const entries: TopLevelEntry[] = description.entries.map((entry, index) => ({
     index,
@@ -310,9 +336,34 @@ export function compile(description: WorkflowDescription, options: CompileOption
     entries,
     resumeSites,
     boundaries,
-    checkpoints: [...(description.checkpoints ?? [])],
-    structuralHash: structuralHash(description, names.names()),
+    checkpoints,
+    structuralHash: structuralHash(description, checkpoints, names.names()),
   };
+}
+
+/**
+ * The checkpoints a description marks ([ADR 0010]), checked: whole numbers, strictly ascending, each
+ * after a top-level entry that has a successor. The adapter emits exactly this; a hand-written
+ * description that does not is refused rather than repaired, since a mark on the last entry or out
+ * of range means its author expected a write that would never happen.
+ */
+function checkpointsOf(description: WorkflowDescription): readonly number[] {
+  const marks = description.checkpoints ?? [];
+  const last = description.entries.length - 1;
+  let previous = -1;
+  for (const i of marks) {
+    if (!Number.isInteger(i) || i < 0 || i >= last) {
+      throw new Error(
+        `workflow '${description.id}': checkpoint ${String(i)} is not after a top-level entry with a successor ` +
+          `(0..${last - 1}); a mark on the last entry adds nothing — its terminal row covers it`,
+      );
+    }
+    if (i <= previous) {
+      throw new Error(`workflow '${description.id}': checkpoints must be strictly ascending, got [${marks.join(', ')}]`);
+    }
+    previous = i;
+  }
+  return [...marks];
 }
 
 /**
@@ -347,7 +398,7 @@ function entrySite(entry: EntryDescription, index: number, inPlace: Place<FlowTo
  *
  * A per-run wait hashes as `perRun`, not as a value — that is the point of it being per run.
  */
-function structuralHash(description: WorkflowDescription, names: readonly string[]): string {
+function structuralHash(description: WorkflowDescription, checkpoints: readonly number[], names: readonly string[]): string {
   const step = (s: StepDescription): unknown => [
     'step',
     s.id,
@@ -366,8 +417,11 @@ function structuralHash(description: WorkflowDescription, names: readonly string
       case 'foreach': return [entry.kind, entry.id, entry.concurrency, step(entry.body)];
     }
   };
+  // Checkpoints join the key only when there are any, so an unmarked description hashes byte for
+  // byte as it did before checkpoints existed (the names would tell them apart anyway).
+  const marks = checkpoints.length > 0 ? { checkpoints } : {};
   return createHash('sha256')
-    .update(JSON.stringify({ v: 5, id: description.id, shape: description.entries.map(shape), names }))
+    .update(JSON.stringify({ v: 5, id: description.id, shape: description.entries.map(shape), names, ...marks }))
     .digest('hex')
     .slice(0, 16);
 }

@@ -76,14 +76,15 @@ function everyKey(compiled: CompiledWorkflow, sites: readonly string[]): string[
   );
 }
 
-/** `verifyWorkflow`'s default, every structural check clean, every property of every segment proven. */
+/** `verifyWorkflow`'s default less the restarts, every structural check clean, every property of every segment proven. */
 async function proveAll(expect: ExpectStatic, label: string, compiled: CompiledWorkflow, sites: readonly string[]): Promise<void> {
   expect([...compiled.resumeSites.keys()].sort()).toStrictEqual([...sites].sort());
   for (const check of [cancelStructureViolations, budgetStructureViolations, resumeGateViolations, suspensionCoverageViolations, resumeTimingViolations]) {
     expect(check(compiled), check.name).toStrictEqual([]);
   }
   const started = Date.now();
-  const reports = await verifyWorkflow(compiled, { timeoutMs: BUDGET_MS });
+  // The fresh and resume segments alone: the restart segments ([ADR 0010]) are restart-segments.test.ts's.
+  const reports = await verifyWorkflow(compiled, { timeoutMs: BUDGET_MS, restart: 'none' });
   proofLog(`[${label}] total ${Date.now() - started}ms; ${reports.map(describeReport).join('; ')}`);
   expect(reports.map(keyOf).sort()).toStrictEqual(everyKey(compiled, sites).sort());
   for (const r of reports) expect(r.result.verdict.type, `${label}: ${describeReport(r)}`).toBe('proven');

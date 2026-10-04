@@ -21,10 +21,10 @@ interface PersistBase {
   readonly serializedStepGraph: unknown;
   readonly requestContext: unknown;
   /**
-   * Present on a resumed run ([ADR 0007]). Every write then carries the **whole** stored context
-   * with this segment's records over it — as the default engine's writes spread its `stepResults`,
-   * which start as the stored ones (`default.ts:800-807`, `handlers/step.ts:216-229`). A write of
-   * `{ input }` alone would erase every stored step result.
+   * Present on a resumed ([ADR 0007]) or restarted ([ADR 0010]) run. Every write then carries the
+   * **whole** stored context with this segment's records over it — as the default engine's writes
+   * spread its `stepResults`, which start as the stored ones (`default.ts:800-807`,
+   * `handlers/step.ts:216-229`). A write of `{ input }` alone would erase every stored step result.
    */
   readonly resume?: ResumedFrom;
 }
@@ -40,6 +40,10 @@ interface PersistBase {
  *   this engine last wrote the run `suspended` or `paused` (see {@link PersistGuard}). It is the
  *   write `Run`'s claim release looks for (`workflow.ts:4760-4806`): the stored `suspendedPaths` are
  *   gone from it, so a run that fails after it can never be re-armed as `suspended`.
+ * - `checkpoint` — after an author-marked top-level entry succeeded ([ADR 0010]): status
+ *   `running`, the stored context (on a resumed or restarted run) then the records so far, the
+ *   run's state, `activePaths [after + 1]`. A `running` write like `start`: under the same guard,
+ *   predicate and `pruneSnapshot`. A restart writes no start row, only checkpoints and the terminal.
  * - `terminal` — after `formatWorkflowResult`: the run's report, and the formatted result, which is
  *   the **single source** of the snapshot's `stepExecutionPath` — the default engine hands the same
  *   list to `fmtReturnValue` and to the snapshot (`default.ts:954-967`).
@@ -65,6 +69,13 @@ export type PersistContext = PersistBase &
         readonly phase: 'checkpoint';
         readonly after: number;
         readonly records: ReadonlyMap<string, StepRecord>;
+        /**
+         * The run's `stepExecutionPath` through entry `after` — the carried list, then this
+         * segment's pushing entries up to `after` (`checkpointExecutionPath` in `result.ts`, the
+         * helper the terminal result's path is built with). Built by the engine, which holds the
+         * live graph, as the terminal row's comes from the formatted result.
+         */
+        readonly stepExecutionPath: readonly string[];
       }
     | {
         readonly phase: 'terminal';
@@ -117,8 +128,11 @@ export interface PersistGuard {
  * engine reads `engine.options` too, so reading them here is Mastra's contract for every engine.
  *
  * The phases stand for the default engine's many writes (`docs/divergences.md`): `start` and
- * `resume-start` for the first `running` write (`handlers/step.ts:216-229`), `terminal` for the
- * `terminal` / `workflow-end` / loop-top `canceled` write (`default.ts:814-835,954-967,1081-1093`).
+ * `resume-start` for the first `running` write (`handlers/step.ts:216-229`), `checkpoint` for the
+ * `running` write after an author-marked entry ([ADR 0010]), `terminal` for the `terminal` /
+ * `workflow-end` / loop-top `canceled` write (`default.ts:814-835,954-967,1081-1093`). A
+ * checkpoint's write is awaited by its firing: a rejection from storage — or from the predicate or
+ * `pruneSnapshot` — rejects here and fails the run.
  */
 export async function persistRun(engine: ExecutionEngine, ctx: PersistContext, guard?: PersistGuard): Promise<void> {
   const workflowStatus = statusOf(ctx);
@@ -187,12 +201,18 @@ export function buildRunSnapshot(ctx: PersistContext, now: number = Date.now()):
     timestamp: now,
   };
 
-  if (ctx.phase === 'start' || ctx.phase === 'resume-start') {
+  // A `running` row, in the start row's key order. A checkpoint ([ADR 0010]) stands at the boundary
+  // after entry `after`: `activePaths [after + 1]`, so Mastra's own restart of it — and this
+  // engine's — starts at the next entry from the records. No step is in flight
+  // (`activeStepsPath {}`), the run suspended nowhere and wrote no label it still carries
+  // (`suspendedPaths`/`resumeLabels {}`), and nothing passes a tracing context with a `running`
+  // write (the key is present, `undefined`, as on every other `running` row).
+  if (ctx.phase === 'start' || ctx.phase === 'resume-start' || ctx.phase === 'checkpoint') {
     return {
       ...common,
       status: 'running',
-      activePaths: ctx.phase === 'start' ? [0] : [...ctx.activePath],
-      stepExecutionPath: [...(ctx.resume?.carriedPath ?? [])],
+      activePaths: ctx.phase === 'start' ? [0] : ctx.phase === 'checkpoint' ? [ctx.after + 1] : [...ctx.activePath],
+      stepExecutionPath: ctx.phase === 'checkpoint' ? [...ctx.stepExecutionPath] : [...(ctx.resume?.carriedPath ?? [])],
       suspendedPaths: {},
       resumeLabels: {},
       result: undefined,
@@ -200,8 +220,6 @@ export function buildRunSnapshot(ctx: PersistContext, now: number = Date.now()):
       tracingContext: undefined,
     };
   }
-
-  if (ctx.phase === 'checkpoint') throw new Error('buildRunSnapshot: checkpoint rows are not built yet (M4b W3)');
 
   const o = ctx.report.outcome;
   const { index, afterEntry } = terminalPosition(o, graph, ctx.resume?.index);
@@ -374,11 +392,13 @@ function statusOf(ctx: PersistContext): WorkflowRunStatus {
 }
 
 /**
- * Mastra's `stepResults`: seeded `{ input }` (`default.ts:805-807`) — or, on a resumed run, the
- * stored context whole (`:800-807`) — then every record of this run, in record order.
+ * Mastra's `stepResults`: seeded `{ input }` (`default.ts:805-807`) — or, on a resumed or restarted
+ * run, the stored context whole (`:800-807`) — then every record of this run, in record order: at
+ * the end the report's, at a checkpoint the records so far.
  */
 function contextOf(ctx: PersistContext, now: number): Record<string, unknown> {
-  const records = ctx.phase === 'terminal' ? ctx.report.stepResults : new Map<string, StepRecord>();
+  const records =
+    ctx.phase === 'terminal' ? ctx.report.stepResults : ctx.phase === 'checkpoint' ? ctx.records : new Map<string, StepRecord>();
   return stepResultsOf(ctx.input, records, () => 0, now, ctx.resume?.context);
 }
 

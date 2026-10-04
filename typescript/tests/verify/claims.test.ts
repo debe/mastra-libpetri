@@ -229,7 +229,7 @@ describe('non-vacuity: one mutant per family, which every completion proof passe
       return rest;
     };
     const compiled = compile(wf({ kind: 'parallel', id: 'fan', arms: [step('x'), step('y')] }), { gadgets: { parallel: unclaimed } });
-    const report = await verify(compiled, { families: ['completion', 'bounds'], resume: 'none' });
+    const report = await verify(compiled, { families: ['completion', 'bounds'], resume: 'none', restart: 'none' });
     // Every place a settling arm writes, in both fresh segments; the collect places each take one.
     const over = ['arm-bail', 'arm-err', 'arm-pause', 'arm-susp', 'arrived', 'err-seen', 'susp-seen'];
     expect(failing(report)).toEqual(['cancel', 'closed'].flatMap((s) => over.map((r) => `${s}/bound(s.0.fan.${r}<=1)`)));

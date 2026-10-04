@@ -40,6 +40,7 @@ import type {
   ResumeRouteLabel,
   TraceEvent,
 } from '../../src/conformance/differential.js';
+import type { PersistedRow, RestartAttribution, RestartCase, RestartObservation } from '../../src/conformance/restart.js';
 
 /** The loop bound the petri engine requires and Mastra does not have (`docs/divergences.md` row 13). */
 export const ITERATION_BOUND = 20;
@@ -1760,3 +1761,289 @@ function foreachResumeFixtures(): ResumeFixture[] {
 function assertNever(value: never): never {
   throw new Error(`unhandled engine: ${String(value)}`);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Crash, then restart ([ADR 0010])
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A fixture that is run to its end on one engine, its every persisted row recorded, and restarted
+ * from each `running` / `waiting` row it wrote (`src/conformance/restart.ts`). Marked with
+ * `metadata: { checkpoint: true }` where a checkpoint is wanted: the default engine ignores the mark.
+ */
+export interface RestartFixture {
+  readonly name: string;
+  /** The workflow id: the storage key both engines share. */
+  readonly id: string;
+  readonly input: unknown;
+  /** The oracle's outcome of the uninterrupted run, so a broken fixture cannot pass by failing on both. */
+  readonly expected: string;
+  readonly build: (cfg: EngineConfig, rec: Recorder) => Runnable;
+  readonly divergences?: readonly RestartAttribution[];
+  readonly independent?: readonly IndependentPair[];
+  /** As {@link MastraFixture.width}. */
+  readonly width?: number;
+}
+
+interface RestartableRun extends ResumableRun {
+  restart(args?: Record<string, unknown>): Promise<unknown>;
+}
+
+/** Registers `wf` on a new `Mastra` over `storage`, with `restart()` on its runs. */
+function registerRestartable(storage: InMemoryStore, wf: Runnable): { createRun(options: { runId: string }): Promise<RestartableRun> } {
+  return register(storage, wf) as unknown as { createRun(options: { runId: string }): Promise<RestartableRun> };
+}
+
+/** Wraps the store's `persistWorkflowSnapshot` so every row is recorded, in call order, as written. */
+async function recordWrites(storage: InMemoryStore): Promise<{ rows: PersistedRow[]; seed(rows: readonly PersistedRow[]): Promise<void> }> {
+  const store = await storage.getStore('workflows');
+  if (!store) throw new Error('InMemoryStore has no workflows store');
+  const real = store.persistWorkflowSnapshot.bind(store);
+  const rows: PersistedRow[] = [];
+  store.persistWorkflowSnapshot = async (args) => {
+    rows.push({ workflowName: args.workflowName, runId: args.runId, snapshot: structuredClone(args.snapshot) });
+    return real(args);
+  };
+  return {
+    rows,
+    seed: async (seed) => {
+      for (const r of seed) await real({ workflowName: r.workflowName, runId: r.runId, snapshot: structuredClone(r.snapshot) as never });
+    },
+  };
+}
+
+const restartRunId = (f: RestartFixture) => `${f.id}-run`;
+
+/** Runs the fixture to its end on `writer` over a fresh store, returning every row it persisted, in order. */
+export async function crashRows(fixture: RestartFixture, writer: EngineName, concurrency?: number): Promise<{ rows: PersistedRow[]; outcome: string }> {
+  const storage = new InMemoryStore();
+  const { rows } = await recordWrites(storage);
+  const wf = registerRestartable(storage, fixture.build(engineConfig(writer, concurrency), new Recorder()));
+  const run = await wf.createRun({ runId: restartRunId(fixture) });
+  let outcome: string;
+  try {
+    const result = (await run.start({ inputData: fixture.input })) as { status?: unknown };
+    outcome = String(result.status);
+  } catch {
+    outcome = 'rejected';
+  }
+  return { rows, outcome };
+}
+
+/**
+ * A new process: a fresh `Mastra` over a fresh store holding exactly `seed`, a fresh build on
+ * `engine`, and `createRun({ runId }).restart()`. Records the outcome, storage after it, the steps
+ * it ran, the `execute()` calls it caused and how many rows it wrote.
+ */
+export async function observeRestart(fixture: RestartFixture, engine: EngineName, seed: readonly PersistedRow[], concurrency?: number): Promise<RestartObservation> {
+  const storage = new InMemoryStore();
+  const writes = await recordWrites(storage);
+  await writes.seed(seed);
+  const rec = new Recorder();
+  const executions: Execution[] = [];
+  const undo = [
+    probeExecute(PetriExecutionEngine.prototype, 'petri', executions),
+    probeExecute(DefaultExecutionEngine.prototype, 'default', executions),
+  ];
+  let outcome: RestartObservation['outcome'];
+  try {
+    const wf = registerRestartable(storage, fixture.build(engineConfig(engine, concurrency), rec));
+    const run = await wf.createRun({ runId: restartRunId(fixture) });
+    rec.bind(run);
+    outcome = { kind: 'resolved', result: await run.restart() };
+  } catch (error) {
+    outcome = { kind: 'rejected', error };
+  } finally {
+    for (const u of undo.reverse()) u();
+  }
+  return { outcome, stored: await storedRuns(storage), trace: [...rec.events], executions, writes: writes.rows.length };
+}
+
+/** The fixture as a restart case, the petri engine built with run budget `concurrency` (absent: unbounded). */
+export function toRestartCase(fixture: RestartFixture, concurrency?: number): RestartCase {
+  return {
+    name: fixture.name,
+    workflowName: fixture.id,
+    crash: async (writer) => (await crashRows(fixture, writer, concurrency)).rows,
+    restart: (engine, seed) => observeRestart(fixture, engine, seed, concurrency),
+    ...(concurrency === undefined ? {} : { concurrency }),
+    divergences: fixture.divergences ?? [],
+    ...(fixture.independent === undefined ? {} : { independent: fixture.independent }),
+  };
+}
+
+const CP = { metadata: { checkpoint: true } } as const;
+
+/** `nStep` with a checkpoint mark: `createStep({ metadata })`. */
+function markedStep<const Id extends string>(rec: Recorder, id: Id, fn: (n: number) => number | Promise<number>) {
+  return createStep({
+    id,
+    inputSchema: N,
+    outputSchema: N,
+    ...CP,
+    execute: async ({ inputData }) => rec.around(id, async () => ({ n: await fn(inputData.n) })),
+  });
+}
+
+const restartFixture = (f: RestartFixture): RestartFixture => f;
+
+export const RESTART_FIXTURES: readonly RestartFixture[] = [
+  restartFixture({
+    name: 'restart-step',
+    id: 'rt-step',
+    input: { n: 1 },
+    expected: 'success',
+    build: (cfg, rec) =>
+      wf('rt-step', cfg)
+        .then(markedStep(rec, 'a', (n) => n + 1))
+        .then(nStep(rec, 'b', (n) => n * 10))
+        .then(nStep(rec, 'c', (n) => n - 3))
+        .commit(),
+  }),
+  restartFixture({
+    name: 'restart-parallel',
+    id: 'rt-par',
+    width: 2,
+    input: { n: 1 },
+    expected: 'success',
+    build: (cfg, rec) =>
+      wf('rt-par', cfg)
+        .then(nStep(rec, 'pre', (n) => n + 1))
+        .parallel([nStep(rec, 'left', async (n) => (await tick(), n * 2)), nStep(rec, 'right', (n) => n * 3)], CP)
+        .then(sumArms(rec, 'join'))
+        .commit(),
+    divergences: [
+      {
+        row: 92,
+        routes: ['default>petri'],
+        activePaths: [[1]],
+        paths: ['trace.left#0', 'trace.right#0'],
+        reason:
+          "Mastra's entry-end row of the .parallel() ([1], activeStepsPath {}) stores both arms succeeded; Mastra's restart keeps every arm whose record is not running and re-runs none (control-flow.ts:186-221), the petri engine re-runs the entry whole",
+      },
+    ],
+  }),
+  restartFixture({
+    name: 'restart-sleep',
+    id: 'rt-sleep',
+    input: { n: 1 },
+    expected: 'success',
+    build: (cfg, rec) =>
+      wf('rt-sleep', cfg)
+        .then(markedStep(rec, 'a', (n) => n + 1))
+        .sleep(5)
+        .then(nStep(rec, 'b', (n) => n * 2))
+        .commit(),
+  }),
+  restartFixture({
+    name: 'restart-loop',
+    id: 'rt-loop',
+    input: { n: 0 },
+    expected: 'success',
+    build: (cfg, rec) =>
+      wf('rt-loop', cfg)
+        .dountil(nStep(rec, 'body', (n) => n + 1), async ({ inputData }) => inputData.n >= 3, CP)
+        .then(nStep(rec, 'after', (n) => n * 10))
+        .commit(),
+    divergences: [
+      {
+        row: 93,
+        routes: ['default>petri'],
+        activePaths: [[0]],
+        paths: ['trace.body#1', 'trace.body#2'],
+        reason:
+          "Mastra's row at iteration 2 or 3's start stores the body running with its iterationCount; Mastra continues there on the stored payload (control-flow.ts:726-735), the petri engine restarts the loop at iteration 1 on the entry's input and runs the earlier iterations again",
+      },
+    ],
+  }),
+  restartFixture({
+    name: 'restart-foreach',
+    id: 'rt-fe',
+    width: 2,
+    input: { n: 3 },
+    expected: 'success',
+    independent: [
+      ['item:1', 'item:2'],
+      ['item:1', 'item:3'],
+      ['item:2', 'item:3'],
+    ],
+    build: (cfg, rec) =>
+      wf('rt-fe', cfg)
+        .then(
+          createStep({
+            id: 'explode',
+            inputSchema: N,
+            outputSchema: z.array(N),
+            ...CP,
+            execute: async ({ inputData }) => rec.around('explode', () => Array.from({ length: inputData.n }, (_, i) => ({ n: i + 1 }))),
+          }),
+        )
+        .foreach(
+          createStep({
+            id: 'item',
+            inputSchema: N,
+            outputSchema: N,
+            execute: async ({ inputData }) => rec.around(`item:${inputData.n}`, () => ({ n: inputData.n * 10 })),
+          }),
+          { concurrency: 2 },
+        )
+        .then(
+          createStep({
+            id: 'total',
+            inputSchema: z.array(N),
+            outputSchema: N,
+            execute: async ({ inputData }) => rec.around('total', () => ({ n: inputData.reduce((acc, v) => acc + v.n, 0) })),
+          }),
+        )
+        .commit(),
+  }),
+  restartFixture({
+    name: 'restart-branch',
+    id: 'rt-branch',
+    width: 2,
+    input: { n: 1 },
+    expected: 'success',
+    build: (cfg, rec) =>
+      wf('rt-branch', cfg)
+        .then(nStep(rec, 'pre', (n) => n + 2))
+        .branch(
+          [
+            [async ({ inputData }: { inputData: N }) => inputData.n > 1, nStep(rec, 'big', (n) => n * 100)],
+            [async ({ inputData }: { inputData: N }) => inputData.n % 2 === 1, nStep(rec, 'odd', (n) => n + 1)],
+            [async () => false, nStep(rec, 'never', (n) => n)],
+          ],
+          CP,
+        )
+        .then(createStep({ id: 'after', inputSchema: z.any(), outputSchema: z.any(), execute: async ({ inputData }) => rec.around('after', () => inputData) }))
+        .commit(),
+  }),
+  restartFixture({
+    name: 'restart-nested',
+    id: 'rt-nested',
+    input: { n: 1 },
+    expected: 'success',
+    build: (cfg, rec) => {
+      const inner = createWorkflow({ id: 'rt-inner', inputSchema: N, outputSchema: N, ...cfg })
+        .then(markedStep(rec, 'i1', (n) => n * 2))
+        .then(nStep(rec, 'i2', (n) => n + 7))
+        .commit();
+      return wf('rt-nested', cfg)
+        .then(markedStep(rec, 'pre', (n) => n + 1))
+        .then(inner)
+        .then(nStep(rec, 'post', (n) => n * 10))
+        .commit();
+    },
+  }),
+  restartFixture({
+    name: 'restart-unmarked',
+    id: 'rt-none',
+    input: { n: 1 },
+    expected: 'success',
+    build: (cfg, rec) =>
+      wf('rt-none', cfg)
+        .then(nStep(rec, 'a', (n) => n + 1))
+        .then(nStep(rec, 'b', (n) => n * 10))
+        .then(nStep(rec, 'c', (n) => n - 3))
+        .commit(),
+  }),
+];

@@ -1,6 +1,6 @@
 # ADR 0010 — Restart continues from the latest author-marked checkpoint, a proven boundary of the same net
 
-Status: proposed (2026-10-04, M4b)
+Status: accepted (2026-10-04, M4b)
 
 ## Context
 
@@ -52,8 +52,12 @@ same net, proven at every boundary.**
   on the last entry adds nothing: the terminal row covers it.
 - **The net.** For each marked *i* < last: place `s.<i>.checkpoint` becomes entry *i*'s `next`;
   `t.<i>.checkpoint` (inhibited by `wf.cancel`) awaits the write and outputs `in_{i+1}`; a sweep
-  `t.<i>.checkpoint.cancel` reads `wf.cancel` and moves the token on unwritten, so `in_{i+1}`'s own
-  sweep reports the cancel as today. An unmarked workflow compiles to exactly today's net.
+  `t.<i>.checkpoint-cancel` (not `.cancel`, which a step id `checkpoint` would mint as its own
+  sweep) reads `wf.cancel` and ends the run in `wf.canceled` unwritten, reporting entry *i+1* as not
+  started — what that entry's own sweep reports. *Amended in W1:* the sweep first moved the token on
+  to `in_{i+1}`; that kept the cancel signal live downstream, and liveness witnesses on a seven-entry
+  workflow went from ~100 ms to `unknown` at 30 s. Ending in `wf.canceled`, as every other sweep
+  does, brought them back to ~260 ms. An unmarked workflow compiles to exactly today's net.
 - **The write is a freeze, awaited in the firing.** The row is durable before any effect of entry
   *i+1*, and lands strictly before the terminal write — no queue. Its rows are `running` writes
   under the `#lastPersisted` guard, `shouldPersistSnapshot` and `pruneSnapshot`. A rejected write
@@ -108,11 +112,22 @@ same net, proven at every boundary.**
 
 ## Evidence
 
-Untested until M4b lands. Planned: `tests/compiler/checkpoint.test.ts` (unmarked nets unchanged,
-refusals per position), `tests/verify/restart-segments.test.ts` (`restart@p` at every boundary,
-k = 1, 2, 4, unbounded, with timings and libpetri provenance), `tests/mastra/checkpoint-row.test.ts`,
-`tests/upstream/restart-seam.test.ts`, `tests/conformance/restart*.test.ts` (crash at every
-recorded row; petri>petri vs petri>default, default>default vs default>petri).
+- `tests/compiler/checkpoint.test.ts` — unmarked nets keep their structural hash; one place and two
+  transitions per mark; refusals; marked workflows prove `closed` and `cancel`.
+- `tests/mastra/adapt-checkpoint.test.ts` — the mark read from step and entry metadata, the
+  `checkpoint-position` / `checkpoint-value` refusals, and the Layer test on the default engine.
+- `tests/verify/restart-segments.test.ts` — `restart@p` and `restart@p+cancel` proven at every
+  boundary at k = 1, 2, 4 and unbounded; a shared marking cited, not re-asked; structure mutants.
+- `tests/engine/kernel-restart.test.ts`, `tests/compiler/restart-seed.test.ts` — seeding and refusals.
+- `tests/mastra/checkpoint-row.test.ts`, `tests/mastra/engine-restart.test.ts`,
+  `tests/mastra/restart-codec.test.ts` — the row key for key, a rejected write rejecting the run,
+  refusals that persist nothing.
+- `tests/upstream/restart-seam.test.ts` — Mastra reads `workflowEngineType` only before its first
+  `await`; `tests/mastra/restart-surface.test.ts`, `tests/mastra/recovery.test.ts`.
+- `tests/conformance/restart-differential.test.ts` — a crash at every row, restarted on a fresh
+  store: petri>petri 0 differences; default>petri differences only as rows 92 and 93 record.
+- The corpus gate with restart segments: every claim holds at 30 s a query on CI (PR #1, registry
+  libpetri 8.0.0).
 
 [ADR 0007]: 0007-resume-is-a-seeded-segment.md
 [ADR 0009]: 0009-verification-claims.md

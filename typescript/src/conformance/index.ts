@@ -11,6 +11,8 @@
  * Suspend-then-resume fixtures run phase by phase on every {@link ResumeRoute} — the engine that
  * suspends, the one that resumes, in one process or a fresh engine per phase — each compared with
  * the default engine's oracle by the same gates ([ADR 0007]).
+ * Crash-then-restart fixtures are restarted from every row the run wrote, on both engines, by
+ * {@link runRestart} ([ADR 0010]).
  * Host-free: fixtures inject how they run and how `execute()` is observed.
  */
 export {
@@ -69,3 +71,15 @@ export type {
   Verdict,
   VerdictKind,
 } from './differential.js';
+export {
+  compareRestart,
+  crashLabel,
+  crashPoints,
+  formatRestartReport,
+  restartLabel,
+  restartOracle,
+  runRestart,
+  storageAt,
+  RESTART_ROUTES,
+} from './restart.js';
+export type { CrashPoint, PersistedRow, RestartAttribution, RestartCase, RestartObservation, RestartRoute, RestartVerdict } from './restart.js';

@@ -398,7 +398,9 @@ const BUDGET = ['permitsBounded', 'permitsReturned'];
 
 async function expectAllProven(name: string, compiled: CompiledWorkflow, sites: readonly string[]): Promise<void> {
   expect([...compiled.resumeSites.keys()].sort()).toStrictEqual([...sites].sort());
-  const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000 });
+  // The fresh and resume segments alone: the restart segments ([ADR 0010]) are
+  // `tests/verify/restart-segments.test.ts`'s.
+  const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000, restart: 'none' });
   const budget = compiled.budget ? BUDGET : [];
   const expected = ['closed', 'cancel', ...sites.flatMap((s) => [`resume@${s}`, `resume@${s}+cancel`])].flatMap((segment) =>
     (segment.endsWith('cancel') ? CANCEL : CLOSED).concat(budget).map((p) => `${segment}/${p}`),

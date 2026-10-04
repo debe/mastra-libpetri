@@ -244,3 +244,131 @@ export function resumeTimingViolations(compiled: CompiledWorkflow): readonly str
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Restart ([ADR 0010]). A restarted run is a segment seeded with one token at a top-level boundary,
+// and a checkpoint is a transition between entry i and entry i+1 that awaits a storage write. Both
+// are proven as segments of the same net; these are what those proofs cannot see.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The checkpoint transitions after entry `index`, as `NameVocabulary.checkpointTransition` mints
+ * them: the write `t.<i>.checkpoint` and its sweep `t.<i>.checkpoint-cancel` (not ADR 0010's first
+ * `t.<i>.checkpoint.cancel`, which a step with id `checkpoint` would mint as its own sweep).
+ */
+const checkpointName = (index: number): string => `t.${index}.checkpoint`;
+const checkpointSweepName = (index: number): string => `t.${index}.checkpoint-cancel`;
+
+/**
+ * Every top-level boundary is the input place of its entry, and every checkpoint is gated on the
+ * cancel signal and swept beside it to `wf.canceled` ([ADR 0010]).
+ *
+ * **Boundaries.** One per top-level entry, `boundaries[i].index === i`, its `entryId` and `entryKind`
+ * entry `i`'s, its place a place of the net that the net map records as entry `[i]`'s input;
+ * `boundaries[0].place` is the entry place. A restart seeds that place, so a boundary off by one
+ * would restart the wrong entry and every proof of it would still hold.
+ *
+ * **Checkpoints.** For each `i` in `compiled.checkpoints` — an integer, ascending, and below the last
+ * entry — there is exactly one checkpoint transition `t.<i>.checkpoint` and:
+ * 1. it is **inhibited by `wf.cancel`** and does not read it: once a cancel has arrived no write is
+ *    taken, as Mastra's check before the next entry would stop the run;
+ * 2. it consumes exactly one place, the checkpoint place, and its only output is entry `i + 1`'s
+ *    boundary — the write sits on the success path between the two entries and nowhere else;
+ * 3. its **sweep** `t.<i>.checkpoint-cancel` exists, reads `wf.cancel`, consumes the same place, and
+ *    its only output is `wf.canceled` — the run ends unwritten, as every other sweep does
+ *    (`resumeGateViolations`, rule 6). Not entry `i + 1`'s boundary, as ADR 0010 first drew it: a
+ *    sweep leading back into work kept the cancel signal live downstream, and liveness witnesses went
+ *    from ~100 ms to `unknown` at 30 s (`gadgets/checkpoint.ts`). A sweep re-routed to `wf.done` still
+ *    drains to exactly one terminal; only this sees it;
+ * 4. nothing else consumes the checkpoint place.
+ *
+ * A transition named like a checkpoint after an entry that is not marked is reported too: the net
+ * would take a write the description never asked for.
+ *
+ * Returns one line per violation; empty means sound, and an unmarked workflow has no checkpoint
+ * lines. Compared by name, as the other checks are.
+ */
+export function checkpointStructureViolations(compiled: CompiledWorkflow): readonly string[] {
+  const cancel = compiled.cancel.name;
+  const out: string[] = [];
+  const transitions = [...compiled.net.transitions];
+  const byName = new Map(transitions.map((t) => [t.name, t]));
+  const placeNames = new Set([...compiled.net.places].map((p) => p.name));
+  const outputs = (t: Transition): string[] => [...t.outputPlaces()].map((p) => p.name);
+
+  // Boundaries.
+  if (compiled.boundaries.length !== compiled.entries.length) {
+    out.push(`${compiled.boundaries.length} boundaries for ${compiled.entries.length} top-level entries; there is one per entry`);
+  }
+  compiled.boundaries.forEach((b, i) => {
+    const where = `boundary ${i} ('${b.place.name}')`;
+    if (b.index !== i) out.push(`boundary ${i} says it is at index ${b.index}`);
+    const entry = compiled.entries[i];
+    if (entry !== undefined && (b.entryId !== entry.id || b.entryKind !== entry.kind)) {
+      out.push(`${where} names ${b.entryKind} '${b.entryId}'; entry ${i} is ${entry.kind} '${entry.id}'`);
+    }
+    if (!placeNames.has(b.place.name)) {
+      out.push(`${where} is not a place in the net`);
+      return;
+    }
+    const owner = compiled.netMap.placeToEntry.get(b.place.name);
+    if (owner === undefined || owner.path.length !== 1 || owner.path[0] !== i) out.push(`${where} is not the input place of entry ${i}`);
+  });
+  if (compiled.boundaries[0] !== undefined && compiled.boundaries[0].place.name !== compiled.entryPlace.name) {
+    out.push(`boundary 0 ('${compiled.boundaries[0].place.name}') is not the entry place '${compiled.entryPlace.name}'`);
+  }
+
+  // Checkpoints.
+  const last = compiled.entries.length - 1;
+  const marked = new Set<string>();
+  compiled.checkpoints.forEach((i, n) => {
+    if (!Number.isInteger(i) || i < 0 || i >= last) {
+      out.push(`checkpoint after entry ${i}: a checkpoint is taken after a top-level entry other than the last (0..${last - 1})`);
+      return;
+    }
+    if (n > 0 && i <= compiled.checkpoints[n - 1]!) out.push(`checkpoints [${compiled.checkpoints.join(', ')}] are not strictly ascending`);
+    const entryId = compiled.entries[i]!.id;
+    marked.add(checkpointName(i));
+    marked.add(checkpointSweepName(i));
+    const t = byName.get(checkpointName(i));
+    if (t === undefined) {
+      out.push(`checkpoint after entry ${i} ('${entryId}') has no transition '${checkpointName(i)}'`);
+      return;
+    }
+    const next = compiled.boundaries[i + 1]?.place.name;
+    if (!inhibitedBy(t, cancel)) out.push(`checkpoint '${t.name}' is not inhibited by '${cancel}'`);
+    if (readsPlace(t, cancel)) out.push(`checkpoint '${t.name}' reads '${cancel}'; only its sweep does`);
+    const consumed = t.inputSpecs.map((spec) => spec.place.name);
+    if (consumed.length !== 1) {
+      out.push(`checkpoint '${t.name}' consumes [${consumed.join(', ')}]; it consumes exactly its checkpoint place`);
+      return;
+    }
+    const at = consumed[0]!;
+    const goesOnlyToNext = (x: Transition): boolean => {
+      const o = outputs(x);
+      return next !== undefined && o.length > 0 && o.every((p) => p === next);
+    };
+    if (!goesOnlyToNext(t)) out.push(`checkpoint '${t.name}' outputs into [${outputs(t).join(', ')}]; its only output is entry ${i + 1}'s boundary '${next}'`);
+
+    const sweep = byName.get(checkpointSweepName(i));
+    if (sweep === undefined) out.push(`checkpoint '${t.name}' has no sweep '${checkpointSweepName(i)}'`);
+    else {
+      if (!readsPlace(sweep, cancel)) out.push(`sweep '${sweep.name}' does not read '${cancel}'`);
+      const swept = sweep.inputSpecs.map((spec) => spec.place.name);
+      if (swept.length !== 1 || swept[0] !== at) out.push(`sweep '${sweep.name}' consumes [${swept.join(', ')}]; it consumes exactly '${at}', as its checkpoint does`);
+      const canceled = compiled.terminals.canceled.name;
+      const so = outputs(sweep);
+      if (so.length === 0 || !so.every((p) => p === canceled)) out.push(`sweep '${sweep.name}' outputs into [${so.join(', ')}]; its only output is '${canceled}'`);
+    }
+    for (const other of transitions) {
+      if (other === t || other === sweep || !consumesPlace(other, at)) continue;
+      out.push(`'${other.name}' consumes checkpoint place '${at}'; only '${t.name}' and its sweep do`);
+    }
+  });
+  for (const t of transitions) {
+    if (/^t\.\d+\.checkpoint(?:-cancel)?$/.test(t.name) && !marked.has(t.name)) {
+      out.push(`'${t.name}' is a checkpoint after an entry that is not marked`);
+    }
+  }
+  return out;
+}

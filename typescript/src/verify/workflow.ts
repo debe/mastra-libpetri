@@ -23,6 +23,7 @@ import {
 import {
   completionProperties,
   describeReport,
+  markingKey,
   segmentInitialMarking,
   segmentLabel,
   segmentsFor,
@@ -89,6 +90,13 @@ export interface ClaimReport {
    * overtaken while in flight — and never makes the claim hold.
    */
   readonly assumingAtomic?: SmtVerificationResult;
+  /**
+   * Present when this claim was not asked separately: its segment's initial marking equals this
+   * earlier segment's, so the query is the same one and `result` (and `assumingAtomic`) is that
+   * segment's answer — `restart@0` cites `closed`, `restart@p` cites `resume@p` at a step or loop
+   * ([ADR 0010]). The claim is listed under both labels; it is proven once.
+   */
+  readonly sameProofAs?: Segment;
 }
 
 /** The claim is `unknown` under in-flight firing and `proven` assuming atomic firing. */
@@ -123,6 +131,11 @@ export interface VerificationReport {
  * transitions (a fixed sleep, a retry delay) may be one the clock rules out — the route names
  * which. Liveness is shown in the `closed` segment alone: a step that runs in a fresh run is not
  * dead, and the other segments start inside a run.
+ *
+ * **Segments with equal markings are asked once.** The restart segments ([ADR 0010]) repeat
+ * markings already listed — `restart@0` is `closed`, `restart@0+cancel` is `cancel`, `restart@p` is
+ * `resume@p` at a top-level step or loop. Each such segment's claims are the earlier segment's,
+ * listed again under its own label with `sameProofAs` naming the segment that was asked.
  *
  * Throws `LibpetriSurfaceError` when the installed libpetri lacks a member this calls, and
  * `Z3Unavailable` when no solver resolves: without either, proofs would be quietly absent.
@@ -173,13 +186,26 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
   const width = options.jobs ?? Math.max(1, Math.floor(availableParallelism() / 2));
   const markings = new Map(segments.map((s) => [segmentLabel(s), describeMarking(segmentInitialMarking(compiled, s))]));
   const markingOf = (segment: Segment): string => markings.get(segmentLabel(segment)) ?? describeMarking(segmentInitialMarking(compiled, segment));
+  // Segments whose initial markings are equal ask the same queries ([ADR 0010]: `restart@0` is
+  // `closed`, `restart@p` is `resume@p` at a step or loop). Each later one cites the first: the query
+  // is asked once and its answer listed under both labels — never dropped from the report.
+  const firstWithMarking = new Map<string, Segment>();
+  const citing = new Map<string, Segment>();
+  for (const segment of segments) {
+    const key = markingKey(segmentInitialMarking(compiled, segment));
+    const first = firstWithMarking.get(key);
+    if (first === undefined) firstWithMarking.set(key, segment);
+    else if (segmentLabel(first) !== segmentLabel(segment)) citing.set(segmentLabel(segment), first);
+  }
+  const citedBy = (segment: Segment): Segment | undefined => citing.get(segmentLabel(segment));
+  const asking = [...new Map(segments.filter((segment) => citedBy(segment) === undefined).map((s) => [segmentLabel(s), s])).values()];
 
   // The structural checks, which the other families stand on too: `segments: []` runs them and no
   // query. Completion is then asked here rather than through `verifyWorkflow`'s sequential loop —
   // the same queries on the same verifier settings, run in the pool.
   if (options.structure !== 'skip') await verifyWorkflow(compiled, { ...options, segments: [] });
   if (families.includes('completion')) {
-    const asked = segments.flatMap((segment) => completionProperties(compiled, segment).map(([property, smt]) => ({ segment, property, smt })));
+    const asked = asking.flatMap((segment) => completionProperties(compiled, segment).map(([property, smt]) => ({ segment, property, smt })));
     const answers = await pool(asked, width, async ({ segment, smt }) => {
       const first = await query(segment, smt, 'plain');
       if (first.verdict.type !== 'unknown') return first;
@@ -203,7 +229,7 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
   const jobs: Job[] = [];
   const { claimed, unclaimed } = boundClaims(compiled);
   const exclusive = exclusions(compiled);
-  for (const segment of segments) {
+  for (const segment of asking) {
     if (families.includes('bounds')) {
       for (const c of claimed) jobs.push({ family: 'bounds', kind: 'proof', property: `bound(${c.place.name}<=${c.bound})`, segment, smt: placeBound(c.place, c.bound) });
     }
@@ -245,15 +271,31 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
     });
   }
 
+  // The cited claims: every asked claim of the segment a later one cites, repeated under the later
+  // label with its own segment and marking, and the same result. The report keeps the order it had
+  // before any was cited — completion by segment, then bounds and exclusion by segment, then
+  // liveness — with each cited segment in its own place.
+  const ofSegment = (segment: Segment, family: Family): ClaimReport[] => {
+    const source = citedBy(segment);
+    const label = segmentLabel(source ?? segment);
+    const own = claims.filter((c) => c.family === family && segmentLabel(c.segment) === label);
+    return source === undefined ? own : own.map((c) => ({ ...c, segment, marking: markingOf(segment), sameProofAs: source }));
+  };
+  const all: ClaimReport[] = [
+    ...segments.flatMap((segment) => ofSegment(segment, 'completion')),
+    ...segments.flatMap((segment) => [...ofSegment(segment, 'bounds'), ...ofSegment(segment, 'exclusion')]),
+    ...claims.filter((c) => c.family === 'liveness'),
+  ];
+
   return {
     workflow: compiled.net.name,
     k: compiled.budget?.k ?? 'unbounded',
     structuralHash: compiled.structuralHash,
     segments,
     families,
-    claims,
+    claims: all,
     unclaimed,
-    holds: claims.every((c) => c.holds),
+    holds: all.every((c) => c.holds),
   };
 }
 

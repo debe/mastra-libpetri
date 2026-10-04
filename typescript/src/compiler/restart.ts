@@ -46,7 +46,24 @@ export class UnrestartablePositionError extends Error {
  * anything runs or persists.
  */
 export function restartSeed(compiled: CompiledWorkflow, request: RestartRequest): RestartSeed {
-  void compiled;
-  void request;
-  throw new Error('restartSeed: not implemented (M4b W2)');
+  const path = request.activePaths;
+  const shown = `[${path.join(', ')}]`;
+  if (path.length === 0) {
+    throw new UnrestartablePositionError('no-position', path, `workflow '${compiled.net.name}': the stored activePaths ${shown} name no position to restart from`);
+  }
+  const p = path[0]!;
+  if (!Number.isInteger(p) || p < 0) {
+    throw new UnrestartablePositionError('no-position', path, `workflow '${compiled.net.name}': the stored activePaths ${shown} start at ${p}, which is not a top-level index`);
+  }
+  const site = compiled.boundaries[p];
+  if (site === undefined || site.index !== p) {
+    throw new UnrestartablePositionError(
+      'no-position',
+      path,
+      `workflow '${compiled.net.name}': the stored activePaths ${shown} start at ${p}, and the workflow has no top-level boundary there (entries 0..${compiled.boundaries.length - 1})`,
+    );
+  }
+  // A fresh object: never `resumed`, never a foreach index or an iteration — a restart re-runs entry
+  // `p` from its start, as Mastra's does (ADR 0010).
+  return { site, value: { data: request.input } };
 }

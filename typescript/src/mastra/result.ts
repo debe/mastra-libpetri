@@ -51,8 +51,18 @@ export interface FormatContext {
 
 /** Where a resumed run picks up, as `formatWorkflowResult` and the snapshot read it. */
 export interface ResumedFrom {
-  /** `resumePath[0]` — the top-level entry the segment re-enters. */
+  /**
+   * The top-level entry the segment starts at: `resumePath[0]` for a resume, `activePaths[0]` for
+   * a restart ([ADR 0010]). Mastra's loop starts there (`default.ts:792-808`), so it is also where
+   * its loop-top cancel check stands before the segment's first entry.
+   */
   readonly index: number;
+  /**
+   * A restart ([ADR 0010]), not a resume: entry `index` re-runs as a fresh start and **pushes** its
+   * id onto the carried `stepExecutionPath` — Mastra's restart hands its entries no `resume`, so
+   * `isResumedStep` is false (`handlers/entry.ts:306-309`). A resumed entry does not push.
+   */
+  readonly restarted?: boolean;
   /** The stored `stepExecutionPath`, continued by this segment. */
   readonly carriedPath: readonly string[];
   /** The stored `stepResults` (`snapshot.context` with `input`), as `Run` handed them over. */
@@ -134,7 +144,7 @@ export function formatWorkflowResult(ctx: FormatContext): FormattedResult {
   const raw = stepResultsOf(ctx.input, report.stepResults, rank, now, ctx.resume?.context);
 
   const steps = cleanStepResults(raw);
-  const from = ctx.resume === undefined ? undefined : { index: ctx.resume.index, carried: ctx.resume.carriedPath };
+  const from = segmentOf(ctx.resume);
   const path = ctx.graph === undefined ? undefined : stepExecutionPath(ctx.graph.steps, outcome, from);
   const base = {
     steps: path === undefined ? steps : deduplicatePayloads(steps, path),
@@ -386,26 +396,17 @@ export function deduplicatePayloads(
  * `from`, on a resumed run ([ADR 0007]): the path starts from `from.carried`, and entries up to and
  * including `from.index` push nothing — they ran in an earlier segment, or, at `from.index`, are the
  * resumed entry, which Mastra does not push again. A cancel swept at the resume site's gate is the
- * loop-top check at `from.index` (`default.ts:812-835`) and adds nothing to the carried path.
+ * loop-top check at `from.index` (`default.ts:812-835`) and adds nothing to the carried path. On a
+ * restarted run ([ADR 0010], `from.restarted`) the entry at `from.index` is not resumed but re-run
+ * from its start, and pushes as in a fresh run — as Mastra's restart does, whose entries see no
+ * `resume`.
  */
 export function stepExecutionPath(
   entries: readonly StepFlowEntry[],
   outcome: Exclude<RunOutcome, { readonly status: 'stranded' }>,
-  from?: { readonly index: number; readonly carried: readonly string[] },
+  from?: SegmentFrom,
 ): string[] {
-  // A resumed run continues the stored list (`default.ts:802-803`): entries before the resumed one
-  // never re-run, and the resumed entry is not pushed again (`handlers/entry.ts:306-309`) — a
-  // block, loop or foreach is never pushed at all. Everything after it pushes as in a fresh run.
-  const after = from?.index ?? -1;
-  const upTo = (stop: number, includeStop: boolean): string[] => {
-    const path: string[] = [...(from?.carried ?? [])];
-    entries.forEach((entry, i) => {
-      if (i <= after) return;
-      const id = pushedId(entry);
-      if (id !== undefined && (i < stop || (i === stop && includeStop))) path.push(id);
-    });
-    return path;
-  };
+  const upTo = (stop: number, includeStop: boolean): string[] => pathUpTo(entries, stop, includeStop, from);
   const stopAt = (path: readonly number[]): number => path[0] ?? entries.length;
 
   switch (outcome.status) {
@@ -423,6 +424,50 @@ export function stepExecutionPath(
     default:
       return assertNever(outcome);
   }
+}
+
+/**
+ * Where a segment's `stepExecutionPath` starts: the carried list, and the top-level index of the
+ * segment's first entry. On a resume ([ADR 0007]) that entry is the resumed one and does not push;
+ * on a restart ([ADR 0010], `restarted`) it re-runs as a fresh start and does.
+ */
+export interface SegmentFrom {
+  readonly index: number;
+  readonly carried: readonly string[];
+  readonly restarted?: boolean;
+}
+
+/** {@link SegmentFrom} of a resumed or restarted run, `undefined` for a fresh one. */
+export function segmentOf(from: ResumedFrom | undefined): SegmentFrom | undefined {
+  if (from === undefined) return undefined;
+  return { index: from.index, carried: from.carriedPath, ...(from.restarted === true ? { restarted: true } : {}) };
+}
+
+/**
+ * `stepExecutionPath` at a checkpoint after top-level entry `after` ([ADR 0010]): the carried list,
+ * then every pushing entry of this segment up to and including `after` — each of them started and
+ * succeeded, since the checkpoint follows entry `after`'s success and top-level entries run in
+ * sequence. The same list {@link stepExecutionPath} gives for a run that stopped right after `after`.
+ */
+export function checkpointExecutionPath(entries: readonly StepFlowEntry[], after: number, from?: SegmentFrom): string[] {
+  return pathUpTo(entries, after, true, from);
+}
+
+/**
+ * The carried list (`default.ts:802-803`), then the id of every pushing entry from the segment's
+ * first up to `stop` (including it when `includeStop`). Entries before the segment's first never
+ * re-run; a resumed entry is not pushed again (`handlers/entry.ts:306-309`), a restarted one is; a
+ * block, loop or foreach is never pushed at all.
+ */
+function pathUpTo(entries: readonly StepFlowEntry[], stop: number, includeStop: boolean, from?: SegmentFrom): string[] {
+  const skipThrough = from === undefined ? -1 : from.restarted === true ? from.index - 1 : from.index;
+  const path: string[] = [...(from?.carried ?? [])];
+  entries.forEach((entry, i) => {
+    if (i <= skipThrough) return;
+    const id = pushedId(entry);
+    if (id !== undefined && (i < stop || (i === stop && includeStop))) path.push(id);
+  });
+  return path;
 }
 
 /**

@@ -23,6 +23,14 @@ export interface RunScope {
   getStepResult(stepId: string): StepRecord | undefined;
   /** Records a step's latest record under its id, as Mastra's `stepResults[id] = result`. */
   recordStepResult(stepId: string, record: StepRecord): void;
+  /**
+   * This segment is a restart ([ADR 0010]). Mastra hands `restart` to every entry of a restarted
+   * run (`default.ts:893-935`), and a `.branch()` under restart re-runs every truthy arm, never
+   * reusing a stored `success` (`handlers/control-flow.ts:544-553`). Absent means false.
+   */
+  readonly restarted?: boolean;
+  /** Every record, in first-recorded order — what a checkpoint writes ([ADR 0010]). */
+  stepResults(): ReadonlyMap<string, StepRecord>;
   /** Epoch milliseconds on the run's clock — `.sleepUntil`, and every record's timestamps. */
   epochNow(): number;
   /**

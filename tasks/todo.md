@@ -332,10 +332,36 @@
   (a suspended marking is dead and rebuilt from records; `snapshot()` throws after drain), and
   driving drain and injection from inside `Clock.sleep` (a resume injects nothing)
 
-## M4b — Restart and crash recovery
-- [ ] `Run.restart` and boot-time recovery: per-step snapshot writes and `activeStepsPath`
-      (row 55), `engineType` in Mastra's run registry (row 62), the restart halves of rows 40 and
-      54. Reuses M4's sites and decoder. Restore timing is decided here, not for resume
+## M4b — Restart and crash recovery ([ADR 0010])
+- [x] Design: maintainer decisions — checkpoints are explicit (`metadata.checkpoint`, snapshots are
+      not free), only at top-level boundaries; `engineType` stays `'petri'` and `createRun` is
+      wrapped; a failed checkpoint write rejects the run; restart proven at every boundary; a Mastra
+      row inside a block re-runs the whole entry. Restore timing: a restarted sleep waits in full,
+      as on Mastra (`handlers/entry.ts:586-660`)
+- [x] W0 contract (`9676227`): `BoundarySite`, `CheckpointEvent`, `StepRunner.checkpoint`,
+      `RestartSeed`, `RunOptions.restart`, `RestartSegment`, the checkpoint persist phase
+- [x] W1 compiler and adapter — `s.<i>.checkpoint`, `t.<i>.checkpoint` (inhibited by `wf.cancel`)
+      and `t.<i>.checkpoint-cancel` into `wf.canceled` (amended from the next boundary: liveness
+      witnesses went `unknown` at 30 s); unmarked nets byte-identical; `checkpoint-position` and
+      `checkpoint-value` refusals; the Layer test on the default engine
+- [x] W2 kernel and verify — `restartSeed`, boundary seeding, `checkpointError` on the report,
+      `restart@p` / `restart@p+cancel` at every boundary, a marking proven once and cited under
+      every label that shares it, `checkpointStructureViolations`
+- [x] W3 host — `restart-codec.ts`, the checkpoint row, no start row on restart, `no-position` /
+      `workflow-changed` refusals, the storage error rethrown, nested `restart: true`
+- [x] W4 surface — the `createRun` / `_restart` seam with its upstream guard,
+      `restartAllActiveWorkflowRuns` without the gate, `restartActiveRuns(mastra)`
+- [x] Existing tests: fresh/resume-only proofs pass `restart: 'none'`; default lists include the
+      restart segments
+- [x] W5 conformance — `src/conformance/restart.ts`, `tests/conformance/restart-differential.test.ts`:
+      a crash at every `running`/`waiting` row, then `restart()` on a fresh store. 8 fixtures at
+      k = 1, 2, 4, unbounded: petri>petri 0 differences (a petri checkpoint restarts identically on
+      Mastra's engine); default>petri 71 pass, 3 divergent-and-attributed (rows 92, 93), 0 fail at
+      every k. It found a branch reusing stored arms under restart; fixed (`RunScope.restarted`)
+- [ ] Open after M4b, none blocking: rows 39, 96, 99 unexercised; row 94's resumed-foreach crash;
+      restarting past a `.sleep()` in a new process fails the next step on both engines (Mastra
+      mints sleep ids with `randomUUID()` per build) — an upstream issue for M9
+- [ ] M9 PR 2 (capability predicate) retires the seam and `restartActiveRuns`
 
 ## M5 — Streaming and watch ([ADR 0008])
 - [x] Contract: an observation-only lifecycle hook, `StepRunner.observe(LifecycleEvent)` —
