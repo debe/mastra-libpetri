@@ -18,6 +18,7 @@ export {
   checkpointStructureViolations,
 } from './structure.js';
 export { budgetStructureViolations } from './budget.js';
+export { poolStructureViolations } from './pools.js';
 export { verify, describeClaim, provenOnlyAssumingAtomic, FAMILIES } from './workflow.js';
 export type { ClaimReport, Family, VerificationReport, WorkflowVerifyOptions } from './workflow.js';
 export { boundClaims, exclusions, livenessTargets, retryCeilingViolations } from './claims.js';

@@ -35,7 +35,44 @@ export interface StepDescription {
    * no jitter, and Mastra's is not abortable. Defaults to 0.
    */
   readonly retryDelayMs?: number;
+  /**
+   * A per-attempt deadline in milliseconds ([ADR 0013]) — Layer 3, from the petri `createStep({
+   * timeout })`; Mastra has none (row 6). Each attempt races the step against the run's clock and,
+   * on expiry, aborts the attempt's `StepCall.deadline`, waits for the step to settle, discards its
+   * result and leaves by its `timedOut` branch, which is retried like a thrown error. A whole number
+   * in [1, `MAX_WAIT_MS`]; the adapter refuses anything else as `timeout-value`. Absent, the leaf
+   * emits exactly today's attempt.
+   */
+  readonly timeoutMs?: number;
+  /**
+   * The quotas every attempt of this step draws on ([ADR 0012]), from the petri `createStep({ uses
+   * })`, in declaration order. Each is one run-wide set of canonical places that this step's own
+   * member places are fused into, so two steps naming one quota share it. Absent or empty, the leaf
+   * emits exactly today's attempt.
+   */
+  readonly quotas?: readonly QuotaRef[];
 }
+
+/**
+ * A quota a step draws on ([ADR 0012]), as the compiler sees it: Mastra's `limit(n, {id})` and
+ * `rateLimit(burst, per, {id})` objects reduced to data. The host's quota identity is the object;
+ * here it is `id`, which names the canonical places (`wf.quota.<id>`), so the adapter refuses two
+ * different quota objects sharing an id (`quota-id-collision`) before they get here, and the
+ * compiler refuses two refs with one id and different parameters.
+ *
+ * - `limit`: at most `n` attempts of the using steps in flight at once — a pool of `n`, taken with
+ *   the run permit in the attempt's firing and returned on every branch.
+ * - `rate`: at most `burst` tokens at once, one back every `perMs` ms — every attempt spends one,
+ *   retries included, and one compiler-emitted `refill` per quota returns them while there is
+ *   demand.
+ *
+ * `n` and `burst` are whole numbers in [1, `MAX_CONCURRENCY`] — they are seeded as tokens, as the
+ * run budget is — and `perMs` is a whole number in [1, `MAX_WAIT_MS`]. `id` matches
+ * `QUOTA_ID_PATTERN` (`names.ts`), so it is a name segment verbatim (no slug, so no two ids can share places).
+ */
+export type QuotaRef =
+  | { readonly id: string; readonly kind: 'limit'; readonly n: number }
+  | { readonly id: string; readonly kind: 'rate'; readonly burst: number; readonly perMs: number };
 
 /**
  * A value known when the workflow is built, or one the runner computes per run.
@@ -53,13 +90,28 @@ export type EntryDescription =
   /** `.sleepUntil(date | fn)`. `fixed` is epoch milliseconds. */
   | { readonly kind: 'sleepUntil'; readonly id: string; readonly until: BuildOrRun<number> }
   /** `.parallel([...])` — every arm runs, every arm joins. An empty list is a legal success. */
-  | { readonly kind: 'parallel'; readonly id: string; readonly arms: readonly StepDescription[] }
+  | {
+      readonly kind: 'parallel';
+      readonly id: string;
+      readonly arms: readonly StepDescription[];
+      /** At most this many arms in flight, admitted in arm order — see {@link BlockConcurrency}. */
+      readonly concurrency?: BlockConcurrency;
+    }
   /**
    * `.branch([[cond, step], ...])` — **inclusive**: conditions are evaluated concurrently and
    * *every* truthy arm runs, then all of them join (`handlers/control-flow.ts:395-498,540`).
    * An empty list, or no truthy condition, is a legal success.
    */
-  | { readonly kind: 'branch'; readonly id: string; readonly arms: readonly StepDescription[] }
+  | {
+      readonly kind: 'branch';
+      readonly id: string;
+      readonly arms: readonly StepDescription[];
+      /**
+       * At most this many truthy arms in flight, admitted in arm order — see {@link BlockConcurrency}.
+       * A skipped or reused arm passes the cursor without a slot.
+       */
+      readonly concurrency?: BlockConcurrency;
+    }
   /**
    * `.dowhile` / `.dountil` — strictly sequential.
    *
@@ -88,6 +140,15 @@ export type EntryDescription =
       readonly body: StepDescription;
       readonly concurrency: number;
     };
+
+/**
+ * A block's own bound on its fan-out ([ADR 0011]) — Layer 2, from `metadata: { concurrency: c }` in
+ * the `.parallel()` / `.branch()` call's options, which Mastra's engine ignores. A whole number ≥ 1
+ * (a safe integer; the adapter refuses anything else as `concurrency-value`). The compiler treats
+ * `c ≥ arms` as absent — the limit cannot bind — so such a block compiles, and hashes, exactly as an
+ * unannotated one; the adapter passes the value through as the author wrote it.
+ */
+export type BlockConcurrency = number;
 
 export interface WorkflowDescription {
   readonly id: string;
@@ -254,6 +315,19 @@ export interface StepCall extends RunView {
    * the clock. The same on every attempt of the step.
    */
   readonly startedAt?: number;
+  /**
+   * The attempt's deadline ([ADR 0013]): present exactly when the step has a `timeoutMs`, aborted —
+   * with a `StepTimeoutError` as its `reason` — when this attempt's deadline fires on the run's
+   * clock, and **never** by the run's own abort (that is `abortSignal`; a run abort before expiry
+   * disarms the deadline). A fresh signal per attempt.
+   *
+   * The runner links it with `abortSignal` into the one signal the step sees, so `signal.reason`
+   * tells a step which fired, and once it has fired gates every late effect of the attempt by its
+   * identity (`stepId`, `path`, `foreachIndex`, `attempt`): no `stateUpdate`, no scorers, no
+   * `suspend` / `bail` / resume labels, no writer chunks. The leaf discards the attempt's outcome
+   * and writes the `timedOut` branch itself.
+   */
+  readonly deadline?: AbortSignal;
 }
 
 /**
@@ -617,6 +691,93 @@ export interface StepChain {
   readonly attempts: readonly string[];
   /** Retry hop transition names: hop `j` moves a failed attempt `j` into attempt `j + 1`. */
   readonly hops: readonly string[];
+  /**
+   * Timeout funnel transition names ([ADR 0013]), attempt 0 first: `t.timeout-j` consumes attempt
+   * `j`'s `timedOut_j` and forwards it to the next attempt's link (`retry-{j+1}`) on a non-final
+   * attempt, and to the failure exit on the final one. `retries + 1` of them when the step has a
+   * timeout; empty when it has none. `retryCeilingViolations` reads them: link `j + 1` is produced
+   * only by attempt `j` or funnel `j`.
+   */
+  readonly timeouts: readonly string[];
+  /**
+   * The `timedOut_j` place names, attempt 0 first, parallel to `timeouts`: each produced only by
+   * attempt `j` and consumed only by funnel `j`. Empty when the step has no timeout.
+   */
+  readonly timedOut: readonly string[];
+  /**
+   * The ids of the quotas every attempt in `attempts` draws on ([ADR 0012]), in the step's
+   * declaration order; empty when none. The compiler builds each quota pool's takers from these —
+   * from the leaf's registration, never from the arcs the pool check then inspects, so an attempt
+   * compiled without its quota arc is caught (as `stepAttempts` catches one without its permit).
+   */
+  readonly quotas: readonly string[];
+}
+
+/** What a pool conserves: run permits, a block's slots, a `limit` quota, a `rateLimit` bucket. */
+export type PoolKind = 'permits' | 'slots' | 'limit' | 'bucket';
+
+/** A place that holds a pool's tokens while they are out, and how many pool tokens one of its tokens stands for. */
+export interface PoolHolder {
+  readonly place: string;
+  /** Pool tokens per token of `place` — 1 for every pool M7 compiles. */
+  readonly weight: number;
+}
+
+/**
+ * A conserved resource ([ADR 0006], [ADR 0011], [ADR 0012]): a place seeded with `seed` tokens in
+ * every segment's initial marking — never deposited by an action ([IO-016]) — and a **conservation
+ * vector**, the pool place at weight 1 plus its holders, whose weighted sum is `seed` at every
+ * marking, with an attempt in flight counting as holding what its firing took.
+ *
+ * `verify/pools.ts` checks that on the arcs (`poolStructureViolations`): every branch of every
+ * transition touching the vector preserves the weighted sum; a taker consumes exactly
+ * `one(place)` and a giver produces exactly one token into it; every taker and giver is declared
+ * here, and nothing else takes from or gives to the pool; nothing reads or resets a place of the
+ * vector. Takers and givers are **declared by whoever emitted them**, never derived from the arcs the
+ * check inspects.
+ *
+ * | kind | place | holders | takers | givers |
+ * |---|---|---|---|---|
+ * | `permits` | `wf.permits` | — | every step attempt | the same attempts (returned on every branch) |
+ * | `slots` | `wf.slots.<path>` | the block's `active` | `admit-j`, `re-enter-j` | the collects |
+ * | `limit` | `wf.quota.<id>` | — | the using attempts | the same attempts |
+ * | `bucket` | `wf.quota.<id>` | `wf.quota.<id>.spent` | the using attempts | the quota's `refill` |
+ *
+ * The verifier derives its claims from the pools: `placeBound(place, seed)` and
+ * `quiescentCount([place], seed, seed)` for every pool but a bucket, and for a bucket
+ * `placeBound(place, burst)`, `placeBound(spent, burst)`, `quiescentCount([demand], 0, 0)` — a
+ * bucket's tokens rest in `spent` once demand is gone, by design ([TIME-011]).
+ */
+export type Pool = PoolCommon &
+  (
+    | { readonly kind: 'permits' }
+    | { readonly kind: 'slots' }
+    | { readonly kind: 'limit'; readonly quota: string }
+    | {
+        readonly kind: 'bucket';
+        readonly quota: string;
+        /** Where a spent token waits for the refill; also a holder at weight 1. */
+        readonly spent: Place<null>;
+        /** One token per attempt waiting on the bucket; read, never consumed, by the refill. */
+        readonly demand: Place<null>;
+        /** The quota's one refill: `one(spent), read(demand), delayed(perMs) -> place`. */
+        readonly refill: string;
+        readonly perMs: number;
+      }
+  );
+
+/** What every {@link Pool} carries. */
+export interface PoolCommon {
+  /** The pool place: a canonical place, outside every entry's `s.<i>` namespace. */
+  readonly place: Place<null>;
+  /** Tokens in the pool place in every segment's initial marking; the vector's constant sum. */
+  readonly seed: number;
+  /** The holder places, beside the pool place, of the conservation vector. */
+  readonly holders: readonly PoolHolder[];
+  /** Transitions that consume one token from the pool place. */
+  readonly takers: readonly string[];
+  /** Transitions that produce one token into the pool place. */
+  readonly givers: readonly string[];
 }
 
 /**
@@ -699,6 +860,19 @@ export interface CompiledWorkflow {
    * `permitsBounded` and `permitsReturned`. Absent, steps run unbounded, as Mastra's do.
    */
   readonly budget?: { readonly permits: Place<null>; readonly k: number };
+  /**
+   * Every conserved resource of the net ([ADR 0012]), seeded by `initialCounts` (`engine/kernel.ts`): the run's
+   * permits first when a budget was compiled in, then the block slot pools in emission order, then
+   * one pool per quota in first-use order.
+   *
+   * **`budget` stays beside it.** The permits are listed here too — `{ kind: 'permits', place:
+   * budget.permits, seed: budget.k }` — so the kernel's seeding, the residue scan and the pool check
+   * are one generic loop, while `budget` keeps every reader that means the run budget specifically:
+   * `permitsBounded` / `permitsReturned`, `budgetStructureViolations` (which keeps its export), the
+   * report's `k` and the engine's cache key. Invariant: `budget` is present exactly when a `permits`
+   * pool is, with the same place and `k === seed`, and there is at most one.
+   */
+  readonly pools: readonly Pool[];
   /**
    * The name of every step-attempt transition, recorded by the leaf whether or not a budget was
    * compiled in. The budget's structural check needs it: a check that looks only at transitions

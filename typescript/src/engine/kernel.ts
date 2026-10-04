@@ -339,27 +339,32 @@ function tee(primary: EventStore, secondary: EventStore, onError: (error: unknow
 
 /**
  * The token counts a run — and the proof of its segment — starts from: one token at `start`, one at
- * `cancel` when given, and `k` permits when a budget was compiled in. **The one definition of a
- * segment's initial marking**: the verifier's `segmentInitialMarking` calls it with the segment's
- * start place and, for a cancel segment, the cancel *request*; {@link initialMarking} checks every
- * run's tokens against it with the start it seeded and, for a pre-aborted run, the cancel *signal*.
+ * `cancel` when given, and every pool's `seed` ([ADR 0012]) — the run's `k` permits when a budget was
+ * compiled in, a block's `c` slots, a quota's `n` or `burst`. **The one definition of a segment's
+ * initial marking**: the verifier's `segmentInitialMarking` calls it with the segment's start place
+ * and, for a cancel segment, the cancel *request*; {@link initialMarking} checks every run's tokens
+ * against it with the start it seeded and, for a pre-aborted run, the cancel *signal*. Every segment —
+ * `closed`, `cancel`, `resume@site`, `restart@p` — seeds every pool full: nothing is held at a
+ * boundary or a resume site.
  *
- * Insertion order is start, cancel, permits — the order a report's marking prints in. Counts are
- * set, not added, so a start place that collides with the permits, or with the cancel place when
- * the run is pre-aborted, counts once here and twice in a run's tokens, and the kernel refuses that
- * run. A collision with the cancel place on a run that is not pre-aborted is refused by the
- * one-token-of-work check instead. This does not check `k` independently: the kernel and the
- * verifier both read it from the compiled budget, and the guarantee is that they share these counts.
+ * Takes only the pools, so what it reads is what it seeds: `compiled.pools`, in which the permits
+ * come first, so the insertion order — the order a report's marking prints in — is start, cancel,
+ * permits, as before, then the other pools. Counts are set, not added, so a start place that
+ * collides with a pool, or with the cancel place when the run is pre-aborted, counts once here and
+ * twice in a run's tokens, and the kernel refuses that run. A collision with the cancel place on a
+ * run that is not pre-aborted is refused by the one-token-of-work check instead. This does not
+ * check a seed independently: the kernel and the verifier both read it from the compiled pools, and
+ * the guarantee is that they share these counts.
  */
 export function initialCounts(
-  compiled: CompiledWorkflow,
+  compiled: Pick<CompiledWorkflow, 'pools'>,
   start: Place<unknown>,
   cancel?: Place<unknown>,
 ): ReadonlyMap<Place<unknown>, number> {
   const counts = new Map<Place<unknown>, number>();
   counts.set(start, 1);
   if (cancel !== undefined) counts.set(cancel, 1);
-  if (compiled.budget) counts.set(compiled.budget.permits, compiled.budget.k);
+  for (const pool of compiled.pools) counts.set(pool.place, pool.seed);
   return counts;
 }
 
@@ -436,20 +441,21 @@ export function initialMarking(
   // anywhere, including after the first start.)
   const aborted = signal?.aborted === true;
   if (aborted) initial.set(compiled.cancel, [...(initial.get(compiled.cancel) ?? []), seed(null)]);
-  // The run's step budget ([ADR 0006]): `k` permits in the initial marking, never deposited by an
-  // action, so the analyses see exactly `k` — the multiplicity lives where [IO-016] models it.
-  if (compiled.budget) {
-    const { permits, k } = compiled.budget;
-    initial.set(permits, [...(initial.get(permits) ?? []), ...Array.from({ length: k }, () => seed(null))]);
+  // Every pool full ([ADR 0006], [ADR 0012]): the run's `k` permits, each block's slots, each quota,
+  // in the initial marking, never deposited by an action, so the analyses see exactly the seed — the
+  // multiplicity lives where [IO-016] models it.
+  for (const pool of compiled.pools) {
+    initial.set(pool.place, [...(initial.get(pool.place) ?? []), ...Array.from({ length: pool.seed }, () => seed(null))]);
   }
 
   const segment =
     resume !== undefined ? `resume@${resume.site.path.join('.')}` : restart !== undefined ? `restart@${restart.site.index}` : 'closed';
   assertProvenCounts(compiled, initial, initialCounts(compiled, start, aborted ? compiled.cancel : undefined), segment, aborted);
   if (resume !== undefined || restart !== undefined) {
+    const pooled = new Set<Place<unknown>>(compiled.pools.map((pool) => pool.place));
     let work = 0;
     for (const [p, tokens] of initial) {
-      if (p === compiled.cancel || p === compiled.budget?.permits) continue;
+      if (p === compiled.cancel || pooled.has(p)) continue;
       work += tokens.length;
     }
     if (work !== 1 || initial.get(start)?.length !== 1) {
@@ -556,21 +562,35 @@ export async function runWorkflow(
 
 /**
  * Token counts of every place that holds work at rest: the cancel signal is skipped (it stays
- * marked once injected — the environment's, not work), and the permits appear only when their
- * count is not `k` (every branch returns its permit in the same firing, so any other count is a
- * minted or leaked one; `permitsReturned` proves it cannot happen).
+ * marked once injected — the environment's, not work), and a pool ([ADR 0012]) appears only when its
+ * conservation sum at rest is not its seed — the pool place plus its holders, weighted — listed
+ * under the pool place's name: the permits as `wf.permits (k=…)`, as before, any other pool as
+ * `<place> (seed=…)`. Every branch returns what its firing took, so any other sum is a minted or
+ * leaked token; the pool claims prove it cannot happen.
+ *
+ * A holder place is still work — a block's `active` marked at rest is a stranded arm — except a
+ * bucket's `spent`, where a rate limit's tokens rest by design once demand is gone ([TIME-011]).
  */
 function placeCounts(compiled: CompiledWorkflow, marking: Marking): Map<string, number> {
   const counts = new Map<string, number>();
+  const byName = new Map([...compiled.net.places].map((p) => [p.name, p] as const));
+  const resting = new Set<string>();
+  for (const pool of compiled.pools) {
+    resting.add(pool.place.name);
+    if (pool.kind === 'bucket') resting.add(pool.spent.name);
+  }
   for (const p of compiled.net.places) {
-    if (p.name === compiled.cancel.name) continue;
-    if (p.name === compiled.budget?.permits.name) {
-      const n = marking.tokenCount(p);
-      if (n !== compiled.budget.k) counts.set(`${p.name} (k=${compiled.budget.k})`, n);
-      continue;
-    }
+    if (p.name === compiled.cancel.name || resting.has(p.name)) continue;
     const count = marking.tokenCount(p);
     if (count > 0) counts.set(p.name, count);
+  }
+  for (const pool of compiled.pools) {
+    let sum = marking.tokenCount(pool.place);
+    for (const holder of pool.holders) {
+      const p = byName.get(holder.place);
+      if (p !== undefined) sum += holder.weight * marking.tokenCount(p);
+    }
+    if (sum !== pool.seed) counts.set(`${pool.place.name} (${pool.kind === 'permits' ? 'k' : 'seed'}=${pool.seed})`, marking.tokenCount(pool.place));
   }
   return counts;
 }

@@ -1,5 +1,6 @@
 import type { TransitionContext } from 'libpetri';
 import type { EntryPath } from './names.js';
+import type { AttemptDeadline } from './timeout.js';
 import type { LifecycleEvent, RunView, StepRecord, StepRunner } from './types.js';
 
 /**
@@ -45,6 +46,12 @@ export interface RunScope {
    * relative to enablement, so only a fixed `.sleep` is one.
    */
   wait(ms: number): Promise<void>;
+  /**
+   * Arms one step attempt's deadline `ms` from now on the run's clock ([ADR 0013], [TIME-015]):
+   * its signal aborts with `reason` when it fires. A run abort before then disarms it, so the step's
+   * own outcome stands. Nothing reads the machine clock, so a ManualClock advance fires it.
+   */
+  armDeadline(ms: number, reason: unknown): AttemptDeadline;
   /**
    * Hands a lifecycle event to the runner's `observe` ([ADR 0008]). `undefined` when the runner has
    * none, so an action awaits nothing and a run without an observer fires exactly as before. The

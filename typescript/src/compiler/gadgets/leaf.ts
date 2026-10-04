@@ -123,7 +123,8 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
       attemptIn = nextAttempt;
     }
   }
-  ctx.stepChain({ stepId: entry.id, path, retries, inPlace: inPlace.name, attempts, hops });
+  // M7 W0: no timeout funnels and no quotas yet ([ADR 0012], [ADR 0013]) — W1 B emits them.
+  ctx.stepChain({ stepId: entry.id, path, retries, inPlace: inPlace.name, attempts, hops, timeouts: [], timedOut: [], quotas: [] });
 
   return { inPlace, transitions };
 };

@@ -1,5 +1,6 @@
 import { systemClock, type Clock } from 'libpetri';
 import type { RunScope } from '../compiler/scope.js';
+import type { AttemptDeadline } from '../compiler/timeout.js';
 import type { CheckpointEvent, LifecycleEvent, StepRecord, StepRunner } from '../compiler/types.js';
 
 export interface RunScopeOptions {
@@ -144,5 +145,12 @@ export class KernelRunScope implements RunScope {
     } finally {
       this.signal.removeEventListener('abort', onAbort);
     }
+  }
+
+  /** See `RunScope.armDeadline` ([ADR 0013]). */
+  armDeadline(ms: number, reason: unknown): AttemptDeadline {
+    void ms;
+    void reason;
+    throw new Error('armDeadline: not implemented (M7 W1 B)');
   }
 }

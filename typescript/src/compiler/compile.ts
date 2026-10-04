@@ -34,6 +34,7 @@ import type {
   FlowToken,
   PauseToken,
   PlaceClaim,
+  Pool,
   ResumeSite,
   StepChain,
   StepDescription,
@@ -117,6 +118,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
   const steps: StepChain[] = [];
   const claims = new Map<string, PlaceClaim>();
   const exclusions: ExclusionClaim[] = [];
+  // Pools the gadgets own ([ADR 0011]); the permits and the quota pools are added at the end.
+  const gadgetPools: Pool[] = [];
   // Resume sites ([ADR 0007]), keyed by path; a gadget registers its own through GadgetResult.
   const resumeSites = new Map<string, ResumeSite>();
   const pathToEntry = new Map<string, { entryId: string; kind: EntryDescription['kind'] }>();
@@ -215,6 +218,11 @@ export function compile(description: WorkflowDescription, options: CompileOption
       stepChain: (chain) => {
         steps.push(chain);
       },
+      // [ADR 0012]: one member per (emission, quota, role), fused into the quota's canonical place
+      // at build, with one refill per rate quota — W1 D.
+      quotaMember: () => {
+        throw new Error('quotaMember: not implemented (M7 W1 D)');
+      },
       names,
       exits,
       nextIsResult,
@@ -237,6 +245,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
       claims.set(claim.place, claim);
     }
     exclusions.push(...(result.exclusions ?? []));
+    gadgetPools.push(...(result.pools ?? []));
     return result;
   };
 
@@ -320,6 +329,16 @@ export function compile(description: WorkflowDescription, options: CompileOption
     if (!placeNames.includes(name)) throw new Error(`a claim names '${name}', which is not a place of the net`);
   }
 
+  // Every conserved resource ([ADR 0012]): the run permits first — also kept as `budget` — then the
+  // gadgets' slot pools. Every step attempt takes a permit and returns it, so the permits' takers and
+  // givers are both `stepAttempts`. Quota pools join here in W1 D.
+  const pools: Pool[] = [
+    ...(permits && k !== undefined
+      ? [{ kind: 'permits' as const, place: permits, seed: k, holders: [], takers: [...stepAttempts], givers: [...stepAttempts] }]
+      : []),
+    ...gadgetPools,
+  ];
+
   return {
     net,
     program: PrecompiledNet.compile(net),
@@ -329,6 +348,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
     cancel,
     cancelRequest,
     ...(permits && k !== undefined ? { budget: { permits, k } } : {}),
+    pools,
     stepAttempts,
     steps,
     claims,
@@ -399,6 +419,10 @@ function entrySite(entry: EntryDescription, index: number, inPlace: Place<FlowTo
  * A per-run wait hashes as `perRun`, not as a value — that is the point of it being per run.
  */
 function structuralHash(description: WorkflowDescription, checkpoints: readonly number[], names: readonly string[]): string {
+  // M7 W1 D: a step's `timeoutMs` and `quotas`, and a block's `concurrency` where it binds (c < arms),
+  // join the shape only when present, so a description without them hashes exactly as today — the
+  // names alone do not separate two timeouts, or two quota sizes, of one shape.
+
   const step = (s: StepDescription): unknown => [
     'step',
     s.id,

@@ -1,11 +1,13 @@
 import type { Place, Transition } from 'libpetri';
-import type { NameVocabulary, EntryPath } from '../names.js';
+import type { NameVocabulary, EntryPath, QuotaRole } from '../names.js';
 import type {
   EntryDescription,
   ExclusionClaim,
   Exits,
   FlowToken,
   PlaceClaim,
+  Pool,
+  QuotaRef,
   ResumeSite,
   StepChain,
   StepDescription,
@@ -29,6 +31,16 @@ export interface GadgetResult {
   readonly claims?: readonly PlaceClaim[];
   /** Pairs of this gadget's places that are never marked together ([ADR 0009]). */
   readonly exclusions?: readonly ExclusionClaim[];
+  /**
+   * The pools this gadget owns ([ADR 0011]): a block limit's `wf.slots.<path>`, with its `active`
+   * holder, its admits and re-entries as takers and its collects as givers. Collected by the builder
+   * into `CompiledWorkflow.pools`, as claims are. The pool place must be an arc-referenced place of
+   * the net. A gadget never returns the run permits or a quota pool: those are the compiler's.
+   *
+   * A pool brings its own bound and quiescence claims (the verifier derives them from `pools`), so
+   * the gadget claims only its holders' bounds — `placeBound(active, c)` — through `claims`.
+   */
+  readonly pools?: readonly Pool[];
 }
 
 /**
@@ -67,6 +79,24 @@ export interface GadgetContext {
    * delay and the budget cannot deadlock the net. Combinators pass it through untouched.
    */
   readonly permits: Place<null> | undefined;
+  /**
+   * One step occurrence's member of a quota place ([ADR 0012]) — the leaf calls it for each
+   * `StepDescription.quotas` entry: `role: 'pool'` for every quota (a `limit`'s pool, a `rateLimit`'s
+   * bucket), and `'spent'` / `'demand'` for a `rateLimit` only (asking either of a `limit` throws).
+   *
+   * Returns a fresh place local to this emission, named `s.<path>.<slug>.quota.<id>.<role>`, which
+   * the compiler fuses into the quota's canonical `wf.quota.<id>[.<role>]` at build (`FusionSet`,
+   * [MOD-060]/[MOD-061]); actions write to it by its own name, through the place alias fusion keeps
+   * ([MOD-031]). The same `(ref.id, role)` asked twice in one emission returns the same place. The
+   * first ref seen for an id fixes its parameters; a later ref with the same id and different
+   * parameters throws, naming both.
+   *
+   * The member never survives into the net, so a gadget must not name it in a claim or exclusion,
+   * and must not emit a refill — fusion merges places, not transitions; the compiler emits one per
+   * quota. The leaf still records the quota ids on its `StepChain`, from which the pool's takers are
+   * built.
+   */
+  readonly quotaMember: (ref: QuotaRef, role: QuotaRole) => Place<null>;
   /** Registers a step-attempt transition by name — the leaf calls it for every attempt it emits. */
   readonly stepAttempt: (transitionName: string) => void;
   /** Registers a step's whole attempt chain ([ADR 0009]) — the leaf calls it once per step. */

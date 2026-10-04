@@ -20,9 +20,14 @@ export type {
   PetriEngineType,
   PetriFactories,
   PetriInitOptions,
+  PetriLimit,
+  PetriRateLimit,
   PetriStep,
+  PetriStepResources,
   PetriWorkflow,
 } from './init.js';
+export { Quota } from './resources.js';
+export type { QuotaOptions } from './resources.js';
 export { PetriExecutionEngine, UnsupportedRunModeError } from './engine.js';
 export type { PetriEngineOptions, RestartRefusalReason, UnsupportedRunMode } from './engine.js';
 export { restartActiveRuns } from './recovery.js';
@@ -30,11 +35,12 @@ export type { RestartActiveRunsOptions, RestartActiveRunsReport } from './recove
 export {
   adaptStepFlow,
   adaptExecutionGraph,
+  LAYER2_METADATA_KEYS,
   MASTRA_BRANCH_ENTRY_TYPE,
   MASTRA_WORKFLOW_COMPONENT,
   UnsupportedWorkflowError,
 } from './adapt.js';
-export type { AdaptOptions } from './adapt.js';
+export type { AdaptOptions, Layer2MetadataKey } from './adapt.js';
 export { isMastraWorkflow, nestedWorkflows, verifyMastraWorkflow, workflowsIn } from './verify.js';
 export type { MastraVerification, MastraVerifyOptions, VerifiableWorkflow } from './verify.js';
 export { entryId, suspendTracingContext } from './host.js';

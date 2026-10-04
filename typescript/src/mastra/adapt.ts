@@ -23,6 +23,19 @@ export const MASTRA_BRANCH_ENTRY_TYPE = 'conditional';
  */
 export const MASTRA_WORKFLOW_COMPONENT = 'WORKFLOW';
 
+/**
+ * The Layer 2 annotations: keys of Mastra's own `metadata` that this engine reads and Mastra's
+ * engine ignores — it reads `metadata` only for span attributes (`handlers/control-flow.ts:62-81`;
+ * `types.d.ts:500-503`). `checkpoint` on a top-level entry ([ADR 0010]); `concurrency` on a
+ * `.parallel()` / `.branch()` call's own options ([ADR 0011]). `tests/engine/layer2-ignorable.test.ts`
+ * is driven by this list: an annotated workflow on `DefaultExecutionEngine` returns what its
+ * unannotated twin does, so each key stays meaningful there, merely unenforced.
+ */
+export const LAYER2_METADATA_KEYS = ['checkpoint', 'concurrency'] as const;
+
+/** One of {@link LAYER2_METADATA_KEYS}. */
+export type Layer2MetadataKey = (typeof LAYER2_METADATA_KEYS)[number];
+
 export interface AdaptOptions {
   /** The workflow's id — `ExecutionGraph.id`, which is `Workflow.id`. */
   readonly workflowId: string;

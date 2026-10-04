@@ -17,6 +17,7 @@ import type { InferPublicSchema, PublicSchema, StandardSchemaWithJSON } from '@m
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
 import type { DynamicArgument } from '@mastra/core/types';
 import { PetriExecutionEngine, type PetriEngineOptions } from './engine.js';
+import { limit, rateLimit, type Quota, type QuotaOptions } from './resources.js';
 
 declare const petriEngine: unique symbol;
 
@@ -116,6 +117,30 @@ type ProcessorStep<TProcessorId extends string> = PetriStep<
 >;
 
 /**
+ * What the petri `createStep` accepts beside Mastra's own parameters — Layer 3, so only here, behind
+ * the brand ([ADR 0002]). Mastra's own `createStep` has neither key, so an object literal carrying
+ * one is an excess-property error there, and a {@link Quota} is minted only by {@link init}'s
+ * factories.
+ *
+ * Stripped before Mastra's `createStep` sees the parameters and attached to the Step under
+ * `STEP_RESOURCES` (`resources.ts`), where the adapter reads them.
+ */
+export interface PetriStepResources {
+  /**
+   * The quotas every attempt of this step draws on ([ADR 0012]), from `init().limit` /
+   * `init().rateLimit`. A declarative `.agent('id')` / `.tool('id')` never passes through here and
+   * cannot carry one (`uses-position`).
+   */
+  readonly uses?: readonly Quota[];
+  /**
+   * A per-attempt deadline in milliseconds ([ADR 0013]): on expiry the attempt's signal aborts, the
+   * step is waited for, its result discarded, and the attempt fails with a `StepTimeoutError` —
+   * retried like any thrown error. A whole number in [1, `MAX_WAIT_MS`] (`timeout-value`).
+   */
+  readonly timeout?: number;
+}
+
+/**
  * `createStep` on the petri engine: Mastra's overloads, one for one, each returning a
  * {@link PetriStep}, plus one Mastra has no need for — a petri workflow passed as a step. Mastra
  * nests a workflow by handing it to `.then()` directly, but a `Workflow` declares its own `execute`
@@ -132,7 +157,8 @@ export interface PetriCreateStep {
     TSuspendSchema extends PublicSchema | undefined = undefined,
     TRequestContextSchema extends PublicSchema | undefined = undefined,
   >(
-    params: StepParams<TStepId, TStateSchema, TInputSchema, TOutputSchema, TResumeSchema, TSuspendSchema, TRequestContextSchema>,
+    params: StepParams<TStepId, TStateSchema, TInputSchema, TOutputSchema, TResumeSchema, TSuspendSchema, TRequestContextSchema> &
+      PetriStepResources,
   ): PetriStep<
     TStepId,
     TStateSchema extends PublicSchema ? InferPublicSchema<TStateSchema> : unknown,
@@ -148,7 +174,7 @@ export interface PetriCreateStep {
       structuredOutput?: never;
       retries?: number;
       scorers?: DynamicArgument<MastraScorers>;
-    },
+    } & PetriStepResources,
   ): PetriStep<TStepId, unknown, { prompt: string }, { text: string }, unknown, unknown>;
   <TStepId extends string, TStepOutput>(
     agent: SubAgent<TStepId, any> | Agent<TStepId, any>,
@@ -157,7 +183,7 @@ export interface PetriCreateStep {
       retries?: number;
       scorers?: DynamicArgument<MastraScorers>;
       metadata?: StepMetadata;
-    },
+    } & PetriStepResources,
   ): PetriStep<TStepId, unknown, { prompt: string }, TStepOutput, unknown, unknown>;
   <
     TSchemaIn,
@@ -174,7 +200,7 @@ export interface PetriCreateStep {
       scorers?: DynamicArgument<MastraScorers>;
       metadata?: StepMetadata;
       actor?: ActorSignal;
-    },
+    } & PetriStepResources,
   ): PetriStep<TId, unknown, TSchemaIn, TSchemaOut, TSuspend, TResume, TRequestContext>;
   <TProcessorId extends string>(processor: ProcessorSource<TProcessorId>): ProcessorStep<TProcessorId>;
   <TWorkflowId extends string, TState, TInput, TOutput, TRequestContext extends Record<string, any> | unknown>(
@@ -205,11 +231,24 @@ export type PetriCloneStep = <TStepId extends string>(
  */
 export const PETRI_ENGINE_TYPE = 'petri';
 
+/** `init().limit` ([ADR 0012]): at most `n` attempts of the steps using it in flight at once, per run. */
+export type PetriLimit = (n: number, options: QuotaOptions) => Quota;
+
+/**
+ * `init().rateLimit` ([ADR 0012]): at most `burst` attempts at once, one more every `perMs` ms on the
+ * run's clock, retries included, per run.
+ */
+export type PetriRateLimit = (burst: number, perMs: number, options: QuotaOptions) => Quota;
+
 /** What {@link init} returns. */
 export interface PetriFactories {
   readonly createWorkflow: PetriCreateWorkflow;
   readonly createStep: PetriCreateStep;
   readonly cloneStep: PetriCloneStep;
+  /** Layer 3 ([ADR 0012]): a quota a petri step draws on through `createStep({ uses })`. */
+  readonly limit: PetriLimit;
+  /** Layer 3 ([ADR 0012]): a rate a petri step draws on through `createStep({ uses })`. */
+  readonly rateLimit: PetriRateLimit;
 }
 
 /**
@@ -246,14 +285,36 @@ export function init(options: PetriInitOptions = {}): PetriFactories {
     return workflow;
   }) as unknown as PetriCreateWorkflow;
 
-  const createStep = ((source: unknown, sourceOptions?: unknown) =>
-    source instanceof Workflow
+  const createStep = ((source: unknown, sourceOptions?: unknown) => {
+    // M7 W1 F strips `uses` / `timeout` and attaches them under STEP_RESOURCES ([ADR 0012],
+    // [ADR 0013]). Until then a step asking for either is refused, and every other call reaches
+    // Mastra's createStep with the very object it was given — Mastra binds a params step's
+    // `execute` to that object (`workflow.ts:523`), so W1 must strip without changing `this`.
+    if (asksForResources(source) || asksForResources(sourceOptions)) {
+      throw new Error('createStep: `uses` and `timeout` are not implemented (M7 W1 F)');
+    }
+    return source instanceof Workflow
       ? source
-      : (mastraCreateStep as (s: unknown, o?: unknown) => unknown)(source, sourceOptions)) as PetriCreateStep;
+      : (mastraCreateStep as (s: unknown, o?: unknown) => unknown)(source, sourceOptions);
+  }) as PetriCreateStep;
 
+  // M7 W1 F: copies STEP_RESOURCES onto the clone.
   const cloneStep = mastraCloneStep as unknown as PetriCloneStep;
 
-  return { createWorkflow, createStep, cloneStep };
+  return { createWorkflow, createStep, cloneStep, limit, rateLimit };
+}
+
+/**
+ * Whether a `createStep` argument carries a non-empty `uses` or a `timeout`. Only a plain object — a
+ * params object or an agent/tool options object — is looked at: an `Agent`, `Tool` or `Workflow` is a
+ * class instance whose own fields are not this engine's to read.
+ */
+function asksForResources(value: unknown): boolean {
+  if (value === null || typeof value !== 'object') return false;
+  const proto: unknown = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return false;
+  const { uses, timeout } = value as { uses?: unknown; timeout?: unknown };
+  return (Array.isArray(uses) ? uses.length > 0 : uses !== undefined) || timeout !== undefined;
 }
 
 /** Marks a `Run` whose `_restart` {@link openRestart} has already wrapped. */
