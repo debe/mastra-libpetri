@@ -57,6 +57,16 @@ export type PersistContext = PersistBase &
         readonly activePath: readonly number[];
       }
     | {
+        /**
+         * A checkpoint ([ADR 0010]): entry `after` succeeded. A `running` row with `activePaths
+         * [after + 1]` — the boundary — the context so far and the run's state, so Mastra's own
+         * restart of it starts at the next entry from the records, as this engine's does.
+         */
+        readonly phase: 'checkpoint';
+        readonly after: number;
+        readonly records: ReadonlyMap<string, StepRecord>;
+      }
+    | {
         readonly phase: 'terminal';
         readonly report: RunReport;
         readonly result: FormattedResult;
@@ -190,6 +200,8 @@ export function buildRunSnapshot(ctx: PersistContext, now: number = Date.now()):
       tracingContext: undefined,
     };
   }
+
+  if (ctx.phase === 'checkpoint') throw new Error('buildRunSnapshot: checkpoint rows are not built yet (M4b W3)');
 
   const o = ctx.report.outcome;
   const { index, afterEntry } = terminalPosition(o, graph, ctx.resume?.index);
@@ -344,7 +356,7 @@ function strandedError(places: readonly string[]): Error {
 }
 
 function statusOf(ctx: PersistContext): WorkflowRunStatus {
-  if (ctx.phase === 'start' || ctx.phase === 'resume-start') return 'running';
+  if (ctx.phase === 'start' || ctx.phase === 'resume-start' || ctx.phase === 'checkpoint') return 'running';
   const o = ctx.report.outcome;
   switch (o.status) {
     case 'success':

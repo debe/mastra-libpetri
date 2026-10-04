@@ -25,6 +25,7 @@ import type {
 import type { EntryPath } from '../compiler/names.js';
 import { KernelRunScope } from './scope.js';
 import type { ResumeSeed } from '../compiler/resume.js';
+import type { RestartSeed } from '../compiler/restart.js';
 
 /** Present only when non-empty — see {@link RunOutcome}. */
 type Residue = { readonly residue?: readonly string[] };
@@ -121,6 +122,11 @@ export interface RunOptions {
    * restored from a marking.
    */
   readonly resume?: ResumeSeed;
+  /**
+   * Start a restarted segment ([ADR 0010]): one `FlowToken` at a top-level boundary instead of the
+   * entry place, proven as `restart@<index>`. Exclusive with `resume`.
+   */
+  readonly restart?: RestartSeed;
   /**
    * A second event store every net event is also appended to — the libpetri debug UI's
    * `DebugAwareEventStore` tee ([ADR 0008]). Observation only: the kernel's own watcher still sees
@@ -359,9 +365,10 @@ export function initialCounts(
 export function initialMarking(
   compiled: CompiledWorkflow,
   input: unknown,
-  options: Pick<RunOptions, 'clock' | 'signal' | 'resume'>,
+  options: Pick<RunOptions, 'clock' | 'signal' | 'resume' | 'restart'>,
 ): Map<Place<unknown>, Token<unknown>[]> {
   const { resume, signal } = options;
+  if (options.restart !== undefined) throw new Error('initialMarking: restart seeding is not implemented (M4b W2)');
   if (resume !== undefined) {
     const key = resume.site.path.join('.');
     if (compiled.resumeSites.get(key) !== resume.site) {

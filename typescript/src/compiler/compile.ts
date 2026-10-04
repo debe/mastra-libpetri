@@ -22,6 +22,7 @@ import { foreachGadget } from './gadgets/foreach.js';
 import type { Gadget, GadgetContext, GadgetResult, NestedOptions } from './gadgets/types.js';
 import type {
   BailToken,
+  BoundarySite,
   CanceledToken,
   CompiledWorkflow,
   EntryDescription,
@@ -85,6 +86,10 @@ export function compile(description: WorkflowDescription, options: CompileOption
   if (description.entries.length === 0) {
     // Mastra refuses this too, before persisting anything (`WORKFLOW_EXECUTE_EMPTY_GRAPH`).
     throw new Error(`workflow '${description.id}' has no entries; nothing to compile`);
+  }
+  if ((description.checkpoints ?? []).length > 0) {
+    // ADR 0010, M4b W1: the checkpoint place, transition and sweep are not emitted yet.
+    throw new Error(`workflow '${description.id}': checkpoints are not compiled yet (M4b W1)`);
   }
 
   const names = new NameVocabulary();
@@ -277,6 +282,14 @@ export function compile(description: WorkflowDescription, options: CompileOption
     interior: placeNames.filter((n) => n.startsWith(`s.${index}.`) || n.startsWith(`s.${index}-`)),
     next: nextOf[index]!,
   }));
+  // Every top-level boundary a restart may continue from ([ADR 0010]): entry i's input place, which
+  // is the place entry i - 1's success goes to, and the entry place for i = 0.
+  const placeByName = new Map([...net.places].map((p) => [p.name, p] as const));
+  const boundaries: BoundarySite[] = description.entries.map((entry, index) => {
+    const input = index === 0 ? next : placeByName.get(nextOf[index - 1]!);
+    if (input === undefined) throw new Error(`no input place for the top-level entry at ${index}`);
+    return { kind: 'boundary', index, entryId: entry.id, entryKind: entry.kind, place: input as Place<FlowToken> };
+  });
   for (const name of [...claims.keys(), ...exclusions.flatMap((e) => [e.a, e.b])]) {
     if (!placeNames.includes(name)) throw new Error(`a claim names '${name}', which is not a place of the net`);
   }
@@ -296,6 +309,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
     exclusions,
     entries,
     resumeSites,
+    boundaries,
+    checkpoints: [...(description.checkpoints ?? [])],
     structuralHash: structuralHash(description, names.names()),
   };
 }

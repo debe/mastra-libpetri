@@ -22,7 +22,9 @@ export type {
   PetriWorkflow,
 } from './init.js';
 export { PetriExecutionEngine, UnsupportedRunModeError } from './engine.js';
-export type { PetriEngineOptions, UnsupportedRunMode } from './engine.js';
+export type { PetriEngineOptions, RestartRefusalReason, UnsupportedRunMode } from './engine.js';
+export { restartActiveRuns } from './recovery.js';
+export type { RestartActiveRunsOptions, RestartActiveRunsReport } from './recovery.js';
 export {
   adaptStepFlow,
   adaptExecutionGraph,

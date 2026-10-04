@@ -11,7 +11,7 @@
       solver turns every proof into `unknown` and still reports green) and
       `tests/upstream/libpetri-surface-gate.test.ts` (a missing clock does not throw — the
       executor silently reads the machine clock and a deterministic run simply is not)
-- [ ] `debe/mastra-libpetri` created and pushed
+- [x] `debe/mastra-libpetri` created (private) and pushed, 2026-10-04
 - [x] Final integration: `npm run check && npm test && npm run build` green (3 files, 4 tests);
       `scripts/link-libpetri.sh --check` clean against pin `f34ea8a`. Both gates verified live
       rather than assumed: the z3 gate passes on a resolved solver, and the surface gate passes

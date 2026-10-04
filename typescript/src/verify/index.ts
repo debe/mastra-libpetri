@@ -2,12 +2,13 @@ export {
   verifyWorkflow,
   describeReport,
   resumeSegment,
+  restartSegment,
   segmentLabel,
   segmentInitialMarking,
   segmentsFor,
   completionProperties,
 } from './properties.js';
-export type { PropertyReport, ResumeSegment, Segment, VerifyOptions } from './properties.js';
+export type { PropertyReport, RestartSegment, ResumeSegment, Segment, VerifyOptions } from './properties.js';
 export {
   cancelStructureViolations,
   resumeGateViolations,

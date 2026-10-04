@@ -92,6 +92,13 @@ export type EntryDescription =
 export interface WorkflowDescription {
   readonly id: string;
   readonly entries: readonly EntryDescription[];
+  /**
+   * The top-level entries after which a checkpoint is taken ([ADR 0010]), ascending, each a valid
+   * index, the last entry excluded (the terminal row covers it). Absent or empty compiles to exactly
+   * the unmarked net. The adapter reads them from Mastra's `metadata.checkpoint` and refuses a mark
+   * anywhere but on a top-level entry.
+   */
+  readonly checkpoints?: readonly number[];
 }
 
 /**
@@ -301,6 +308,16 @@ export type LifecycleEvent =
   | { readonly kind: 'foreach-settled'; readonly stepId: string; readonly path: EntryPath; readonly record: StepRecord };
 
 /**
+ * A checkpoint reached ([ADR 0010]): entry `after` succeeded, entry `after + 1` has not started, and
+ * the net holds exactly the one flow token between them. `records` is every step's latest record at
+ * that moment, as the run scope holds it.
+ */
+export interface CheckpointEvent {
+  readonly after: number;
+  readonly records: ReadonlyMap<string, StepRecord>;
+}
+
+/**
  * How a step actually runs. The compiler emits actions that delegate here, and the kernel
  * supplies the runner **per run** through the run scope — so a compiled net holds no runner,
  * is independent of any one run, and can be cached by its structural hash.
@@ -334,6 +351,14 @@ export interface StepRunner {
    * its publish before moving on — but nothing it does, throws or returns changes the run.
    */
   observe?(event: LifecycleEvent): void | Promise<void>;
+
+  /**
+   * Take a checkpoint ([ADR 0010]). **Not** observation-only: the checkpoint transition awaits it,
+   * so the row is durable before any effect of the next entry, and a rejection fails that firing —
+   * the run ends and the engine rejects with the cause. Required when the workflow marks one; the
+   * kernel refuses a marked workflow run with a runner that lacks it.
+   */
+  checkpoint?(event: CheckpointEvent): Promise<void>;
 }
 
 /**
@@ -495,6 +520,21 @@ export interface Terminals extends Exits {
  * kernel asserts it — and each site is proven as its own segment from that marking.
  */
 export type ResumeSite = EntrySite | ArmSite | ForeachSite;
+
+/**
+ * A top-level boundary a restart may continue from ([ADR 0010]): the input place of entry `index`,
+ * which the barrier guarantees is the only marked place outside the permits and the cancel signal
+ * when it is marked. One per top-level entry, marked or not — a row from Mastra's own engine may name
+ * any of them — and kept apart from `resumeSites`, whose key `"i"` may be a foreach's. Index 0 is the
+ * entry place.
+ */
+export interface BoundarySite {
+  readonly kind: 'boundary';
+  readonly index: number;
+  readonly entryId: string;
+  readonly entryKind: EntryDescription['kind'];
+  readonly place: Place<FlowToken>;
+}
 
 /** A top-level step (a nested workflow included) or loop. A sleep never suspends and has none. */
 export interface EntrySite {
@@ -675,6 +715,10 @@ export interface CompiledWorkflow {
   readonly entries: readonly TopLevelEntry[];
   /** Every resume site, keyed by its path joined with `.` ([ADR 0007]). */
   readonly resumeSites: ReadonlyMap<string, ResumeSite>;
+  /** Every top-level boundary, by entry index ([ADR 0010]). `boundaries[0].place` is `entryPlace`. */
+  readonly boundaries: readonly BoundarySite[];
+  /** The entries after which a checkpoint is taken, as the description marked them ([ADR 0010]). */
+  readonly checkpoints: readonly number[];
   /** Stable over structure alone, so it keys a compile cache across runs. */
   readonly structuralHash: string;
 }

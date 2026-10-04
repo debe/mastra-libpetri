@@ -67,6 +67,9 @@ const DEFAULTS: ExecutionEngineOptions = { validateInputs: true, shouldPersistSn
  */
 export type UnsupportedRunMode = 'resume' | 'restart' | 'timeTravel' | 'perStep';
 
+/** Why a restart was refused ([ADR 0010]). */
+export type RestartRefusalReason = 'no-position' | 'workflow-changed';
+
 /**
  * Thrown by `execute()` for a run mode, or a resume, this engine does not support (ADR 0005,
  * ADR 0007). Always before anything is persisted, so a refused resume leaves the suspension as it
@@ -83,6 +86,11 @@ export class UnsupportedRunModeError extends Error {
     readonly path: readonly number[];
     readonly reason: UnresumablePositionError['reason'];
   };
+  /**
+   * Why a restart was refused, when it was one ([ADR 0010]): `no-position` (no stored position, or
+   * not a top-level entry) or `workflow-changed` (the stored step graph is not the compiled one).
+   */
+  readonly restart?: { readonly path: readonly number[]; readonly reason: RestartRefusalReason };
 
   constructor(
     mode: UnsupportedRunMode,

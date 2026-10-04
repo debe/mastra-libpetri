@@ -40,7 +40,25 @@ import { initialCounts } from '../engine/kernel.js';
  * - a {@link ResumeSegment} — a resumed run ([ADR 0007]): one token at a registered resume site,
  *   with or without one cancellation arriving at any point.
  */
-export type Segment = 'closed' | 'cancel' | ResumeSegment;
+export type Segment = 'closed' | 'cancel' | ResumeSegment | RestartSegment;
+
+/**
+ * A restarted run of the same net ([ADR 0010]), proven from `{boundaries[index].place: 1,
+ * wf.permits: k}` plus the cancel request when `cancel` is set — one per top-level boundary, marked
+ * or not. Where the marking equals a `resume@index` segment's, the verifier proves it once and cites
+ * the proof under both labels. Built with {@link restartSegment}; labelled `restart@<index>`.
+ */
+export interface RestartSegment {
+  readonly restart: number;
+  readonly cancel: boolean;
+}
+
+/** A restart segment whose string form is its label. */
+export function restartSegment(index: number, cancel: boolean): RestartSegment {
+  const segment = { restart: index, cancel };
+  Object.defineProperty(segment, 'toString', { value: () => segmentLabel(segment), enumerable: false });
+  return segment;
+}
 
 /**
  * A resumed run of the same net ([ADR 0007]), proven from `{site.place: 1, wf.permits: k}` (the
@@ -74,6 +92,7 @@ export function resumeSegment(site: string, cancel: boolean): ResumeSegment {
 /** `closed`, `cancel`, `resume@<site>` or `resume@<site>+cancel`. */
 export function segmentLabel(segment: Segment): string {
   if (typeof segment === 'string') return segment;
+  if ('restart' in segment) return `restart@${segment.restart}${segment.cancel ? '+cancel' : ''}`;
   return `resume@${segment.resume}${segment.cancel ? '+cancel' : ''}`;
 }
 
@@ -93,6 +112,7 @@ function cancels(segment: Segment): boolean {
  * Throws on a site key the workflow does not register.
  */
 export function segmentInitialMarking(compiled: CompiledWorkflow, segment: Segment): ReadonlyMap<Place<unknown>, number> {
+  if (typeof segment !== 'string' && 'restart' in segment) throw new Error('restart segments are not proven yet (M4b W2)');
   const start = typeof segment === 'string' ? compiled.entryPlace : siteOf(compiled, segment.resume).place;
   return initialCounts(compiled, start, cancels(segment) ? compiled.cancelRequest : undefined);
 }

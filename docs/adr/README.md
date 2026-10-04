@@ -11,6 +11,7 @@
 | [0007](0007-resume-is-a-seeded-segment.md) | A resume is a seeded, gated, separately proven segment of the same net | accepted |
 | [0008](0008-step-events-observe-the-net.md) | Step events observe the net: a lifecycle hook at Mastra's emission points, and a tee for the debug UI | accepted |
 | [0009](0009-verification-claims.md) | Every compiled workflow carries four families of claims, derived, proven, and gated over the corpus | accepted |
+| [0010](0010-restart-from-marked-checkpoints.md) | Restart continues from the latest author-marked checkpoint, a proven boundary of the same net | proposed |
 
 Each ADR has Context / Decision / Consequences / Evidence; Evidence names the test that pins the
 behaviour it rests on. Amendments are recorded in the existing ADR, tagged with the milestone
