@@ -37,8 +37,8 @@ unsettled arm is aborted, the block waits for all n, and each loser is recorded 
   `{type:'parallel'}` and M9 PR 4 stays open. Arms are typed `PetriStep[]`. Refusals:
   `quorum-value` (k not a whole number in [1, n]), `race-empty` (n = 0), `blueprint-arms` (entry
   arms not identical to the minted arms, or a duplicate id), `blueprint-position` (marker on any
-  entry but `.parallel`). *Maintainer decision pending:* this surface, or A's builder methods.
-- **What wins.** A `success`. A failed, bailed, paused or suspended arm is a miss (`Promise.any`).
+  entry but `.parallel`). *Maintainer decision (2026-10-04):* this surface, not A's builder methods.
+- **What wins** (maintainer decision, 2026-10-04: first success, the name stays `race`). A `success`. A failed, bailed, paused or suspended arm is a miss (`Promise.any`).
   Winners are the first k successes in collect order (FIFO on `okSeen`, [IO-002]).
 - **Net, per block.**
   ```text
@@ -66,15 +66,14 @@ unsettled arm is aborted, the block waits for all n, and each loser is recorded 
   then its next attempt sees the fired gate, does not run and leaves by `preempted`. An arm admitted
   after the decision does the same at once. A success that settled before its abort keeps its
   `success` record; a suspended arm's record is rewritten `canceled` at the join, so no finished run
-  holds a resumable orphan. *Maintainer decision pending:* preempt on `short` too (recommended), or
-  only on `met`.
+  holds a resumable orphan. Preempt on `short` too (recommended; taken unless the
+  maintainer objects).
 - **Output.** Parallel's rule, from step records: the next entry gets every declared arm, mapped to
   its record's `output` — exactly what `getStepOutput` rebuilds on a restart. The workflow's last
   entry reports the arms that succeeded. The `won` token carries the winners for observability only.
-  *Maintainer decision pending:* this, or winners only (which would need surplus successes recorded
-  `canceled` to stay restart-consistent).
+  *Maintainer decision (2026-10-04):* this, not winners only.
 - **Suspend.** A miss in wave 1; the block never suspends and emits no `blockReentry` sites.
-  *Maintainer decision pending:* this, or A's resumable block (soft losses, re-entry, replay).
+  *Maintainer decision (2026-10-04):* this for wave 1; a resumable block is deferred.
 - **Cancel** ([ADR 0004]): unchanged — `fork` is gated, arms see the run signal, the top-level
   settle re-stamps `canceled`. Run abort, then deadline, then preempt: whichever fires first.
 - **Restart** ([ADR 0010]): a checkpoint on the race entry is allowed; a restart re-runs the whole

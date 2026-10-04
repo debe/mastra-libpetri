@@ -34,6 +34,8 @@ import {
   type VerifyOptions,
 } from './properties.js';
 import { poolSinks } from './pools.js';
+import { dischargeBySiphon, emptySiphon, wholeMs, type EmptySiphon } from './siphon.js';
+import { executionWitnesses, type ClaimResult } from './witness.js';
 
 /**
  * The four families `verify` proves ([ADR 0009]):
@@ -84,7 +86,12 @@ export interface ClaimReport {
   readonly segment: Segment;
   /** The initial marking the query started from. */
   readonly marking: string;
-  readonly result: SmtVerificationResult;
+  /**
+   * The verifier's answer — or, for a `witness` on an untimed net, an executor run's: route
+   * `execution`, `violated`, the run's firing sequence in [VER-004]'s start/completion split
+   * (`t`, `complete:t`) as the confirmed witness (`witness.ts`).
+   */
+  readonly result: ClaimResult;
   readonly holds: boolean;
   /**
    * Present only on a `proof` whose `result` is `unknown`: the same query under libpetri's opt-out
@@ -143,6 +150,19 @@ export interface VerificationReport {
  * which. Liveness is shown in the `closed` segment alone: a step that runs in a fresh run is not
  * dead, and the other segments start inside a run.
  *
+ * **On an untimed net a liveness witness is first sought by execution** (`witness.ts`): the same
+ * net, stub actions depositing one token into each place of one branch of each `Out` spec, a few
+ * deterministic branch policies, a manual clock. A run that starts the attempt settles its claim
+ * `violated` on the `execution` route, its witness the run's firing sequence as starts and
+ * completions; one no run reaches is asked of the verifier as before. Nothing else is ever settled
+ * from a run.
+ *
+ * **A bound on a place of the segment's initially empty siphon is proven from the arcs**
+ * (`siphon.ts`) — `neverCanceled` where no cancel arrives, and any `bound(p<=n)` on a place only a
+ * cancel can mark — on the `structural` route, with no query asked; so is an exclusion one of whose
+ * places is in it (`exclusive(<interior>, wf.canceled)` where no cancel arrives). The siphon is the
+ * segment's own, from its own initial marking. Every other claim is asked.
+ *
  * **Segments with equal markings are asked once.** The restart segments ([ADR 0010]) repeat
  * markings already listed — `restart@0` is `closed`, `restart@0+cancel` is `cancel`, `restart@p` is
  * `resume@p` at a top-level step or loop. Each such segment's claims are the earlier segment's,
@@ -196,7 +216,18 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
     if (phase === 'atomic' || phase === 'atomic-state-equation') verifier = verifier.assumeAtomicFiring(true);
     return verifier.verify();
   };
-  const settles = (kind: 'proof' | 'witness', result: SmtVerificationResult): boolean =>
+  // A bound or an exclusion on a place of the segment's initially empty siphon is proven from the
+  // arcs, before any query (`siphon.ts`): `neverCanceled` in every segment no cancel arrives in. The
+  // siphon depends on the net and the marking alone, so it is computed once per distinct marking.
+  const siphons = new Map<string, EmptySiphon>();
+  const structural = (segment: Segment, property: SmtProperty): SmtVerificationResult | undefined => {
+    const initial = segmentInitialMarking(compiled, segment);
+    const key = markingKey(initial);
+    let siphon = siphons.get(key);
+    if (siphon === undefined) siphons.set(key, (siphon = emptySiphon(compiled.net, initial)));
+    return dischargeBySiphon(compiled.net, initial, property, siphon);
+  };
+  const settles = (kind: 'proof' | 'witness', result: ClaimResult): boolean =>
     kind === 'proof' ? result.verdict.type === 'proven' : result.verdict.type === 'violated' && result.counterexampleConfirmed === true;
 
   const claims: ClaimReport[] = [];
@@ -224,6 +255,8 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
   if (families.includes('completion')) {
     const asked = asking.flatMap((segment) => completionProperties(compiled, segment).map(([property, smt]) => ({ segment, property, smt })));
     const answers = await pool(asked, width, async ({ segment, smt }) => {
+      const settled = structural(segment, smt);
+      if (settled !== undefined) return settled;
       const first = await query(segment, smt, 'plain');
       if (first.verdict.type !== 'unknown') return first;
       const retried = await query(segment, smt, 'state-equation');
@@ -243,6 +276,8 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
     readonly segment: Segment;
     readonly smt: SmtProperty;
     readonly note?: string;
+    /** A liveness job's target transition. */
+    readonly transition?: string;
   }
   const jobs: Job[] = [];
   const { claimed, unclaimed } = boundClaims(compiled);
@@ -267,11 +302,19 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
   }
   if (families.includes('liveness')) {
     for (const target of livenessTargets(compiled)) {
-      jobs.push({ family: 'liveness', kind: 'witness', property: `live(${target.transition})`, segment: 'closed', smt: unreachable(target.inputs) });
+      jobs.push({ family: 'liveness', kind: 'witness', property: `live(${target.transition})`, segment: 'closed', smt: unreachable(target.inputs), transition: target.transition });
     }
   }
 
-  const results = await pool(jobs, width, (job) => query(job.segment, job.smt, 'plain'));
+  // A liveness claim on an untimed net is first looked for in executor runs of the same net, from the
+  // `closed` marking (`witness.ts`): a run that starts the attempt is its witness, on the `execution`
+  // route. A target no run reached goes to the verifier unchanged — only it can say the step is dead.
+  const witnessed =
+    families.includes('liveness') ? await executionWitnesses(compiled, segmentInitialMarking(compiled, 'closed'), livenessTargets(compiled)) : new Map<string, ClaimResult>();
+  const witnessOf = (job: Job): ClaimResult | undefined =>
+    job.family === 'liveness' && job.kind === 'witness' && segmentLabel(job.segment) === 'closed' ? witnessed.get(job.transition ?? '') : undefined;
+  const results = await pool(jobs, width, async (job): Promise<ClaimResult> =>
+    (job.kind === 'proof' ? structural(job.segment, job.smt) : witnessOf(job)) ?? query(job.segment, job.smt, 'plain'));
   jobs.forEach((job, i) => {
     const result = results[i]!;
     const holds = settles(job.kind, result);
@@ -341,12 +384,14 @@ export function describeClaim(claim: ClaimReport): string {
   const line = describeReport({ property: claim.property, segment: claim.segment, marking: claim.marking, result: claim.result });
   // A witness query asks whether the step is dead, so its `proven` is the failure: say so.
   const reading = claim.kind !== 'witness' ? ''
+    : claim.holds && claim.result.route === 'execution'
+      ? ` (witnessed by an executor run: ${claim.result.counterexampleTransitions.length} steps, each a start or a completion)`
     : claim.holds ? ` (witness: ${claim.result.counterexampleTransitions.length} firings)`
     : claim.result.verdict.type === 'proven' ? ' (the step is proven dead)'
     : claim.result.verdict.type === 'violated' ? ' (a run was found but not confirmed)'
     : ' (no witness found)';
   const atomic = claim.assumingAtomic === undefined ? ''
-    : ` [assuming atomic firing: ${claim.assumingAtomic.verdict.type} via ${claim.assumingAtomic.route} in ${claim.assumingAtomic.elapsedMs}ms]`;
+    : ` [assuming atomic firing: ${claim.assumingAtomic.verdict.type} via ${claim.assumingAtomic.route} in ${wholeMs(claim.assumingAtomic.elapsedMs)}ms]`;
   const note = claim.note === undefined ? '' : ` (${claim.note})`;
   return `${claim.holds ? 'holds' : 'FAILS'} ${claim.family}: ${line}${reading}${note}${atomic}`;
 }

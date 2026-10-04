@@ -27,8 +27,8 @@ import { z } from 'zod';
 import { compile } from '../../src/compiler/compile.js';
 import type { CompiledWorkflow } from '../../src/compiler/types.js';
 import { adaptExecutionGraph, init, type ExecutionGraph } from '../../src/mastra/index.js';
-import { verifyMastraWorkflow } from '../../src/mastra/verify.js';
-import { describeClaim, FAMILIES, type VerificationReport } from '../../src/verify/index.js';
+import { compileMastraWorkflow, verifyMastraWorkflow } from '../../src/mastra/verify.js';
+import { describeClaim, FAMILIES, segmentLabel, segmentsFor, type Segment, type VerificationReport } from '../../src/verify/index.js';
 import { ManualClock } from '../support/manual-clock.js';
 
 const N = z.object({ n: z.number() });
@@ -40,9 +40,9 @@ const compiledOf = (wf: Graph, k?: number): CompiledWorkflow =>
   compile(adaptExecutionGraph(wf.buildExecutionGraph() as ExecutionGraph, wf.retryConfig ? { retryConfig: wf.retryConfig } : {}), k === undefined ? {} : { concurrency: k });
 
 /** Every claim holds, by verdict: `proven` for a proof, a confirmed witness for liveness. */
-function expectHolds(report: VerificationReport): void {
-  expect(report.families).toEqual([...FAMILIES]);
-  for (const family of FAMILIES) expect(report.claims.some((c) => c.family === family), family).toBe(true);
+function expectHolds(report: VerificationReport, families: readonly string[] = FAMILIES): void {
+  expect(report.families).toEqual([...families]);
+  for (const family of families) expect(report.claims.some((c) => c.family === family), family).toBe(true);
   for (const c of report.claims) {
     const line = describeClaim(c);
     if (c.kind === 'proof') expect(c.result.verdict.type, line).toBe('proven');
@@ -243,27 +243,49 @@ function everything() {
     .commit();
 }
 
-const COMPOSITIONS: readonly { readonly name: string; readonly build: () => Graph; readonly rate?: { id: string; burst: number; perMs: number } }[] = [
+const COMPOSITIONS: readonly {
+  readonly name: string;
+  readonly build: () => Graph;
+  readonly rate?: { id: string; burst: number; perMs: number };
+  /**
+   * Proven one segment per test. Same claims, same 30 s a query; a 4-core CI runner took the
+   * whole workflow past the 60 s test cap on claim volume (2,256 claims, about 210 by smt, the
+   * slowest 3.5 s alone), not on any one proof. The pool and rate claims are the closed segment's.
+   */
+  readonly bySegment?: true;
+}[] = [
   { name: `rateLimit(${BURST}, ${PER_MS}) x 3 steps x ${PROVEN_CALLS} calls`, build: () => rateWorkflow(undefined, PROVEN_CALLS).workflow, rate: { id: 'api', burst: BURST, perMs: PER_MS } },
   { name: `limit(2) in .parallel(c=3) of ${PROVEN_ARMS}, k=4`, build: () => limitedWorkflow(3, 2, 4, PROVEN_ARMS).workflow },
   { name: `limit(3) in .parallel(c=2) of ${PROVEN_ARMS}, unbounded`, build: () => limitedWorkflow(2, 3, undefined, PROVEN_ARMS).workflow },
-  { name: 'limit + rateLimit + timeout in .parallel(c=2), k=2', build: everything, rate: { id: 'api', burst: 2, perMs: 500 } },
+  { name: 'limit + rateLimit + timeout in .parallel(c=2), k=2', build: everything, rate: { id: 'api', burst: 2, perMs: 500 }, bySegment: true },
 ];
 
 describe('verify() on each composition: every claim holds', () => {
-  for (const composition of COMPOSITIONS) {
-    it(composition.name, { timeout: 60_000 }, async () => {
+  const cases = COMPOSITIONS.flatMap((composition) =>
+    composition.bySegment
+      ? segmentsFor(compileMastraWorkflow(composition.build() as never)).map((segment) => ({ composition, segment }))
+      : [{ composition, segment: undefined as Segment | undefined }],
+  );
+  for (const { composition, segment } of cases) {
+    const name = segment === undefined ? composition.name : `${composition.name} @ ${segmentLabel(segment)}`;
+    it(name, { timeout: 60_000 }, async () => {
       const t0 = performance.now();
-      const verification = await verifyMastraWorkflow(composition.build() as never, { timeoutMs: TIMEOUT_MS });
+      const verification = await verifyMastraWorkflow(
+        composition.build() as never,
+        segment === undefined
+          ? { timeoutMs: TIMEOUT_MS }
+          : { timeoutMs: TIMEOUT_MS, segments: [segment], families: segment === 'closed' ? FAMILIES : FAMILIES.filter((f) => f !== 'liveness') },
+      );
       const ms = performance.now() - t0;
       const report = verification.workflow;
-      const line = timing(composition.name, report, ms);
+      const line = timing(name, report, ms);
       console.log(line);
       const log = process.env['PROOF_LOG'];
       if (log) appendFileSync(log, `${line}\n`);
       expect(Object.keys(verification.nested)).toEqual([]);
-      expectHolds(report);
+      expectHolds(report, segment === undefined || segment === 'closed' ? FAMILIES : FAMILIES.filter((f) => f !== 'liveness'));
       expect(verification.holds).toBe(true);
+      if (segment !== undefined && segment !== 'closed') return;
 
       const properties = new Set(report.claims.map((c) => c.property));
       for (const pool of compiledOf(composition.build()).pools) {

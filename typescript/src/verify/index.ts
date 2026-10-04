@@ -23,3 +23,7 @@ export { verify, describeClaim, provenOnlyAssumingAtomic, FAMILIES } from './wor
 export type { ClaimReport, Family, VerificationReport, WorkflowVerifyOptions } from './workflow.js';
 export { boundClaims, exclusions, livenessTargets, retryCeilingViolations } from './claims.js';
 export type { BoundClaim, Exclusion, LivenessTarget, UnclaimedPlace } from './claims.js';
+export { dischargeBySiphon, emptySiphon } from './siphon.js';
+export type { EmptySiphon } from './siphon.js';
+export { executionWitnesses, executionWitnessesApply, MAX_STARTS } from './witness.js';
+export type { ClaimResult, ClaimRoute } from './witness.js';

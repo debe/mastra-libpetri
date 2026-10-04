@@ -21,6 +21,7 @@ import {
 import { budgetStructureViolations } from './budget.js';
 import { poolSinks, poolStructureViolations } from './pools.js';
 import { initialCounts } from '../engine/kernel.js';
+import { dischargeBySiphon, emptySiphon, wholeMs } from './siphon.js';
 
 
 /**
@@ -303,6 +304,13 @@ function compareSiteKeys(a: string, b: string): number {
  * permits adds its quiescence claim to the set: `poolReturned(<pool>)` for slots and a `limit`,
  * `demandDrained(<demand>)` for a rate quota's bucket.
  *
+ * **A bound on a place no run can mark is proven from the arcs.** `neverCanceled` in a segment no
+ * cancel arrives in: `wf.cancel.request` and `wf.cancel` start empty and nothing marks them, so every
+ * sweep reading `wf.cancel` is dead and `wf.canceled` stays empty — an initially empty siphon
+ * (`siphon.ts`). Such a claim is `proven` on the `structural` route, its report naming the siphon,
+ * and no query is asked. Read arcs are what the solver's incidence matrix cannot see ([VER-015]),
+ * which is why the same claim otherwise went to IC3. Anything the siphon does not settle is asked.
+ *
  * Callers must assert `proven` explicitly. `isViolated()` is false for `unknown` too, so
  * `expect(isViolated()).toBe(false)` passes on a query that timed out and the test is vacuous
  * from then on.
@@ -364,6 +372,8 @@ export async function verifyWorkflow(
     const initial = segmentInitialMarking(compiled, segment);
     const marking = describeMarking(initial);
     const key = markingKey(initial);
+    // A bound on a place of this segment's own initially empty siphon is proven from the arcs (`siphon.ts`).
+    const siphon = emptySiphon(compiled.net, initial);
     for (const [property, prop] of completionProperties(compiled, segment)) {
       const id = `${key}|${property}`;
       const earlier = firstOf.get(id);
@@ -372,7 +382,10 @@ export async function verifyWorkflow(
         continue;
       }
       askIndex.set(id, asks.length);
-      asks.push(() => base(initial).property(prop).verify());
+      asks.push(() => {
+        const settled = dischargeBySiphon(compiled.net, initial, prop, siphon);
+        return settled !== undefined ? Promise.resolve(settled) : base(initial).property(prop).verify();
+      });
       firstOf.set(id, segment);
       planned.push({ property, segment, marking });
     }
@@ -425,13 +438,16 @@ export function completionProperties(compiled: CompiledWorkflow, segment: Segmen
 }
 
 /**
- * Formats a report for a CLI or a failed assertion: segment, property, verdict, route, the time,
- * why if unknown, and the initial marking — every part a claim has to name. For example
+ * Formats a report for a CLI or a failed assertion: segment, property, verdict, route, the time in
+ * whole milliseconds whatever the route, why if unknown, and the initial marking — every part a claim
+ * has to name. For example
  * `resume@1.0+cancel/exactlyOneTerminal: proven via … in 12ms from {s.1.fan.resume-0: 1, …}`.
  */
-export function describeReport(report: PropertyReport): string {
+export function describeReport(
+  report: Omit<PropertyReport, 'result'> & { readonly result: Pick<SmtVerificationResult, 'verdict' | 'elapsedMs'> & { readonly route: string } },
+): string {
   const { verdict, route, elapsedMs } = report.result;
   const detail = verdict.type === 'unknown' ? ` (${verdict.reason})` : '';
   const cited = report.sameProofAs === undefined ? '' : ` (the proof of ${segmentLabel(report.sameProofAs)}, same marking)`;
-  return `${segmentLabel(report.segment)}/${report.property}: ${verdict.type} via ${route} in ${elapsedMs}ms${detail} from ${report.marking}${cited}`;
+  return `${segmentLabel(report.segment)}/${report.property}: ${verdict.type} via ${route} in ${wholeMs(elapsedMs)}ms${detail} from ${report.marking}${cited}`;
 }

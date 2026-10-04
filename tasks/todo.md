@@ -491,11 +491,31 @@
       `layer2-ignorable`, `blueprints` composition, timeout end to end. Every test capped at 60 s and
       every query at a 30 s total budget (`totalBudget`), queries pooled per workflow, the widest
       corpus workflows proven segment by segment. Merged `4b5383d`
-- [ ] CI on `24518d8`: three failures were contention — proof files side by side on a 4-core runner,
-      each pooling z3, each passing alone (blueprints 45 s, resume-segments 36 s) — so `tests/verify`
-      is its own sharded `proofs` job, one file at a time. One is real: `parallel-wide` k=1
-      `closed/live(t.2.join.run)` `unknown` at 30 s alone (enumeration over the 50k-class cap, the
-      state equation out of budget); raised with libpetri-d0. ADRs 0011–0013 stay proposed until green
+- [x] CI on `24518d8`: three failures were contention — proof files side by side on a 4-core runner,
+      each pooling z3, each passing alone — so `tests/verify` is its own sharded `proofs` job, one
+      file at a time (`1e5e86f`). One was real: `parallel-wide` k=1 `closed/live(t.2.join.run)`
+      `unknown` at 30 s alone. libpetri-d0's diagnosis (TS 8 source): enumeration is breadth-first
+      and truncates at 50k classes while the witness is at the deepest level; read arcs are invisible
+      to the VER-015 incidence matrix, so `neverCanceled` on a timed net fell to the state equation.
+      Two local routes, each adversarially verified, until libpetri ships its own:
+      - **structural, by an initially empty siphon** (`src/verify/siphon.ts`): a `placeBound` or
+        `mutualExclusion` on a place no transition of the segment can ever mark is proven without the
+        solver — closed `neverCanceled` on the retrying parallel 4.6–11.8 s -> under 1 ms;
+      - **execution witnesses** (`src/verify/witness.ts`): on an untimed net, a liveness witness is an
+        executor run of the same net with stub actions, recorded as a VER-004 firing sequence (start,
+        then `complete:` with its branch) that replays against pre/post; otherwise the verifier.
+      `parallel-wide @ closed` k=1 and unbounded: 26 s for both. The `limit + rateLimit + timeout`
+      composition is proven segment by segment (claim volume, not a slow proof: 2,256 claims, 210 by
+      smt, slowest 3.5 s). libpetri 8.0.0 from npm, not linked
+- [ ] Parked for the maintainer: hold a `.parallel()` arm's run permit until its collect fires
+      (prototype at libpetri-d0's suggestion). `parallel-wide` closed at k=1 from 87,152 classes to
+      4,925; unbounded unchanged. Amends ADR 0006 ("returned in the same firing"), and needs the
+      budget/pool structure checks to accept declared holders and givers. `branch.ts` arms likely the
+      same. Not needed for the 60 s cap now
+- [ ] ADRs 0011–0013 to accepted with Evidence once CI is green
+- [ ] Track U asks from this round (libpetri-d0 has them): dead-transition pruning by empty siphons
+      in VER-015; a depth-first or bounded witness mode; an injective DOT `sanitize` (EXP-014, a
+      breaking export change, next majors)
 - [ ] Possible follow-up: verification in worker threads, grouped per net and marking, so a
       synchronous enumeration does not block the pool
 - [ ] Track U asks: an `AbortSignal` on `TransitionContext` fired by `Out.Timeout`; `Out.Timeout` on
