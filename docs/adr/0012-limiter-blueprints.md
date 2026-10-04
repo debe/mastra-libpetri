@@ -1,6 +1,6 @@
 # ADR 0012 — `limit` and `rateLimit` are blueprints over fused quota places, one quota per run
 
-Status: proposed (2026-10-04, M7)
+Status: accepted (2026-10-04, M7)
 
 ## Context
 
@@ -64,8 +64,18 @@ using step's local places are fused into.**
 
 ## Evidence
 
-Untested until M7 lands. Planned: `tests/compiler/quota.test.ts`, `tests/mastra/blueprints-surface.test.ts`,
-`tests/mastra/adapt-resources.test.ts`, `tests/verify/pools.test.ts`, `tests/verify/blueprints.test.ts`.
+Merged to `main` in `4b5383d` (M7); CI green on `f1c5506` (all jobs). libpetri 8.0.0
+from npm, not linked.
+
+- `tests/compiler/quota.test.ts` — fused canonical places, one refill per rate quota, `request-j`.
+- `tests/mastra/blueprints-surface.test.ts`, `tests/mastra/adapt-resources.test.ts` — the
+  `init()` factories, `uses` on every `createStep` overload, `cloneStep`, the refusals.
+- `tests/verify/pools.test.ts` — one conservation check for permits, slots, limits and buckets.
+- `tests/verify/blueprints.test.ts` — composition: three steps on one `rateLimit` finish at a
+  single bucket's instants under a ManualClock (tested, not proven); `limit` inside a block limit
+  peaks at min(c, n, k); every claim of each composition proven (the `limit + rateLimit + timeout`
+  composition segment by segment). Proven fixtures are smaller than the ADR's original 3 x 10:
+  one call per step, four arms (maintainer decision: fewer retries are fine).
 
 [ADR 0002]: 0002-three-layer-surface.md
 [ADR 0011]: 0011-block-concurrency.md

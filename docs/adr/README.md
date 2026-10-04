@@ -12,9 +12,9 @@
 | [0008](0008-step-events-observe-the-net.md) | Step events observe the net: a lifecycle hook at Mastra's emission points, and a tee for the debug UI | accepted |
 | [0009](0009-verification-claims.md) | Every compiled workflow carries four families of claims, derived, proven, and gated over the corpus | accepted |
 | [0010](0010-restart-from-marked-checkpoints.md) | Restart continues from the latest author-marked checkpoint, a proven boundary of the same net | accepted |
-| [0011](0011-block-concurrency.md) | A block's `concurrency` is a seeded pool of slots, admitted in arm order, proven | proposed |
-| [0012](0012-limiter-blueprints.md) | `limit` and `rateLimit` are blueprints over fused quota places, one quota per run | proposed |
-| [0013](0013-step-timeout.md) | A step timeout is a timed-out output branch, raced inside the attempt on the run's clock | proposed |
+| [0011](0011-block-concurrency.md) | A block's `concurrency` is a seeded pool of slots, admitted in arm order, proven | accepted |
+| [0012](0012-limiter-blueprints.md) | `limit` and `rateLimit` are blueprints over fused quota places, one quota per run | accepted |
+| [0013](0013-step-timeout.md) | A step timeout is a timed-out output branch, raced inside the attempt on the run's clock | accepted |
 | [0014](0014-race-and-quorum.md) | `race` and `quorum(k)` are a counted decision on a `.parallel()`, and every loser is aborted and waited for | proposed (draft) |
 
 Each ADR has Context / Decision / Consequences / Evidence; Evidence names the test that pins the

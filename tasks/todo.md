@@ -512,7 +512,7 @@
       4,925; unbounded unchanged. Amends ADR 0006 ("returned in the same firing"), and needs the
       budget/pool structure checks to accept declared holders and givers. `branch.ts` arms likely the
       same. Not needed for the 60 s cap now
-- [ ] ADRs 0011–0013 to accepted with Evidence once CI is green
+- [x] ADRs 0011–0013 accepted with Evidence; CI green on `f1c5506` (run 37231776725: `typescript`, 4 `proofs` shards, 8 `corpus` shards)
 - [ ] Track U asks from this round (libpetri-d0 has them): dead-transition pruning by empty siphons
       in VER-015; a depth-first or bounded witness mode; an injective DOT `sanitize` (EXP-014, a
       breaking export change, next majors)

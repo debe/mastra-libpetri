@@ -1,6 +1,6 @@
 # ADR 0011 — A block's `concurrency` is a seeded pool of slots, admitted in arm order, proven
 
-Status: proposed (2026-10-04, M7)
+Status: accepted (2026-10-04, M7)
 
 ## Context
 
@@ -67,10 +67,18 @@ seeded in every segment's initial marking. The bound is a proven P-invariant.**
 
 ## Evidence
 
-Untested until M7 lands. Planned: `tests/compiler/block-limit.test.ts`,
-`tests/mastra/adapt-concurrency.test.ts`, `tests/verify/pools.test.ts`,
-`tests/engine/layer2-ignorable.test.ts`, the block-limited fixtures in the differential and the
-corpus gate.
+Merged to `main` in `4b5383d` (M7); CI green on `f1c5506` (all jobs). libpetri 8.0.0
+from npm, not linked.
+
+- `tests/compiler/block-limit.test.ts` — the slot pool and FIFO admission on `.parallel()` and
+  `.branch()`, `re-admit-j` under resume.
+- `tests/mastra/adapt-concurrency.test.ts` — `metadata.concurrency` read off the block, refusals.
+- `tests/engine/layer2-ignorable.test.ts` — the Layer test: the same workflow on
+  `DefaultExecutionEngine` ignores the annotation and stays meaningful.
+- `tests/conformance/block-limit-differential.test.ts` — block-limited fixtures against Mastra.
+- `tests/verify/pools.test.ts` — `poolStructureViolations` on slots, each rule by a mutant; the
+  slot claims proven in the corpus gate and in `tests/verify/blueprints.test.ts`
+  (`limit(2) in .parallel(c=3)`: peak min(c, n, k)).
 
 [ADR 0006]: 0006-run-step-budget.md
 [ADR 0010]: 0010-restart-from-marked-checkpoints.md

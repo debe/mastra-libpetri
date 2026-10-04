@@ -1,6 +1,6 @@
 # ADR 0013 — A step timeout is a timed-out output branch, raced inside the attempt on the run's clock
 
-Status: proposed (2026-10-04, M7)
+Status: accepted (2026-10-04, M7)
 
 ## Context
 
@@ -65,9 +65,19 @@ until the step has actually returned or rejected, discards that result, and writ
 
 ## Evidence
 
-Untested until M7 lands. Planned: `tests/compiler/leaf-timeout.test.ts`,
-`tests/mastra/runner-timeout.test.ts`, `tests/engine/timeout-clock.test.ts`, the retry-ceiling
-mutants with funnels.
+Merged to `main` in `4b5383d` (M7); CI green on `f1c5506` (all jobs). libpetri 8.0.0
+from npm, not linked.
+
+- `tests/compiler/leaf-timeout.test.ts` — the `timedOut_j` branch and funnel, retried through the
+  `delayed` hop, final attempt to the failure exit; permits and quotas returned on every branch.
+- `tests/mastra/runner-timeout.test.ts` — the per-attempt signal, the gates on a late success
+  (no `stateUpdate`, scorers, suspend, bail or writer chunks), `StepTimeoutError`, a run abort before
+  expiry leaving the step's own outcome.
+- `tests/engine/timeout-clock.test.ts` — a ManualClock advance fires the deadline; nothing reads the
+  machine clock.
+- The retry-ceiling mutants with funnels in `tests/verify/pools.test.ts` ("timeout funnel mutants"); the timeout in
+  `tests/verify/blueprints.test.ts`'s composition.
+- Source guard: `deadline.signal` is the one allowed signal read (`tests/verify/source-guard.test.ts`).
 
 [ADR 0002]: 0002-three-layer-surface.md
 [ADR 0012]: 0012-limiter-blueprints.md
