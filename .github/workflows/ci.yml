@@ -16,7 +16,7 @@ permissions:
 jobs:
   typescript:
     runs-on: ubuntu-latest
-    # Everything but the corpus gate, which the `corpus` job shards.
+    # Everything but the proofs, which the `proofs` and `corpus` jobs shard.
     timeout-minutes: 30
     defaults:
       run:
@@ -36,8 +36,33 @@ jobs:
       # what a release consumer gets rather than whatever libpetri's main branch holds today.
       - run: npm ci
       - run: npm run check
-      - run: npm test -- --exclude tests/verify/corpus.test.ts
+      - run: npm test -- --exclude 'tests/verify/**'
       - run: npm run build
+
+  proofs:
+    # The proof files under tests/verify, one file at a time per runner: each already runs its z3
+    # queries in parallel, and two files side by side on a 4-core runner starved each other past
+    # the 30 s budget (M7, CI on 24518d8). Same claims and budgets as on a developer machine.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - uses: ./.github/actions/install-z3
+
+      - run: npm ci
+      - run: npx vitest run tests/verify --exclude tests/verify/corpus.test.ts --no-file-parallelism --shard=${{ matrix.shard }}/4
 
   corpus:
     # The corpus gate (ADR 0009): about 13 minutes of proofs on ten cores, far longer on one

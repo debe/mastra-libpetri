@@ -129,8 +129,13 @@
       name); a seeded arrival proves only runs the cancel reached, hence the pairing; the
       structural check stands in for a missing `neverEnabledWhile` property, which they passed on
       to the maintainer with enumeration for bounded environment places
-- [ ] Track A, remaining after that: dot export, and the `.branch` split threshold, now chosen
-      from the measured curve above
+- [x] Dot export: `toDot(compiled)` in `src/compiler/dot.ts`, over libpetri 8.0.0's
+      `libpetri/export` (`mapToGraph`, `renderDot`) with one cluster per entry path from the `NetMap`;
+      compiler entry only, never the Mastra-facing root. It refuses a net whose distinct names
+      `sanitize` merges into one DOT id (a block `0_b` at [1] and its arm `b` at [1,0]): `slug` keeps
+      `-` and `_`, `sanitize` maps both to `_`. Only the picture is refused, not the run; an injective
+      `sanitize` is a libpetri ask (Track U)
+- [ ] Track A, remaining: the `.branch` split threshold, chosen from the measured curve above
 - [ ] Open question carried out of the audit, cheap and worth answering before renaming
       anything: Mastra's `loop.predicate` and `conditional.predicates` are declarative,
       serialisable guards present whenever the `.branch({predicate})` / `.dowhile({predicate})`
@@ -143,7 +148,11 @@
       as one token per named place ([IO-016]). That multiplicity is specified (U8); closing the
       limit means expressing the allowance in topology. No property establishes termination
       (see above)
-- [ ] Track A: assert the instantiate -> fuse -> re-instantiate round-trip. Depth is
+- [x] Track A: assert the instantiate -> fuse -> re-instantiate round-trip
+      (`tests/compiler/fuse-roundtrip.test.ts`): a compiled child bound by identity-named ports, its
+      cancel fused with the parent's, re-instantiated; every place once under its final name, every
+      alias resolving, no token lost on the executor, a cancel reaching the child through the fusion.
+      Reapplying the [MOD-031] defect (`dropIdentityEntries`) fails it. Was: Depth is
       unconstrained now that [MOD-031] is fixed, but it is the shape nested workflows take and
       a regression there is silent token loss rather than a build error
 - [x] Track C, the half that grounds everything else: `scripts/bootstrap-mastra.sh` +
@@ -300,7 +309,8 @@
       instead of waiting forever under Mastra's signal (rows 66, 68)
 - [x] W6 runner — resume data, suspend data, the nested-workflow overlay, labels, a foreach item's
       prior record (non-success siblings from the segment never read, row 87), and host
-      preconditions rejecting the resume as on the default engine (`HostPreconditionError`, row 84)
+      preconditions rejecting the resume as on the default engine (`HostPreconditionError`, row 84;
+      inside a `.parallel()` arm and a `.dountil()` body too, `tests/mastra/host-precondition.test.ts`)
 - [x] W7 engine and snapshot — `decodeResume`, refusals before the first persist (Run's claim
       released), the `#lastPersisted` guard, the resume-start row, `suspendedPaths` from every
       suspension, tracing ids and `tracingContext: undefined` as Mastra writes it (row 63)
@@ -322,9 +332,10 @@
       fresh-run differential 206/206
 - [ ] Open after M4, none blocking: row 84's key residual (`tripwire: undefined`,
       `suspendPayload: {}` on a foreach thrown-result entry); row 86 (a rebuilt foreach entry — needs
-      the item's full record on its tokens, a `stepRecord?` on the exit tokens); `StrandedRunError`
-      naming the failed transition; `HostPreconditionError` from a `.parallel()` arm or loop body,
-      untested; surviving mutants P6, P8, P13, P14; partial resume@ verdict maps in the budget, loop
+      the item's full record on its tokens, a `stepRecord?` on the exit tokens); a real Mastra run
+      reaching `StrandedRunError` with a failed firing (the error names the transition since M7b
+      prep, pinned on a replayed report: a checkpoint failure is thrown as the storage error first);
+      surviving mutants P6, P8, P13, P14; partial resume@ verdict maps in the budget, loop
       and foreach mutant tests; exact key lists in leaf-resume and anchored refusal messages in
       parallel-/branch-resume; ManualClock stamps for pending tokens; `foreachOutput.*` clock stamps
       in `EXCLUDED_PATHS`; the e2e falsy-resume loop for `''` and omitted data
@@ -476,15 +487,25 @@
       arcs, timeout branch and funnel, `armDeadline` (B), adapter refusals (C), fused canonical quota
       places and one refill per rate quota (D), one pool conservation check and pool claims (E), the
       petri `createStep` surface, `limit`/`rateLimit`, the per-attempt gate in the runner (F)
-- [ ] W2 integration — limited fixtures in the differential and corpus, `layer2-ignorable`,
-      `blueprints` composition, timeout end to end
+- [x] W2 integration (`85324cc`, `f819f64`) — limited fixtures in the differential and corpus,
+      `layer2-ignorable`, `blueprints` composition, timeout end to end. Every test capped at 60 s and
+      every query at a 30 s total budget (`totalBudget`), queries pooled per workflow, the widest
+      corpus workflows proven segment by segment. Merged `4b5383d`
+- [ ] CI on `24518d8`: three failures were contention — proof files side by side on a 4-core runner,
+      each pooling z3, each passing alone (blueprints 45 s, resume-segments 36 s) — so `tests/verify`
+      is its own sharded `proofs` job, one file at a time. One is real: `parallel-wide` k=1
+      `closed/live(t.2.join.run)` `unknown` at 30 s alone (enumeration over the 50k-class cap, the
+      state equation out of budget); raised with libpetri-d0. ADRs 0011–0013 stay proposed until green
+- [ ] Possible follow-up: verification in worker threads, grouped per net and marking, so a
+      synchronous enumeration does not block the pool
 - [ ] Track U asks: an `AbortSignal` on `TransitionContext` fired by `Out.Timeout`; `Out.Timeout` on
       the TIME-015 clock; a settle-before-deposit timeout. Each would let ADR 0013 use `Out.Timeout`
 
 ## M7b — Blueprints (Layer 3 — new capability)
 - [ ] The `PetriEngineType` phantom brand gates the extended builder, so reaching for a
       blueprint is a typed, visible decision and never a silent incompatibility
-- [ ] First wave: `race()`, `quorum(k, n)` (`limit` and `rateLimit` shipped in M7)
+- [ ] First wave: `race()`, `quorum(k, n)` (`limit` and `rateLimit` shipped in M7). Design drafted
+      in [ADR 0014] (proposed): two designs judged, one synthesised, twelve maintainer questions open
 - [ ] Second wave: `pipeline()` — the one the IR structurally cannot express, since
       join-before-next-index is its defining property — plus `supersede()`, `compensate()`,
       `circuitBreaker()`, `queue(depth)`, `correlate(key)`
@@ -647,7 +668,8 @@ bump not yet run):
       900 s from 2 lanes). Gadget suites: verify/foreach 38 tests in 75 s, verify/foreach-resume 15 in
       5 s. Behaviour unchanged: every engine and Mastra-level test green; the window between an
       outcome and its settle is closed by priority at run time, as before by inhibitors
-- [ ] `tests/mastra/events.test.ts` "concurrency 3 … progress per item": the differential's oracle
+- [x] Widened to 20 / 30 / 100 / 150 ms (every gap at least 30 ms, the designed order kept, no retry).
+      Was: `tests/mastra/events.test.ts` "concurrency 3 … progress per item": the differential's oracle
       (Mastra's own engine) settled items out of the delays' designed order once under load ~20+
       (2026-10-03), ours in it; 3/3 green at normal load. The 3 ms / 10 ms / 13 ms / 25 ms spacing
       is too tight for a loaded machine — widen it rather than retry

@@ -73,3 +73,5 @@ export { resumeSeed, UnresumablePositionError } from './resume.js';
 export { HostPreconditionError } from './gadgets/leaf.js';
 export type { ResumeRequest, ResumeSeed } from './resume.js';
 export { foreachSeed } from './resume-foreach.js';
+export { toDot } from './dot.js';
+export type { DotOptions } from './dot.js';

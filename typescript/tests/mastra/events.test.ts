@@ -308,10 +308,12 @@ const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * Doubles an item after a delay chosen so the items settle in one order, with no ties, at
- * concurrency 1 and 3 alike: at 3, item 3 at 10 ms, item 4 (started then) at 13, item 2 at 25,
- * item 1 at 40.
+ * concurrency 1 and 3 alike: at 3, item 3 at 20 ms, item 4 (started then) at 50, item 2 at 100,
+ * item 1 at 150. Every gap is at least 30 ms: at 3 / 10 / 13 / 25 ms Mastra's own engine, the
+ * oracle, once settled items out of this order on a machine at load ~20, so the spacing is widened
+ * rather than the test retried.
  */
-const DELAYS: Record<number, number> = { 1: 40, 2: 25, 3: 10, 4: 3 };
+const DELAYS: Record<number, number> = { 1: 150, 2: 100, 3: 20, 4: 30 };
 const doubler = (id: string, fail?: number) =>
   createStep({
     id,

@@ -10,7 +10,7 @@ import { HostPreconditionError } from '../compiler/gadgets/leaf.js';
 import { resumeSeed, UnresumablePositionError, type ResumeSeed } from '../compiler/resume.js';
 import { restartSeed, UnrestartablePositionError, type RestartSeed } from '../compiler/restart.js';
 import type { CheckpointEvent, CompiledWorkflow, StepRecord, WorkflowDescription } from '../compiler/types.js';
-import { runWorkflowDetailed, type RunReport } from '../engine/kernel.js';
+import { runWorkflowDetailed, type RunReport, type TransitionFailure } from '../engine/kernel.js';
 import { adaptExecutionGraph } from './adapt.js';
 import { StepEvents } from './events.js';
 import { suspendTracingContext } from './host.js';
@@ -133,10 +133,16 @@ export class UnsupportedRunModeError extends Error {
 
 /**
  * Thrown by `execute()` when the net comes to rest with no terminal marked — a model defect the
- * proven `exactlyOneTerminal` rules out. The run **rejects**: its span is errored, no lifecycle
- * callback fires and nothing more is persisted, so storage keeps the `running` snapshot written at
- * start — what the default engine leaves behind when its own `execute()` throws. Writing `failed`
- * instead would report a Mastra outcome for a run no Mastra outcome describes.
+ * proven `exactlyOneTerminal` rules out — or when a firing failed and the kernel ended the run at
+ * once. The run **rejects**: its span is errored, no lifecycle callback fires and nothing more is
+ * persisted, so storage keeps the `running` snapshot written at start — what the default engine
+ * leaves behind when its own `execute()` throws. Writing `failed` instead would report a Mastra
+ * outcome for a run no Mastra outcome describes.
+ *
+ * A failed firing is named: `failure` carries the transition and its error, from libpetri's
+ * `transition-failed` event ([EXEC-003]) — an action's own throw, or an `OutViolationError` when it
+ * emitted outside its `Out` spec ([IO-015]). Without it a stranded run lists only where tokens
+ * rest, which says what was left and not what went wrong.
  */
 export class StrandedRunError extends Error {
   override readonly name = 'StrandedRunError';
@@ -144,15 +150,21 @@ export class StrandedRunError extends Error {
   readonly runId: string;
   /** The places still holding a token, as the kernel names them. */
   readonly places: readonly string[];
+  /** The firing that failed and stranded the run; absent when the net simply came to rest. */
+  readonly failure?: TransitionFailure;
 
-  constructor(workflowId: string, runId: string, places: readonly string[]) {
+  constructor(workflowId: string, runId: string, places: readonly string[], failure?: TransitionFailure) {
     super(
       `PetriExecutionEngine: run '${runId}' of workflow '${workflowId}' came to rest with no outcome; ` +
+        (failure === undefined
+          ? ''
+          : `the firing of transition '${failure.transition}' failed (${failure.exceptionType}: ${failure.message}); `) +
         `tokens remain in ${places.join(', ') || '(no place)'}`,
     );
     this.workflowId = workflowId;
     this.runId = runId;
     this.places = places;
+    if (failure !== undefined) this.failure = failure;
   }
 }
 
@@ -441,7 +453,7 @@ export class PetriExecutionEngine extends ExecutionEngine implements SpanLifecyc
 
     const report: RunReport = { ...netReport, stepResults: hostFields(netReport.stepResults) };
     const outcome = report.outcome;
-    if (outcome.status === 'stranded') throw new StrandedRunError(workflowId, runId, outcome.places);
+    if (outcome.status === 'stranded') throw new StrandedRunError(workflowId, runId, outcome.places, outcome.failure);
     if (outcome.status === 'failed' && outcome.error instanceof HostPreconditionError) {
       // The host refused a step before it ran (row 84): the default engine's resume rejects there,
       // with the error itself — a `TypeError` from `handlers/step.ts:160` as it is — and writes no
