@@ -11,7 +11,7 @@
  * `@mastra/core` is a peer dependency imported only under `src/mastra/` (ADR 0005); the
  * `compiler`, `verify`, `codec` and `conformance` subpaths never load it.
  */
-export { init, PETRI_ENGINE_TYPE, PetriExecutionEngine, UnsupportedRunModeError } from './mastra/index.js';
+export { init, PETRI_ENGINE_TYPE, PetriExecutionEngine, Quota, StepTimeoutError, UnsupportedRunModeError } from './mastra/index.js';
 export type {
   PetriCloneStep,
   PetriCreateStep,
@@ -20,8 +20,12 @@ export type {
   PetriEngineType,
   PetriFactories,
   PetriInitOptions,
+  PetriLimit,
+  PetriRateLimit,
   PetriStep,
+  PetriStepResources,
   PetriWorkflow,
+  QuotaOptions,
   UnsupportedRunMode,
 } from './mastra/index.js';
 export { restartActiveRuns } from './mastra/index.js';

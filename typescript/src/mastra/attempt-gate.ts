@@ -41,8 +41,75 @@ export function attemptGate(
   call: Pick<StepCall, 'path' | 'foreachIndex' | 'attempt' | 'abortSignal' | 'deadline'>,
   run: AbortController,
 ): AttemptGate {
-  void stepId;
-  void call;
-  void run;
-  throw new Error('attemptGate: not implemented (M7 W1 F)');
+  const identity: AttemptIdentity = {
+    stepId,
+    path: call.path,
+    ...(call.foreachIndex === undefined ? {} : { foreachIndex: call.foreachIndex }),
+    attempt: call.attempt,
+  };
+  const deadline = call.deadline;
+  if (deadline === undefined) {
+    // Transparent: the run's own controller, exactly what the runner handed the executor before M7.
+    return { identity, controller: run, expired: () => false, writer: (stream) => stream, release: () => {} };
+  }
+
+  // One signal the step sees, aborted by whichever source fires first, with that source's reason.
+  const attempt = new AbortController();
+  const sources = [...new Set([call.abortSignal, run.signal, deadline])];
+  const unlink: (() => void)[] = [];
+  for (const source of sources) {
+    if (source.aborted) {
+      attempt.abort(source.reason);
+      break;
+    }
+    const onAbort = (): void => attempt.abort(source.reason);
+    source.addEventListener('abort', onAbort, { once: true });
+    unlink.push(() => source.removeEventListener('abort', onAbort));
+  }
+  const release = (): void => {
+    for (const u of unlink.splice(0)) u();
+  };
+  if (attempt.signal.aborted) release();
+
+  // What `StepExecutor` reads of its `abortController` is `signal` and `abort()` only
+  // (`evented/step-executor.ts:89-90, 248-253`): the step sees the attempt's signal, and its own
+  // `abort()` cancels the run, as on the default engine (`handlers/step.ts:420-450`).
+  const controller = {
+    get signal(): AbortSignal {
+      return attempt.signal;
+    },
+    abort(reason?: unknown): void {
+      run.abort(reason);
+    },
+  } as AbortController;
+
+  const expired = (): boolean => deadline.aborted;
+  return { identity, controller, expired, writer: (stream) => gated(stream, expired), release };
+}
+
+/**
+ * `target` with every write dropped once `expired()` holds: a function (an `OutputWriter`) is not
+ * called; an object (a `ToolStream`) has `write`, `custom` and the writers `getWriter()` returns
+ * gated. Every other member is the target's own, bound to it — a `WritableStream` keeps internal
+ * slots a proxy receiver would fail the brand check on.
+ */
+function gated<W extends object>(target: W, expired: () => boolean): W {
+  return new Proxy(target, {
+    apply(fn, self, args) {
+      if (expired()) return Promise.resolve();
+      return Reflect.apply(fn as (...a: unknown[]) => unknown, self, args);
+    },
+    get(object, key) {
+      const value: unknown = Reflect.get(object, key, object);
+      if (typeof value !== 'function') return value;
+      const bound = (value as (...a: unknown[]) => unknown).bind(object);
+      if (key === 'write' || key === 'custom') {
+        return (...args: unknown[]) => (expired() ? Promise.resolve() : bound(...args));
+      }
+      if (key === 'getWriter') {
+        return (...args: unknown[]) => gated(bound(...args) as object, expired);
+      }
+      return bound;
+    },
+  });
 }

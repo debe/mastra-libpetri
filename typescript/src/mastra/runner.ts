@@ -29,6 +29,7 @@ import type { RunnerResume } from './resume-codec.js';
 import { runScorersForStep, type RunScorersParams } from './scorers.js';
 import type { StepSpans } from './spans.js';
 import { toMastraStepResult } from './step-result.js';
+import { attemptGate, type AttemptGate } from './attempt-gate.js';
 
 /** `validateStepInput`'s result: the input every attempt uses, and the error that fails them all. */
 interface ValidatedInput {
@@ -289,6 +290,29 @@ export class MastraStepRunner implements StepRunner {
       throw new HostPreconditionError(stepId, call.path, error);
     }
     const restart = this.#restartFeed(step.id, call, nested);
+    // The attempt's gate ([ADR 0013]): transparent without a deadline. Released once the step settles.
+    const gate = attemptGate(stepId, call, this.#o.abortController);
+    try {
+      return await this.#attempt(stepId, input, call, entry, step, nested, nestedRunId, feed, restart, gate);
+    } finally {
+      gate.release();
+    }
+  }
+
+  /** One attempt of {@link run}, behind its gate. */
+  async #attempt(
+    stepId: string,
+    input: unknown,
+    call: StepCall,
+    entry: SingleStepEntry,
+    step: MastraStep,
+    nested: boolean,
+    nestedRunId: string | undefined,
+    feed: ResumeFeed,
+    restart: boolean,
+    gate: AttemptGate,
+  ): Promise<StepOutcome> {
+    const foreachIndex = call.foreachIndex;
 
     // Mastra's `stepCallId` (`handlers/step.ts:106`): one per step call, every retry sharing it — the
     // start event's, the result's and the writer's.
@@ -307,10 +331,11 @@ export class MastraStepRunner implements StepRunner {
       // Observation only: whatever building or publishing the start throws is kept, and the step runs.
       await this.#publishStart(stepId, inputData, call, feed, stepCallId).catch((error: unknown) => this.#o.events?.keep(error));
     }
-    const writer = new ToolStream(
-      { prefix: 'workflow-step', callId: stepCallId, name: step.id, runId: this.#o.runId },
-      this.#o.outputWriter,
-    );
+    // Gated per attempt ([ADR 0013]): once the deadline has fired, every chunk is dropped — through
+    // the step's writer and through the output writer the step is handed. Without a deadline both are
+    // the very objects of before.
+    const outputWriter = this.#o.outputWriter === undefined ? undefined : gate.writer(this.#o.outputWriter);
+    const writer = gate.writer(new ToolStream({ prefix: 'workflow-step', callId: stepCallId, name: step.id, runId: this.#o.runId }, outputWriter));
 
     let stateUpdate: Record<string, unknown> | undefined;
     // The last `suspend` call's validated data: Mastra keeps the last (`handlers/step.ts:414`).
@@ -359,6 +384,8 @@ export class MastraStepRunner implements StepRunner {
               validateInputs: this.#o.validateInputs,
             });
             if (suspendError) throw suspendError;
+            // After the deadline a suspend is ignored: no label reaches the run ([ADR 0013]).
+            if (gate.expired()) return;
             for (const label of labelsOf(options)) this.#resumeLabels[label] = { stepId: step.id, foreachIndex };
             suspension = { data: suspendData };
             // Marks the attempt suspended; its stamped copy of the data is replaced below.
@@ -368,7 +395,7 @@ export class MastraStepRunner implements StepRunner {
           // The default engine's writer and output writer (`handlers/step.ts:445-454`), not the
           // executor's, which publishes every chunk to the run's topic whether or not anyone streams.
           writer,
-          outputWriter: this.#o.outputWriter,
+          outputWriter,
           ...(this.#o.resourceId === undefined ? {} : { resourceId: this.#o.resourceId }),
           validateInputs: this.#o.validateInputs,
           setState: async (next: unknown): Promise<void> => {
@@ -378,6 +405,7 @@ export class MastraStepRunner implements StepRunner {
               validateInputs: this.#o.validateInputs,
             });
             if (stateError) throw stateError;
+            if (gate.expired()) return;
             stateUpdate = stateData as Record<string, unknown> | undefined;
           },
         } as unknown as Parameters<MastraStep['execute']>[0]) as Promise<unknown>;
@@ -387,6 +415,11 @@ export class MastraStepRunner implements StepRunner {
       },
     });
 
+    // A deadline that fired before the step began ([ADR 0013]): the step is not started at all — it
+    // would only see an aborted signal — and the leaf discards this outcome for its timeout.
+    if (gate.expired()) {
+      return toOutcome({ status: 'failed', error: gate.controller.signal.reason, payload: inputData });
+    }
     const result = (await this.#o.executor.execute({
       workflowId: this.#o.workflowId,
       runId: this.#o.runId,
@@ -399,11 +432,18 @@ export class MastraStepRunner implements StepRunner {
       requestContext: this.#o.requestContext,
       retryCount: call.attempt,
       validateInputs: this.#o.validateInputs,
-      abortController: this.#o.abortController,
+      // The attempt's controller ([ADR 0013]): without a deadline, the run's own.
+      abortController: gate.controller,
       ...(foreachIndex === undefined ? {} : { foreachIdx: foreachIndex }),
     })) as HostResult;
 
     const { __state: _s, __stateDelta: _d, ...raw } = result as Record<string, unknown>;
+    // Once the deadline has fired the attempt has no effect ([ADR 0013]): no state, no item
+    // bookkeeping, no scorers, no suspension check. The leaf discards the outcome and records the
+    // timeout itself.
+    if (gate.expired()) {
+      return toOutcome({ ...raw, payload: inputData });
+    }
     // Applied once the step has run without failing, suspended and bailed included, as the
     // default engine applies `contextMutations.stateUpdate` whenever the attempt returned.
     if (raw['status'] !== 'failed' && stateUpdate !== undefined) Object.assign(this.#state, stateUpdate);

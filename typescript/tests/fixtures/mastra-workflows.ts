@@ -897,7 +897,9 @@ export const FIXTURES: readonly MastraFixture[] = [
     // `success []` and publishes its -result and -finish; the abort still reaches the petri run
     // before its terminal, so the run is `canceled` on both engines and row 52 (the run succeeding)
     // does not apply at the time of writing. A microtask-depth fixture: which side of the window
-    // each engine lands on is not by construction.
+    // each engine lands on is not by construction. Since M7's attempt gate and timeout race the
+    // petri side lands in the window too when the whole differential file runs (canceled [], as
+    // Mastra), and outside it when this fixture runs alone — so the attribution is `racy`.
     build: (cfg, rec) =>
       wf('foreach-empty-cancel-inside', cfg)
         .then(emptyItems(rec, () => afterMicrotasks(INSIDE_EMPTY_FOREACH, () => void rec.cancel())))
@@ -907,6 +909,7 @@ export const FIXTURES: readonly MastraFixture[] = [
       {
         row: 49,
         paths: ['result.steps.item.status', 'events.item.length'],
+        racy: true,
         reason:
           "a cancel inside an empty foreach: Mastra's final abort check records canceled [] (handlers/control-flow.ts:1291-1306) and publishes nothing after the foreach's -start (the -result/-finish at :1331-1351 are past that return); the petri foreach completes with no await to land in, so success [] with its -result and -finish",
       },

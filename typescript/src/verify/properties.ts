@@ -17,6 +17,7 @@ import {
   suspensionCoverageViolations,
 } from './structure.js';
 import { budgetStructureViolations } from './budget.js';
+import { poolSinks, poolStructureViolations } from './pools.js';
 import { initialCounts } from '../engine/kernel.js';
 
 /**
@@ -283,7 +284,11 @@ function compareSiteKeys(a: string, b: string): number {
  * one's — `restart@0` is `closed`, `restart@0+cancel` is `cancel`, and `restart@p` is `resume@p` at a
  * top-level step or loop, whose site is its own input place — the query is asked once and its
  * report is repeated under the later label with `sameProofAs` naming the segment that asked it.
- * The `checkpoint structure` check runs with the others.
+ * The `checkpoint structure` check runs with the others, and so does `pool structure`
+ * (`poolStructureViolations`, [ADR 0012]): every pool — permits, a block's slots, a quota — conserved
+ * on the arcs. Every pool place is a sink, as the permits always were, and each pool other than the
+ * permits adds its quiescence claim to the set: `poolReturned(<pool>)` for slots and a `limit`,
+ * `demandDrained(<demand>)` for a rate quota's bucket.
  *
  * Callers must assert `proven` explicitly. `isViolated()` is false for `unknown` too, so
  * `expect(isViolated()).toBe(false)` passes on a query that timed out and the test is vacuous
@@ -301,6 +306,7 @@ export async function verifyWorkflow(
     const checks: readonly (readonly [string, (c: CompiledWorkflow) => readonly string[]])[] = [
       ['cancellation structure', cancelStructureViolations],
       ['step budget structure', budgetStructureViolations],
+      ['pool structure', poolStructureViolations],
       ['resume gate structure', resumeGateViolations],
       ['suspension coverage', suspensionCoverageViolations],
       ['resume timing structure', resumeTimingViolations],
@@ -323,7 +329,9 @@ export async function verifyWorkflow(
       // The cancel place is a sink: once marked it stays. That blinds `terminatesAtSink` to a
       // stranded run in the cancel segment — a marked cancel place satisfies it — which is one
       // more reason `exactlyOneTerminal` is in the set.
-      .sinkPlaces(...terminals, compiled.cancel, ...(compiled.budget ? [compiled.budget.permits] : []))
+      // Every pool place too ([ADR 0012]) — the permits as before, each block's slots, each quota and,
+      // for a bucket, its `spent`, where the tokens rest once demand is gone ([TIME-011]).
+      .sinkPlaces(...terminals, compiled.cancel, ...poolSinks(compiled))
       // P-invariants are what make these queries converge; without them a chain of xor
       // branches is where a proof stops landing.
       .semiflowInvariants(true)
@@ -372,6 +380,15 @@ export function completionProperties(compiled: CompiledWorkflow, segment: Segmen
   if (compiled.budget) {
     out.push(['permitsBounded', placeBound(compiled.budget.permits, compiled.budget.k)]);
     out.push(['permitsReturned', quiescentCount([compiled.budget.permits], compiled.budget.k, compiled.budget.k)]);
+  }
+  // Every other pool ([ADR 0011], [ADR 0012]): all its tokens back when the run comes to rest — a
+  // block's slots and a `limit`'s quota in the pool place; a bucket's split between the bucket and
+  // `spent` by design, so what must be empty is its demand, which is what keeps the refill alive.
+  // The permits keep their own names above. Their bounds are in the bounds family (`boundClaims`).
+  for (const pool of compiled.pools) {
+    if (pool.kind === 'permits') continue;
+    if (pool.kind === 'bucket') out.push([`demandDrained(${pool.demand.name})`, quiescentCount([pool.demand], 0, 0)]);
+    else out.push([`poolReturned(${pool.place.name})`, quiescentCount([pool.place], pool.seed, pool.seed)]);
   }
   return out;
 }

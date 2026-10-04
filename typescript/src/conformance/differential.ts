@@ -120,6 +120,12 @@ export interface Attribution {
   readonly paths: readonly string[];
   readonly reason: string;
   readonly routes?: readonly ResumeRouteLabel[];
+  /**
+   * The difference hangs on a race the fixture cannot pin — a microtask-depth window, say — so it
+   * may or may not appear. A difference that does appear must still match it; an unused one is not
+   * reported. Only for a fixture whose own comment documents the race.
+   */
+  readonly racy?: true;
 }
 
 /**
@@ -731,7 +737,7 @@ export function settle(
       : differences.every((d) => d.row !== undefined)
         ? 'divergent'
         : 'fail';
-  return { differences, unused: attributions.filter((at) => applies(at) && !used.has(at)), verdict };
+  return { differences, unused: attributions.filter((at) => applies(at) && !used.has(at) && at.racy !== true), verdict };
 }
 
 /** The events of one side, or `[]` when it observed none — compared only when either side observed some. */

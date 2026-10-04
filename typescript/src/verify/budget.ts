@@ -79,7 +79,7 @@ function takesOne(spec: In): boolean {
   return spec.type === 'one' || (spec.type === 'exactly' && spec.count === 1);
 }
 
-function describeIn(spec: In): string {
+export function describeIn(spec: In): string {
   switch (spec.type) {
     case 'one': return 'one()';
     case 'exactly': return `exactly(${spec.count})`;
@@ -94,7 +94,7 @@ function describeIn(spec: In): string {
  * its child's branches (as libpetri's own enumeration does). Unlike `enumerateBranches`, a place
  * named twice in one branch counts twice — the difference this check exists for.
  */
-function branchesOf(out: Out): ReadonlyMap<string, number>[] {
+export function branchesOf(out: Out): ReadonlyMap<string, number>[] {
   switch (out.type) {
     case 'place':
       return [new Map([[out.place.name, 1]])];
@@ -122,7 +122,7 @@ function branchesOf(out: Out): ReadonlyMap<string, number>[] {
   }
 }
 
-function describeBranch(branch: ReadonlyMap<string, number>): string {
+export function describeBranch(branch: ReadonlyMap<string, number>): string {
   return [...branch].map(([name, n]) => (n === 1 ? name : `${name}×${n}`)).join(' + ') || 'nothing';
 }
 

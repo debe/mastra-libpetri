@@ -27,6 +27,7 @@ export type {
   PetriWorkflow,
 } from './init.js';
 export { Quota } from './resources.js';
+export { StepTimeoutError } from '../compiler/timeout.js';
 export type { QuotaOptions } from './resources.js';
 export { PetriExecutionEngine, UnsupportedRunModeError } from './engine.js';
 export type { PetriEngineOptions, RestartRefusalReason, UnsupportedRunMode } from './engine.js';

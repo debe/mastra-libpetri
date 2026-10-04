@@ -1,3 +1,4 @@
+import { MAX_CONCURRENCY, MAX_WAIT_MS, QUOTA_ID_PATTERN } from '../compiler/index.js';
 import type { QuotaRef } from '../compiler/types.js';
 
 /**
@@ -64,9 +65,9 @@ export interface QuotaOptions {
  * to settle. Refused (`quota-value`): `n` not a whole number in [1, `MAX_CONCURRENCY`], or a bad id.
  */
 export function limit(n: number, options: QuotaOptions): Quota {
-  void n;
-  void options;
-  throw new Error('limit: not implemented (M7 W1 F)');
+  const id = quotaId('limit', options);
+  wholeIn('limit', id, 'n', n, MAX_CONCURRENCY);
+  return new Quota(minted, { id, kind: 'limit', n });
 }
 
 /**
@@ -76,10 +77,26 @@ export function limit(n: number, options: QuotaOptions): Quota {
  * number in [1, `MAX_WAIT_MS`], or a bad id.
  */
 export function rateLimit(burst: number, perMs: number, options: QuotaOptions): Quota {
-  void burst;
-  void perMs;
-  void options;
-  throw new Error('rateLimit: not implemented (M7 W1 F)');
+  const id = quotaId('rateLimit', options);
+  wholeIn('rateLimit', id, 'burst', burst, MAX_CONCURRENCY);
+  wholeIn('rateLimit', id, 'perMs', perMs, MAX_WAIT_MS);
+  return new Quota(minted, { id, kind: 'rate', burst, perMs });
+}
+
+/** The quota's id, refused (`quota-value`) unless it is a string matching `QUOTA_ID_PATTERN`. */
+function quotaId(factory: string, options: QuotaOptions | undefined): string {
+  const id: unknown = options?.id;
+  if (typeof id !== 'string' || !QUOTA_ID_PATTERN.test(id)) {
+    throw new RangeError(`${factory}: quota-value: the id must match [A-Za-z0-9_-]+, got ${JSON.stringify(id)}`);
+  }
+  return id;
+}
+
+/** Refuses (`quota-value`) anything but a whole number in [1, `max`]. */
+function wholeIn(factory: string, id: string, name: string, value: unknown, max: number): void {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > max) {
+    throw new RangeError(`${factory}('${id}'): quota-value: ${name} must be a whole number in [1, ${max}], got ${String(value)}`);
+  }
 }
 
 /**
@@ -88,17 +105,29 @@ export function rateLimit(burst: number, perMs: number, options: QuotaOptions): 
  * a scorer's view) does not copy it by accident; the petri `cloneStep` copies it on purpose.
  */
 export function attachResources(target: object, resources: StepResources): void {
-  void target;
-  void resources;
-  throw new Error('attachResources: not implemented (M7 W1 F)');
+  const frozen: StepResources = Object.freeze({
+    ...(resources.quotas === undefined ? {} : { quotas: Object.freeze([...resources.quotas]) }),
+    ...(resources.timeoutMs === undefined ? {} : { timeoutMs: resources.timeoutMs }),
+  });
+  Object.defineProperty(target, STEP_RESOURCES, { value: frozen, enumerable: false, configurable: true, writable: false });
 }
 
 /**
  * The resources attached to a step-flow step, looked up on the step itself and then on its
  * `__agentOptions` / `__toolOptions`; `undefined` when none — every step built by Mastra's own
- * factories, and every petri step declared without `uses` or `timeout`.
+ * factories, and every petri step declared without `uses` or `timeout`. The object passed may also
+ * be the options object itself, as a declarative `{ type: 'agent' | 'tool', options }` entry holds it.
  */
 export function resourcesOf(step: unknown): StepResources | undefined {
-  void step;
-  throw new Error('resourcesOf: not implemented (M7 W1 F)');
+  if (step === null || (typeof step !== 'object' && typeof step !== 'function')) return undefined;
+  const own = (step as { [STEP_RESOURCES]?: StepResources })[STEP_RESOURCES];
+  if (own !== undefined) return own;
+  const { __agentOptions, __toolOptions } = step as { __agentOptions?: unknown; __toolOptions?: unknown };
+  for (const options of [__agentOptions, __toolOptions]) {
+    if (options !== null && typeof options === 'object') {
+      const kept = (options as { [STEP_RESOURCES]?: StepResources })[STEP_RESOURCES];
+      if (kept !== undefined) return kept;
+    }
+  }
+  return undefined;
 }

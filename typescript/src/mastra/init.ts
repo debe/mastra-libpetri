@@ -17,7 +17,7 @@ import type { InferPublicSchema, PublicSchema, StandardSchemaWithJSON } from '@m
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
 import type { DynamicArgument } from '@mastra/core/types';
 import { PetriExecutionEngine, type PetriEngineOptions } from './engine.js';
-import { limit, rateLimit, type Quota, type QuotaOptions } from './resources.js';
+import { attachResources, limit, Quota, rateLimit, resourcesOf, type QuotaOptions, type StepResources } from './resources.js';
 
 declare const petriEngine: unique symbol;
 
@@ -286,35 +286,77 @@ export function init(options: PetriInitOptions = {}): PetriFactories {
   }) as unknown as PetriCreateWorkflow;
 
   const createStep = ((source: unknown, sourceOptions?: unknown) => {
-    // M7 W1 F strips `uses` / `timeout` and attaches them under STEP_RESOURCES ([ADR 0012],
-    // [ADR 0013]). Until then a step asking for either is refused, and every other call reaches
-    // Mastra's createStep with the very object it was given — Mastra binds a params step's
-    // `execute` to that object (`workflow.ts:523`), so W1 must strip without changing `this`.
-    if (asksForResources(source) || asksForResources(sourceOptions)) {
-      throw new Error('createStep: `uses` and `timeout` are not implemented (M7 W1 F)');
+    if (source instanceof Workflow) return source;
+    const create = mastraCreateStep as (s: unknown, o?: unknown) => object;
+    if (sourceOptions !== undefined) {
+      // An agent or tool source. Mastra keeps the options object as `__agentOptions` /
+      // `__toolOptions` and later spreads it into `agent.stream()` (`run-agent-entry.ts:37`) and the
+      // serialized graph, so `uses` / `timeout` are stripped from a shallow copy — only when present:
+      // an options object without them reaches Mastra as it was given. Nothing binds to it.
+      const resources = resourcesIn(sourceOptions);
+      if (!carriesResourceKeys(sourceOptions)) return create(source, sourceOptions);
+      const { uses: _uses, timeout: _timeout, ...options } = sourceOptions as Record<string, unknown>;
+      const step = create(source, options);
+      if (resources !== undefined) {
+        attachResources(step, resources);
+        attachResources(options, resources);
+      }
+      return step;
     }
-    return source instanceof Workflow
-      ? source
-      : (mastraCreateStep as (s: unknown, o?: unknown) => unknown)(source, sourceOptions);
+    // A params object, or a processor. Mastra builds the Step from a fixed list of the params' fields
+    // and binds `execute` to the params object itself (`workflow.ts:510-530`, the bind at `:523`), so
+    // the very object is passed on: `uses` and `timeout` never reach the Step, and `this` inside
+    // `execute` is the object the author wrote, exactly as on Mastra's own `createStep`.
+    const resources = resourcesIn(source);
+    const step = create(source);
+    if (resources !== undefined) attachResources(step, resources);
+    return step;
   }) as PetriCreateStep;
 
-  // M7 W1 F: copies STEP_RESOURCES onto the clone.
-  const cloneStep = mastraCloneStep as unknown as PetriCloneStep;
+  // Mastra's `cloneStep` copies a fixed list of fields (`workflow.ts:1648-1666`) — not the
+  // non-enumerable resources, nor an agent or tool step's `__agentOptions` / `__toolOptions` — so the
+  // clone gets the original's resources here.
+  const cloneStep = ((step: object, opts: { id: string }) => {
+    const clone = (mastraCloneStep as (s: object, o: { id: string }) => object)(step, opts);
+    const resources = resourcesOf(step);
+    if (resources !== undefined) attachResources(clone, resources);
+    return clone;
+  }) as unknown as PetriCloneStep;
 
   return { createWorkflow, createStep, cloneStep, limit, rateLimit };
 }
 
 /**
- * Whether a `createStep` argument carries a non-empty `uses` or a `timeout`. Only a plain object — a
- * params object or an agent/tool options object — is looked at: an `Agent`, `Tool` or `Workflow` is a
- * class instance whose own fields are not this engine's to read.
+ * Whether a plain object — a params object or an agent/tool options object — has a `uses` or
+ * `timeout` key. An `Agent`, `Tool` or processor is a class instance whose own fields are not this
+ * engine's to read.
  */
-function asksForResources(value: unknown): boolean {
+function carriesResourceKeys(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object') return false;
   const proto: unknown = Object.getPrototypeOf(value);
   if (proto !== Object.prototype && proto !== null) return false;
+  return Object.hasOwn(value, 'uses') || Object.hasOwn(value, 'timeout');
+}
+
+/**
+ * The resources a `createStep` argument declares ([ADR 0012], [ADR 0013]): `undefined` when it
+ * declares none — no `uses` (or an empty one) and no `timeout`. `uses` must be an array of quotas
+ * minted by `init().limit` / `init().rateLimit`; anything else is refused here, since the brand's
+ * type check does not reach a caller that casts. `timeout` is carried as given: the adapter refuses
+ * a bad value as `timeout-value`, by the entry it names.
+ */
+function resourcesIn(value: unknown): StepResources | undefined {
+  if (!carriesResourceKeys(value)) return undefined;
   const { uses, timeout } = value as { uses?: unknown; timeout?: unknown };
-  return (Array.isArray(uses) ? uses.length > 0 : uses !== undefined) || timeout !== undefined;
+  if (uses !== undefined && (!Array.isArray(uses) || !uses.every((q) => q instanceof Quota))) {
+    throw new TypeError('createStep: `uses` takes quotas made by init().limit or init().rateLimit');
+  }
+  const quotas = (uses as readonly Quota[] | undefined) ?? [];
+  if (quotas.length === 0 && timeout === undefined) return undefined;
+  return {
+    ...(quotas.length === 0 ? {} : { quotas }),
+    ...(timeout === undefined ? {} : { timeoutMs: timeout as number }),
+  };
 }
 
 /** Marks a `Run` whose `_restart` {@link openRestart} has already wrapped. */

@@ -208,22 +208,35 @@ export function suspensionCoverageViolations(compiled: CompiledWorkflow): readon
  * parked and lane permits. The one exception is a leaf's **retry hop**: when a top-level step is
  * its own site's gate, its failed attempt emits into `retry-n`, whose `delayed` wait is a lower
  * bound after an attempt that ran in this segment (it fails safe). A retry hop is recognised
- * structurally: `delayed`, one input produced only by step attempts, and every output consumed
- * only by step attempts.
+ * structurally: `delayed`, one input produced only by step attempts (and their timeout funnels,
+ * [ADR 0013]), and every output consumed only by step attempts.
  */
 export function resumeTimingViolations(compiled: CompiledWorkflow): readonly string[] {
   const cancel = compiled.cancel.name;
   const out: string[] = [];
   const transitions = [...compiled.net.transitions];
   const attempts = new Set(compiled.stepAttempts);
+  // A timeout funnel ([ADR 0013]) forwards a timed-out attempt into the same retry place its attempt
+  // fails into, so a hop's input is produced by attempts and funnels.
+  const funnels = new Set(compiled.steps.flatMap((chain) => chain.timeouts));
   const consumersOf = (name: string): Transition[] => transitions.filter((t) => consumesPlace(t, name));
   const producersOf = (name: string): Transition[] => transitions.filter((t) => producesInto(t, name));
   const onlyAttempts = (ts: readonly Transition[]): boolean => ts.length > 0 && ts.every((t) => attempts.has(t.name));
+  const onlyAttemptsOrFunnels = (ts: readonly Transition[]): boolean =>
+    ts.some((t) => attempts.has(t.name)) && ts.every((t) => attempts.has(t.name) || funnels.has(t.name));
+  // An attempt drawing on a rate quota is entered through its immediate request ([ADR 0012]), which
+  // relays the link to the attempt and marks the demand: a hop feeding one still feeds an attempt.
+  const demands = new Set(compiled.pools.flatMap((pool) => (pool.kind === 'bucket' ? [pool.demand.name] : [])));
+  const isRequest = (t: Transition): boolean =>
+    !isTimed(t) &&
+    [...t.outputPlaces()].some((p) => !demands.has(p.name)) &&
+    [...t.outputPlaces()].every((p) => demands.has(p.name) || onlyAttempts(consumersOf(p.name)));
+  const intoAttempts = (ts: readonly Transition[]): boolean => ts.length > 0 && ts.every((t) => attempts.has(t.name) || isRequest(t));
   const isRetryHop = (t: Transition): boolean =>
     t.timing.type === 'delayed' &&
     t.inputSpecs.length === 1 &&
-    onlyAttempts(producersOf(t.inputSpecs[0]!.place.name)) &&
-    [...t.outputPlaces()].every((p) => onlyAttempts(consumersOf(p.name)));
+    onlyAttemptsOrFunnels(producersOf(t.inputSpecs[0]!.place.name)) &&
+    [...t.outputPlaces()].every((p) => intoAttempts(consumersOf(p.name)));
 
   for (const [key, site] of compiled.resumeSites) {
     const name = site.place.name;

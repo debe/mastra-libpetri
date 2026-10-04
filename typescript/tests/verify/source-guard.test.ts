@@ -11,7 +11,13 @@ import { describe, expect, it } from 'vitest';
  * goes, is decided by arcs on `wf.cancel`. A gadget may *pass* the signal on (a step's own
  * `abortSignal` is the runner's business, through `viewOf`); it may not branch on it. This guard
  * keeps that out of review's hands.
+ *
+ * One pass-through is allowed by name: the leaf hands a timed attempt's `deadline.signal` to the
+ * runner ([ADR 0013]). That is the attempt's own deadline, not the run's abort, and the leaf decides
+ * the timeout from the deadline's `expired` promise into an output branch the net already has.
  */
+const SIGNAL_READ = /\.signal\b|\.aborted\b|abortSignal/g;
+
 describe('source guard: gadgets never read the abort signal', () => {
   const dir = join(import.meta.dirname, '../../src/compiler/gadgets');
   const files = readdirSync(dir).filter((f) => f.endsWith('.ts'));
@@ -24,11 +30,13 @@ describe('source guard: gadgets never read the abort signal', () => {
     const code = readFileSync(join(dir, file), 'utf8')
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .replace(/\/\/.*$/gm, '');
-    expect(code.match(/\.signal\b|\.aborted\b|abortSignal/g) ?? []).toEqual([]);
+    expect(code.replace(/\bdeadline\.signal\b/g, '').match(SIGNAL_READ) ?? []).toEqual([]);
   });
 
   it('would catch the defect it guards against', () => {
     const offending = 'if (scope.signal.aborted) { tctx.output(canceled, x); }';
-    expect(offending.match(/\.signal\b|\.aborted\b|abortSignal/g)).not.toBeNull();
+    expect(offending.match(SIGNAL_READ)).not.toBeNull();
+    // The deadline allowance covers that exact pass-through, not the run's signal beside it.
+    expect('deadline.signal; scope.signal'.replace(/\bdeadline\.signal\b/g, '').match(SIGNAL_READ)).not.toBeNull();
   });
 });

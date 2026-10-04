@@ -20,6 +20,7 @@ import type {
   StepRecord,
   SuspendToken,
 } from '../types.js';
+import { admissionClaims, admissionPools, admit, bindingLimit, blockAdmission, collect } from './admission.js';
 import { blockClaims, blockReentry, suspendedBlock, type ArmArrival } from './reentry.js';
 import type { Gadget } from './types.js';
 
@@ -126,10 +127,20 @@ import type { Gadget } from './types.js';
  * decided by the same precedence as a fresh one. A losing suspension is carried on the reported
  * one as `pending`, in arm order, rather than dropped, so every suspended arm stays resumable.
  *
- * **Concurrency is unbounded**, as `Promise.all` is. The `parallel` entry carries no limit to
- * compile (`docs/divergences.md` row 5 is a proposed addition). Adding one would be a permit
- * place seeded by topology, never `k` tokens written into one place by `fork`: a branch names
- * places, not counts ([IO-016]).
+ * **Concurrency is unbounded**, as `Promise.all` is, unless the block carries `concurrency = c`
+ * below its arm count ([ADR 0011], `./admission.ts`). Then `fork` hands the input to a cursor
+ * instead of to every arm, and arms are admitted in arm order from a pool of `c` slots seeded in the
+ * initial marking — never `c` tokens written by `fork`: a branch names places, not counts ([IO-016]).
+ *
+ * ```text
+ *   in --(fork, inhibitor cancel)--> q_0 {data}
+ *   q_j + slot --(admit-j)--> armIn_j + active + q_{j+1} {data}      (no q_n)
+ *   every collect: ... + active -> ... + slot
+ * ```
+ *
+ * Every arm still runs, and none is gated by cancel: an arm admitted after an abort starts with its
+ * signal aborted and writes its record, as an arm of a started block does. `c ≥ arms` compiles
+ * exactly the unlimited net.
  */
 export const parallelGadget: Gadget = (entry, next, ctx) => {
   if (entry.kind !== 'parallel') throw new Error(`parallelGadget received a '${entry.kind}' entry`);
@@ -137,6 +148,8 @@ export const parallelGadget: Gadget = (entry, next, ctx) => {
   const { names, path, viewPath, cancel } = ctx;
   const arms = entry.arms;
   const armCount = arms.length;
+  // The block's own limit, where it binds ([ADR 0011]); `undefined` compiles today's net.
+  const admission = blockAdmission(names, path, entry.id, bindingLimit(entry.id, entry.concurrency, armCount));
   const inPlace = place<FlowToken>(names.entryIn(path, entry.id));
   /** Mastra's check before the entry: the input never reaches `fork` once the signal is marked. */
   const cancelSweep: Transition[] =
@@ -195,23 +208,41 @@ export const parallelGadget: Gadget = (entry, next, ctx) => {
     armIns.push(arm.inPlace);
 
     collects.push(
-      Transition.builder(names.entryTransition(path, entry.id, `collect-${i}`))
-        .inputs(one(armDone))
-        .outputs(outPlace(arrived))
-        .action(async (tctx) => {
-          tctx.output(arrived, { status: 'ok', index: i, data: tctx.input(armDone).data });
-        })
-        .build(),
+      collect(admission, names.entryTransition(path, entry.id, `collect-${i}`), armDone, [arrived], (tctx, done) => {
+        tctx.output(arrived, { status: 'ok', index: i, data: done.data });
+      }),
     );
   }
+
+  // Under a limit: the cursor `q_j`, carrying the block's input, and one `admit-j` per arm. The arm
+  // input is `{ data }` — the same token the unlimited fork writes.
+  const cursors: Place<FlowToken>[] =
+    admission === undefined ? [] : arms.map((_, j) => place<FlowToken>(names.entryPlace(path, entry.id, `q-${j}`)));
+  const admits: Transition[] =
+    admission === undefined
+      ? []
+      : arms.map((_, j) =>
+          admit(
+            admission,
+            names.entryTransition(path, entry.id, `admit-${j}`),
+            cursors[j]!,
+            armIns[j]!,
+            j + 1 < armCount ? { place: cursors[j + 1]!, pass: ({ data }) => ({ data }) } : undefined,
+          ),
+        );
 
   const forkBuilder = Transition.builder(names.entryTransition(path, entry.id, 'fork'))
     .inputs(one(inPlace))
     // One branch, claiming exactly the set the action writes ([IO-015]): every arm always runs,
-    // so there is nothing to select. Every arm receives the same input, as Mastra's does.
-    .outputs(and(...armIns.map(outPlace)))
+    // so there is nothing to select. Every arm receives the same input, as Mastra's does. Under a
+    // limit the input goes to the cursor, and each `admit-j` hands it on.
+    .outputs(admission === undefined ? and(...armIns.map(outPlace)) : outPlace(cursors[0]!))
     .action(async (tctx) => {
       const { data } = tctx.input(inPlace);
+      if (admission !== undefined) {
+        tctx.output(cursors[0]!, { data });
+        return;
+      }
       for (const armIn of armIns) tctx.output(armIn, { data });
     });
   // The only gate in the block: whether it starts. The sweep beside it takes the input instead.
@@ -220,43 +251,25 @@ export const parallelGadget: Gadget = (entry, next, ctx) => {
 
   // Both writes are one branch, and that is the whole race-freedom argument: the arrival that
   // keeps the count honest and the marker that decides the outcome land together or not at all.
-  const collectErr = Transition.builder(names.entryTransition(path, entry.id, 'collect-err'))
-    .inputs(one(armExits.failed))
-    .outputs(and(outPlace(arrived), outPlace(errSeen)))
-    .action(async (tctx) => {
-      const failure = tctx.input(armExits.failed);
-      tctx.output(arrived, { status: 'failed' });
-      tctx.output(errSeen, failure);
-    })
-    .build();
+  const collectErr = collect(admission, names.entryTransition(path, entry.id, 'collect-err'), armExits.failed, [arrived, errSeen], (tctx, failure) => {
+    tctx.output(arrived, { status: 'failed' });
+    tctx.output(errSeen, failure);
+  });
 
-  const collectSusp = Transition.builder(names.entryTransition(path, entry.id, 'collect-susp'))
-    .inputs(one(armExits.suspended))
-    .outputs(and(outPlace(arrived), outPlace(suspSeen)))
-    .action(async (tctx) => {
-      const suspension = tctx.input(armExits.suspended);
-      tctx.output(arrived, { status: 'suspended' });
-      tctx.output(suspSeen, suspension);
-    })
-    .build();
+  const collectSusp = collect(admission, names.entryTransition(path, entry.id, 'collect-susp'), armExits.suspended, [arrived, suspSeen], (tctx, suspension) => {
+    tctx.output(arrived, { status: 'suspended' });
+    tctx.output(suspSeen, suspension);
+  });
 
   // A bail or a pause is swallowed: the arm counts toward the join and contributes nothing else.
   // Its outcome is still in the run's step results, which is where the next entry reads it.
-  const collectBail = Transition.builder(names.entryTransition(path, entry.id, 'collect-bail'))
-    .inputs(one(armExits.bailed))
-    .outputs(outPlace(arrived))
-    .action(async (tctx) => {
-      tctx.output(arrived, { status: 'settled' });
-    })
-    .build();
+  const collectBail = collect(admission, names.entryTransition(path, entry.id, 'collect-bail'), armExits.bailed, [arrived], (tctx) => {
+    tctx.output(arrived, { status: 'settled' });
+  });
 
-  const collectPause = Transition.builder(names.entryTransition(path, entry.id, 'collect-pause'))
-    .inputs(one(armExits.paused))
-    .outputs(outPlace(arrived))
-    .action(async (tctx) => {
-      tctx.output(arrived, { status: 'settled' });
-    })
-    .build();
+  const collectPause = collect(admission, names.entryTransition(path, entry.id, 'collect-pause'), armExits.paused, [arrived], (tctx) => {
+    tctx.output(arrived, { status: 'settled' });
+  });
 
   /**
    * The arm an outcome came from: the element of its view path just below the block's own, which
@@ -341,6 +354,7 @@ export const parallelGadget: Gadget = (entry, next, ctx) => {
     cancel,
     canceled: ctx.exits.canceled,
     failed: ctx.exits.failed,
+    admission,
   });
 
   // The arms' own transitions are deliberately not returned: `emitNested` already recorded them
@@ -348,9 +362,15 @@ export const parallelGadget: Gadget = (entry, next, ctx) => {
   return {
     inPlace,
     resumeSites: reentry.resumeSites,
-    claims: blockClaims([arrived, armExits.failed, armExits.bailed, armExits.suspended, armExits.paused, errSeen, suspSeen], armCount),
+    claims: [
+      ...blockClaims([arrived, armExits.failed, armExits.bailed, armExits.suspended, armExits.paused, errSeen, suspSeen], armCount),
+      ...admissionClaims(admission),
+    ],
+    // Read after every collect, admit and re-admit is emitted: the pool's takers and givers.
+    pools: admissionPools(admission),
     transitions: [
       fork,
+      ...admits,
       ...cancelSweep,
       ...collects,
       collectErr,

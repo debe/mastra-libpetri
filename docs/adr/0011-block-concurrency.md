@@ -39,7 +39,7 @@ seeded in every segment's initial marking. The bound is a proven P-invariant.**
   with `c` tokens, never deposited by an action ([IO-016], [ADR 0006]). A FIFO cursor `q.j` passes
   only at `admit-j`: `q.j + slot -> armIn_j + active + q.{j+1}`. For a branch the gate first routes
   a skipped or reused arm straight to its arrival and passes the cursor without a slot. Every
-  collect consumes one `active` and returns one slot. A resume's `re-enter-j` takes a slot; replays
+  collect consumes one `active` and returns one slot. A resume's `re-admit-j`, after `re-enter-j` has checked the seed, takes a slot; replays
   take none. A slot is held from admission to settlement, across retries and retry delays.
 - **Every arm still runs.** No fail-fast: `.parallel` semantics, not `.foreach`'s.
 - **Cancellation.** Queued arms are not gated (ADR 0004, row 28: arms of a started block are not):

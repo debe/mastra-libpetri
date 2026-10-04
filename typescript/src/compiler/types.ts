@@ -739,7 +739,7 @@ export interface PoolHolder {
  * | kind | place | holders | takers | givers |
  * |---|---|---|---|---|
  * | `permits` | `wf.permits` | — | every step attempt | the same attempts (returned on every branch) |
- * | `slots` | `wf.slots.<path>` | the block's `active` | `admit-j`, `re-enter-j` | the collects |
+ * | `slots` | `wf.slots.<path>` | the block's `active` | `admit-j`, `re-admit-j` (a resume; `re-enter-j` holds nothing, so a refused seed returns no slot) | the collects |
  * | `limit` | `wf.quota.<id>` | — | the using attempts | the same attempts |
  * | `bucket` | `wf.quota.<id>` | `wf.quota.<id>.spent` | the using attempts | the quota's `refill` |
  *

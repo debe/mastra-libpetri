@@ -1,12 +1,22 @@
-import { MAX_FOREACH_LANES, MAX_ITERATION_BOUND, MAX_RETRIES, MAX_WAIT_MS } from '../compiler/index.js';
+import {
+  MAX_CONCURRENCY,
+  MAX_FOREACH_LANES,
+  MAX_ITERATION_BOUND,
+  MAX_RETRIES,
+  MAX_WAIT_MS,
+  QUOTA_ID_PATTERN,
+} from '../compiler/index.js';
 import type {
+  BlockConcurrency,
   BuildOrRun,
   EntryDescription,
+  QuotaRef,
   StepDescription,
   StepSource,
   WorkflowDescription,
 } from '../compiler/types.js';
 import { entryId, type ExecutionGraph, type SingleStepEntry, type StepFlowEntry } from './host.js';
+import { Quota, resourcesOf } from './resources.js';
 
 /**
  * Mastra's tag for `.branch()`. There is no `'branch'` entry type in `StepFlowEntry`; the
@@ -104,7 +114,9 @@ export function adaptStepFlow(
   entries: readonly StepFlowEntry[],
   options: AdaptOptions,
 ): WorkflowDescription {
-  const adapted = entries.map((entry, index) => adaptEntry(entry, index, options));
+  const ctx: AdaptContext = { options, quotas: new Map() };
+  const adapted = entries.map((entry, index) => adaptEntry(entry, index, ctx));
+  refuseMisplacedConcurrency(entries, adapted);
   const checkpoints = checkpointsOf(entries, adapted);
   return {
     id: options.workflowId,
@@ -239,6 +251,123 @@ function checkpointMark(metadata: unknown, type: string, id: string): boolean {
   );
 }
 
+/**
+ * A `.parallel()` / `.branch()` call's own bound on its fan-out ([ADR 0011]): `metadata: { concurrency:
+ * c }` in the call's options, which `toEntryOptionFields` keeps on the entry (`workflow.ts:647-653`).
+ * The options themselves take only `id`, `description` and `metadata` — `{ concurrency: c }` there is
+ * a type error in Mastra's own types and dropped at run time — so the key rides where Mastra keeps
+ * what it does not enforce, and the default engine runs an annotated block exactly as an unannotated
+ * one: every arm at once (Layer 2).
+ *
+ * Absent (or `undefined`) is no bound. A safe integer ≥ 1 is passed through **as written**: the
+ * compiler treats `c ≥ arms` as absent, so the description says what the author wrote. Anything
+ * else is refused by name (`concurrency-value`) — a function in particular, since a block's bound,
+ * unlike `.foreach()`'s resolver, is fixed when the workflow is compiled.
+ */
+function blockConcurrency(entry: StepFlowEntry, id: string): BlockConcurrency | undefined {
+  const metadata = metadataOfEntry(entry);
+  if (!hasConcurrency(metadata)) return undefined;
+  const value: unknown = (metadata as { concurrency?: unknown }).concurrency;
+  if (typeof value === 'function') {
+    refuse(
+      entry.type,
+      id,
+      'concurrency-value: metadata.concurrency is a function, but a block\'s bound is fixed when the ' +
+        'workflow is compiled and one compiled form serves every run. Pass a whole number of at least 1.',
+    );
+  }
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    refuse(
+      entry.type,
+      id,
+      `concurrency-value: metadata.concurrency is ${describeValue(value)}; it must be a whole number of at ` +
+        'least 1 — the most arms of this block in flight at once.',
+    );
+  }
+  return value;
+}
+
+/** Whether `metadata` carries a `concurrency` key with a value; `undefined` counts as none. */
+function hasConcurrency(metadata: unknown): boolean {
+  if (metadata === null || typeof metadata !== 'object') return false;
+  if (!Object.prototype.hasOwnProperty.call(metadata, 'concurrency')) return false;
+  return (metadata as { concurrency?: unknown }).concurrency !== undefined;
+}
+
+/**
+ * `metadata.concurrency` anywhere but a `.parallel()` / `.branch()` call's own options ([ADR 0011]).
+ * Refused rather than ignored: Mastra's engine ignores it everywhere, so an author who put it on a
+ * step expected this engine to read it, and reading it nowhere would quietly run unbounded.
+ *
+ * - `concurrency-position`: on a top-level `.then()` step, an agent, tool, `.map()`, sleep or loop
+ *   entry, or on an arm's or a body's own step metadata. The message names the enclosing block's
+ *   options as the place for a block bound, the engine's run-wide `concurrency` for a bound on the
+ *   whole run, and `cloneStep()` for a Step object shared between positions, since metadata travels
+ *   with the object.
+ * - `concurrency-foreach`: on a `.foreach()` entry's metadata. Its bound is `.foreach(step, {
+ *   concurrency })`, which Mastra itself enforces (Layer 1).
+ */
+function refuseMisplacedConcurrency(entries: readonly StepFlowEntry[], adapted: readonly EntryDescription[]): void {
+  const runWide =
+    'To bound how many steps of the whole run are in flight at once, use the engine\'s run-wide `concurrency` ' +
+    'option (`init({ concurrency })` / `new PetriExecutionEngine({ concurrency })`).';
+  const shared =
+    'If this Step object is also used where the key belongs, give this use its own copy with cloneStep(), ' +
+    'since metadata travels with the object.';
+  entries.forEach((entry, index) => {
+    const enclosing = adapted[index]!;
+    for (const { inner, role } of innerSteps(entry)) {
+      if (!hasConcurrency(metadataOfSingle(inner))) continue;
+      const where =
+        entry.type === 'parallel' || entry.type === MASTRA_BRANCH_ENTRY_TYPE
+          ? `A bound on this block's arms goes in its own options: \`{ metadata: { concurrency: c } }\` on the .${builderOf(entry)}() call.`
+          : entry.type === 'foreach'
+            ? 'A bound on this block\'s items goes in its own options: `.foreach(step, { concurrency: c })`, which Mastra enforces.'
+            : `A .${builderOf(entry)}() runs its body one iteration at a time; there is no fan-out to bound.`;
+      refuse(
+        entry.type,
+        enclosing.id,
+        `concurrency-position: step '${entryId(inner)}' carries metadata.concurrency as ${role}, but the key ` +
+          `bounds a block's fan-out and is read only from a .parallel() or .branch() call's own options. ${where} ` +
+          `${runWide} ${shared}`,
+      );
+    }
+    if (entry.type === 'parallel' || entry.type === MASTRA_BRANCH_ENTRY_TYPE) return;
+    if (!hasConcurrency(metadataOfEntry(entry))) return;
+    if (entry.type === 'foreach') {
+      refuse(
+        entry.type,
+        enclosing.id,
+        'concurrency-foreach: metadata.concurrency is on a .foreach(), whose bound is its own option: ' +
+          '`.foreach(step, { concurrency: c })`, which Mastra enforces itself. Move it there.',
+      );
+    }
+    refuse(
+      entry.type,
+      enclosing.id,
+      `concurrency-position: metadata.concurrency is on ${positionOf(entry)}, but the key bounds a block's ` +
+        "fan-out and is read only from a .parallel() or .branch() call's own options " +
+        `(\`{ metadata: { concurrency: c } }\`); this entry has no arms to bound. ${runWide} ${shared}`,
+    );
+  });
+}
+
+/** How a refusal names a top-level entry that is not a block. */
+function positionOf(entry: StepFlowEntry): string {
+  switch (entry.type) {
+    case 'step':
+      return entry.step.component === MASTRA_WORKFLOW_COMPONENT ? 'a nested workflow step' : 'a .then() step';
+    case 'agent':
+      return 'an agent step';
+    case 'tool':
+      return 'a tool step';
+    case 'mapping':
+      return 'a .map()';
+    default:
+      return `a .${builderOf(entry)}()`;
+  }
+}
+
 function describeValue(value: unknown): string {
   if (typeof value === 'string') return `the string '${value}'`;
   if (typeof value === 'number' || typeof value === 'bigint') return `the ${typeof value} ${String(value)}`;
@@ -267,13 +396,23 @@ export function adaptExecutionGraph(
   return adaptStepFlow(graph.steps, { ...options, workflowId: graph.id });
 }
 
-function adaptEntry(entry: StepFlowEntry, index: number, options: AdaptOptions): EntryDescription {
+/**
+ * What one adaptation carries beside the caller's options: every quota seen so far, by id, with the
+ * step that first used it — the workflow-wide `quota-id-collision` check ([ADR 0012]).
+ */
+interface AdaptContext {
+  readonly options: AdaptOptions;
+  readonly quotas: Map<string, { readonly quota: Quota; readonly stepId: string }>;
+}
+
+function adaptEntry(entry: StepFlowEntry, index: number, ctx: AdaptContext): EntryDescription {
+  const { options } = ctx;
   switch (entry.type) {
     case 'step':
     case 'agent':
     case 'tool':
     case 'mapping':
-      return adaptSingleStep(entry, options);
+      return adaptSingleStep(entry, ctx);
 
     case 'sleep':
       return adaptSleep(entry);
@@ -281,24 +420,32 @@ function adaptEntry(entry: StepFlowEntry, index: number, options: AdaptOptions):
     case 'sleepUntil':
       return adaptSleepUntil(entry);
 
-    case 'parallel':
+    case 'parallel': {
       // An empty list is legal: Mastra reduces over no results and continues with `{}`
       // (`handlers/control-flow.ts:220,286-295`).
+      const id = entry.id ?? `parallel_${index}`;
+      const concurrency = blockConcurrency(entry, id);
       return {
         kind: 'parallel',
-        id: entry.id ?? `parallel_${index}`,
-        arms: entry.steps.map((s) => adaptSingleStep(s, options)),
+        id,
+        arms: entry.steps.map((s) => adaptSingleStep(s, ctx)),
+        ...(concurrency !== undefined ? { concurrency } : {}),
       };
+    }
 
-    case MASTRA_BRANCH_ENTRY_TYPE:
+    case MASTRA_BRANCH_ENTRY_TYPE: {
       // `arms[j]` pairs with `conditions[j]` (`workflow.ts:2436-2454`), which is what makes an
       // index returned by the runner's branch selection mean the same arm on both sides. An empty
       // list, like an empty `.parallel()`, is a success with `{}` (`handlers/control-flow.ts:540,616-624`).
+      const id = entry.id ?? `branch_${index}`;
+      const concurrency = blockConcurrency(entry, id);
       return {
         kind: 'branch',
-        id: entry.id ?? `branch_${index}`,
-        arms: entry.steps.map((s) => adaptSingleStep(s, options)),
+        id,
+        arms: entry.steps.map((s) => adaptSingleStep(s, ctx)),
+        ...(concurrency !== undefined ? { concurrency } : {}),
       };
+    }
 
     case 'loop': {
       // Mastra keys a loop's result by the body step's id, and the entry's own id is optional
@@ -337,7 +484,7 @@ function adaptEntry(entry: StepFlowEntry, index: number, options: AdaptOptions):
       return {
         kind: 'loop',
         id,
-        body: adaptSingleStep(entry.step, options),
+        body: adaptSingleStep(entry.step, ctx),
         loopType: entry.loopType,
         iterationBound: bound,
       };
@@ -348,7 +495,7 @@ function adaptEntry(entry: StepFlowEntry, index: number, options: AdaptOptions):
       return {
         kind: 'foreach',
         id,
-        body: adaptSingleStep(entry.step, options),
+        body: adaptSingleStep(entry.step, ctx),
         concurrency: foreachConcurrency(id, entry.opts),
       };
     }
@@ -374,18 +521,195 @@ function adaptEntry(entry: StepFlowEntry, index: number, options: AdaptOptions):
  * This is also the only thing a `.parallel()` / `.branch()` arm or a loop / `.foreach()` body can
  * be (`types.d.ts:577,583,601,619`), so anything else in that position is refused.
  */
-function adaptSingleStep(entry: SingleStepEntry, options: AdaptOptions): StepDescription {
+function adaptSingleStep(entry: SingleStepEntry, ctx: AdaptContext): StepDescription {
+  const { options } = ctx;
   const source = sourceOf(entry);
   const id = entryId(entry);
   const retries = effectiveRetries(entry, id, options);
   const retryDelayMs = retries > 0 ? retryDelay(entry.type, id, options) : 0;
+  const { timeoutMs, quotas } = stepResources(entry, id, ctx);
   return {
     kind: 'step',
     id,
     source,
     ...(retries > 0 ? { retries } : {}),
     ...(retryDelayMs > 0 ? { retryDelayMs } : {}),
+    // Both keys absent unless the petri createStep attached them, so an unannotated step describes,
+    // keys the compile cache and hashes exactly as before M7.
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(quotas.length > 0 ? { quotas } : {}),
   };
+}
+
+/**
+ * A step's Layer 3 resources ([ADR 0012], [ADR 0013]): the `uses` and `timeout` the petri `createStep`
+ * stripped from its parameters and attached under `STEP_RESOURCES` (`resources.ts`).
+ *
+ * **Where they are read.** A `step` entry: on the Step object (`resourcesOf` also looks at its
+ * `__agentOptions` / `__toolOptions`). An `agent` / `tool` entry: on its `options`, which is the
+ * object Mastra kept as `__agentOptions` / `__toolOptions` when the petri step was passed to
+ * `.then()` / `.parallel()` / … and `toSingleStepEntry` rebuilt the declarative entry from it
+ * (`workflow.ts:579-593`) — the Step object itself is not in the entry. A `.map()` has none.
+ *
+ * **A nested workflow** passed as a step takes them as the step as a whole, as the leaf already
+ * treats it: the timeout races the whole child run (whose signal cancels it, `workflow.ts:2983,3045`)
+ * and a quota is held by each attempt for the child run's whole length. The child's own steps are
+ * not affected — they are another run's net.
+ *
+ * **Refusals.** `timeout-value` and `quota-value` catch what slipped past the factories (a hand-made
+ * carrier, a forged `Quota`), each with the factories' own bounds. `quota-id-collision` is
+ * workflow-wide — every arm and body included — because an id names the run's one set of quota
+ * places (`wf.quota.<id>`), so two different objects with one id would silently become one quota.
+ * It is **this workflow's description only**: a nested workflow is adapted on its own, as its own
+ * run with its own net, so the same quota object used by a parent and a child is two quotas, one
+ * per run, by the per-run scope of [ADR 0012] — never a collision, and never shared.
+ *
+ * `uses-position` is the one route that *is* detectable for resources that never reached a net:
+ * `uses` or `timeout` on an options object or step that the petri `createStep` never saw. Mastra
+ * keeps an agent's or tool's options verbatim — the declarative `.agent(…, options)` /
+ * `.tool(…, options)` builders push them into the entry (`workflow.ts:2012`), and Mastra's own
+ * `createStep(agent | tool, options)` keeps them as `__agentOptions` / `__toolOptions`
+ * (`step-factories.ts:80,119`) — so the keys are still there to see, unattached. Mastra's types
+ * refuse both keys in an object literal but not in an options object built in a variable. Neither
+ * key is one of Mastra's (`AgentStepOptions` has neither; `tests/mastra/adapt-resources.test.ts`
+ * pins it), so their presence can only mean resources the author expected to apply. A **params**
+ * step built by Mastra's own `createStep({ …, uses })` is not detectable: Mastra copies named fields
+ * into a fresh object (`workflow.ts:510-531`) and the keys are gone — the brand on the petri
+ * factories is the gate there ([ADR 0002]).
+ */
+function stepResources(
+  entry: SingleStepEntry,
+  id: string,
+  ctx: AdaptContext,
+): { readonly timeoutMs?: number; readonly quotas: readonly QuotaRef[] } {
+  const carrier = carrierOf(entry);
+  if (carrier === undefined) return { quotas: [] };
+  const resources = resourcesOf(carrier);
+  if (resources === undefined) {
+    refuseUnattachedResources(entry, id, carrier);
+    return { quotas: [] };
+  }
+
+  const timeoutMs: unknown = resources.timeoutMs;
+  if (timeoutMs !== undefined && !(Number.isInteger(timeoutMs) && (timeoutMs as number) >= 1 && (timeoutMs as number) <= MAX_WAIT_MS)) {
+    refuse(
+      entry.type,
+      id,
+      `timeout-value: its timeout is ${describeValue(timeoutMs)}; a step timeout is a whole number of ` +
+        `milliseconds from 1 to ${MAX_WAIT_MS} (~24.9 days, the longest wait a JavaScript timer accepts).`,
+    );
+  }
+
+  const quotas: QuotaRef[] = [];
+  const listed: unknown = resources.quotas ?? [];
+  if (!Array.isArray(listed)) {
+    refuse(entry.type, id, `quota-value: its uses is ${describeValue(listed)}, not a list of quotas.`);
+  }
+  for (const quota of listed as readonly unknown[]) {
+    const ref = quotaRef(quota, entry.type, id);
+    if (quotas.some((q) => q.id === ref.id)) {
+      refuse(
+        entry.type,
+        id,
+        `quota-value: its uses lists quota '${ref.id}' twice. An attempt draws one token from each quota ` +
+          'it uses; list each quota once.',
+      );
+    }
+    const seen = ctx.quotas.get(ref.id);
+    if (seen === undefined) {
+      ctx.quotas.set(ref.id, { quota: quota as Quota, stepId: id });
+    } else if (seen.quota !== quota) {
+      refuse(
+        entry.type,
+        id,
+        `quota-id-collision: it uses a quota with id '${ref.id}', and step '${seen.stepId}' uses a different ` +
+          `quota object with the same id. A quota is its object — every step listing one object shares it — ` +
+          `and its id names its places in the run, so two objects with one id would silently become one ` +
+          'quota. Share one object between the steps, or give each quota its own id.',
+      );
+    }
+    quotas.push(ref);
+  }
+  return { ...(timeoutMs !== undefined ? { timeoutMs: timeoutMs as number } : {}), quotas };
+}
+
+/** The object a single step's resources are attached to, or `undefined` for a `.map()`. */
+function carrierOf(entry: SingleStepEntry): object | undefined {
+  switch (entry.type) {
+    case 'step':
+      return entry.step;
+    case 'agent':
+    case 'tool':
+      return entry.options;
+    default:
+      return undefined;
+  }
+}
+
+/** A quota as the compiler sees it, refusing anything the petri factories would not have minted. */
+function quotaRef(quota: unknown, type: string, id: string): QuotaRef {
+  if (!(quota instanceof Quota)) {
+    return refuse(
+      type,
+      id,
+      `quota-value: its uses holds ${describeValue(quota)}, which is not a quota made by init().limit or ` +
+        'init().rateLimit.',
+    );
+  }
+  const ref: unknown = quota.ref;
+  const r = (ref ?? {}) as { id?: unknown; kind?: unknown; n?: unknown; burst?: unknown; perMs?: unknown };
+  const whole = (v: unknown, max: number) => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= max;
+  const name = typeof r.id === 'string' ? `'${r.id}'` : describeValue(r.id);
+  if (typeof r.id !== 'string' || !QUOTA_ID_PATTERN.test(r.id)) {
+    refuse(type, id, `quota-value: a quota's id is ${name}; it must match [A-Za-z0-9_-]+, since it names the quota's places.`);
+  }
+  if (r.kind === 'limit') {
+    if (!whole(r.n, MAX_CONCURRENCY)) {
+      refuse(type, id, `quota-value: limit ${name} allows ${describeValue(r.n)}; it must be a whole number from 1 to ${MAX_CONCURRENCY}.`);
+    }
+    return { id: r.id as string, kind: 'limit', n: r.n as number };
+  }
+  if (r.kind === 'rate') {
+    if (!whole(r.burst, MAX_CONCURRENCY)) {
+      refuse(type, id, `quota-value: rateLimit ${name} has a burst of ${describeValue(r.burst)}; it must be a whole number from 1 to ${MAX_CONCURRENCY}.`);
+    }
+    if (!whole(r.perMs, MAX_WAIT_MS)) {
+      refuse(
+        type,
+        id,
+        `quota-value: rateLimit ${name} refills every ${describeValue(r.perMs)} ms; it must be a whole number ` +
+          `of milliseconds from 1 to ${MAX_WAIT_MS}.`,
+      );
+    }
+    return { id: r.id as string, kind: 'rate', burst: r.burst as number, perMs: r.perMs as number };
+  }
+  return refuse(type, id, `quota-value: quota ${name} is of kind ${describeValue(r.kind)}, neither 'limit' nor 'rate'.`);
+}
+
+/**
+ * `uses-position`: `uses` or `timeout` on a carrier the petri `createStep` never attached resources to.
+ * Only a plain object is looked at — an options object, or a step Mastra's own factories built — as
+ * `init.ts`'s `asksForResources` does; an empty `uses` asks for nothing there, so not here either.
+ */
+function refuseUnattachedResources(entry: SingleStepEntry, id: string, carrier: object): void {
+  const proto: unknown = Object.getPrototypeOf(carrier);
+  if (proto !== Object.prototype && proto !== null) return;
+  const { uses, timeout } = carrier as { uses?: unknown; timeout?: unknown };
+  const asks = [
+    ...((Array.isArray(uses) ? uses.length > 0 : uses !== undefined) ? ['`uses`'] : []),
+    ...(timeout !== undefined ? ['`timeout`'] : []),
+  ];
+  if (asks.length === 0) return;
+  const what = entry.type === 'step' ? 'step' : `${entry.type}'s options`;
+  refuse(
+    entry.type,
+    id,
+    `uses-position: this ${what} carries ${asks.join(' and ')}, but they never passed through the petri ` +
+      'createStep, so nothing attached them and the step would run without them. Mastra passes the options ' +
+      'of a declarative .agent() / .tool() entry, and of its own createStep(agent | tool, options), through ' +
+      `unread. Build the step with init().createStep(${entry.type === 'tool' ? 'tool' : entry.type === 'agent' ? 'agent' : '…'}, ` +
+      '{ uses, timeout }) and add that step with .then(), .parallel() or .branch().',
+  );
 }
 
 function sourceOf(entry: SingleStepEntry): StepSource {

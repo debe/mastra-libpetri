@@ -1,5 +1,6 @@
 import { Transition, and, one, outPlace, place, xor, type Out, type Place } from 'libpetri';
 import type { EntryPath, NameVocabulary } from '../names.js';
+import { admit, type BlockAdmission } from './admission.js';
 import type {
   ArmResume,
   ArmSite,
@@ -54,6 +55,11 @@ export interface BlockReentryOptions {
   readonly canceled: Place<CanceledToken>;
   /** The enclosing failure exit — where a seed that does not fit this block is refused, by name. */
   readonly failed: Place<FailureToken>;
+  /**
+   * The block's binding `concurrency` ([ADR 0011]), or `undefined`. Under a limit the resumed arm
+   * takes a slot, through `re-admit-j`; replays take none, since a replayed sibling is not running.
+   */
+  readonly admission?: BlockAdmission | undefined;
 }
 
 export interface BlockReentry {
@@ -99,6 +105,18 @@ export interface BlockReentry {
  * step id, no `skipped` in a `.parallel()` — and sends a misfit to `failed` with an error naming the
  * block, before a single token is written. The decoder is the trust point here (no proof sees values), so the gate
  * refuses by name rather than let a malformed replay miscount the join.
+ *
+ * **Under a block limit** ([ADR 0011]) the resumed arm holds a slot like any admitted arm, so its
+ * collect can return one: `re-enter-j` hands the validated input to `resumed_j` instead of
+ * `armIn_j`, and `re-admit-j: resumed_j + slot -> armIn_j + active` admits it. The validation stays
+ * in `re-enter-j`, before any slot is taken — a misfit refused there holds nothing, so every branch
+ * of every slot taker moves exactly one token from the pool to `active`. Every pool is seeded full
+ * at a resume site, so `re-admit-j` is enabled at once. It is not gated: the block has (re)started.
+ *
+ * ```text
+ *   resume-j --re-enter-j [inhibitor cancel]--> xor( and(resumed_j, replay_i for every i != j), failed )
+ *   resumed_j + slot --re-admit-j--> armIn_j + active
+ * ```
  *
  * **What is never on the resume path.** `.branch()`'s `decide`: conditions are not re-evaluated on
  * a resume, and a sibling that did not run replays as `skipped` (`handlers/entry.ts:43-46,415-500`).
@@ -154,7 +172,11 @@ export function armReentry(
     if (i !== j) replayOf.set(i, p);
   });
 
-  const run: Out = siblings.length === 0 ? outPlace(armIn) : and(outPlace(armIn), ...siblings.map(outPlace));
+  // Under a limit the validated input waits at `resumed_j` for its slot; see {@link blockReentry}.
+  const admission = o.admission;
+  const resumed = admission === undefined ? undefined : place<FlowToken>(names.entryPlace(path, blockId, `resumed-${j}`));
+  const target = resumed ?? armIn;
+  const run: Out = siblings.length === 0 ? outPlace(target) : and(outPlace(target), ...siblings.map(outPlace));
   const gate = Transition.builder(names.entryTransition(path, blockId, `re-enter-${j}`))
     .inputs(one(resume))
     .outputs(xor(run, outPlace(o.failed)))
@@ -170,12 +192,15 @@ export function armReentry(
         });
         return;
       }
-      tctx.output(armIn, { data: seed.data, resumed: true });
+      tctx.output(target, { data: seed.data, resumed: true });
       for (const verdict of seed.siblings) tctx.output(replayOf.get(verdict.index)!, verdict);
     });
   if (o.cancel !== undefined) gate.inhibitor(o.cancel);
 
   const transitions: Transition[] = [gate.build()];
+  if (admission !== undefined && resumed !== undefined) {
+    transitions.push(admit(admission, names.entryTransition(path, blockId, `re-admit-${j}`), resumed, armIn, undefined));
+  }
   if (o.cancel !== undefined) {
     const canceled = o.canceled;
     transitions.push(
