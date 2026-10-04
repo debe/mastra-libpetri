@@ -188,11 +188,16 @@ function mutated(m: Mutation): Gadget {
 const T = { timeout: 60_000 } as const;
 
 /**
- * Every query spawns its own solver or enumerates in-process and no test shares state, so the
- * blocks run concurrently; assertions therefore use the test's own `expect`.
+ * The tests run one at a time: each `verifyWorkflow` already pools its queries, and enumeration is
+ * synchronous, so concurrent tests only wait on each other's graph builds with their 60 s clocks
+ * running. Assertions use the test's own `expect`, which works either way.
  */
-describe.concurrent('compiled foreach, proved (every segment)', () => {
-  it.for([1, 2, 3, 5])('is deadlock-free, never canceled unasked, and ends in exactly one terminal with %i lane(s)', T, async (lanes, { expect }) => {
+describe('compiled foreach, proved (every segment)', () => {
+  // Up to three lanes: five took 62 s (every query 5-7 s on SMT, past enumeration's 50,000 classes,
+  // registry libpetri 8.0.0, 2026-10-04). libpetri: lanes are identical, so ν-named lanes through
+  // one gadget would let Route B quotient their permutations — a redesign; until then three lanes
+  // are the proven size, and wider foreach concurrency is the same gadget, not claimed.
+  it.for([1, 2, 3])('is deadlock-free, never canceled unasked, and ends in exactly one terminal with %i lane(s)', T, async (lanes, { expect }) => {
     await prove(expect, `foreach(c=${lanes})`, build([foreach(lanes)]));
   });
 
@@ -217,7 +222,7 @@ describe.concurrent('compiled foreach, proved (every segment)', () => {
  * permits. Proven for c = 2 at k = 1 (the budget binds below the lane count) and k = 2 (they
  * coincide), from every segment, the foreach's resume site included.
  */
-describe.concurrent('compiled foreach under a run budget, proved (every segment)', () => {
+describe('compiled foreach under a run budget, proved (every segment)', () => {
   it.for([1, 2])('c = 2, k = %i: the budget is conserved from the arcs, and every property of every segment is proven', T, async (k, { expect }) => {
     const compiled = build([foreach(2)], undefined, k);
     expect(compiled.budget?.k).toBe(k);
@@ -233,7 +238,7 @@ describe.concurrent('compiled foreach under a run budget, proved (every segment)
  * is "no item starts once an outcome is recorded", for every interleaving and every item count.
  * Not a suspension: a resume carries suspensions beside an open queue, as Mastra's does.
  */
-describe.concurrent('compiled foreach: dispatch stops at the first failure, bail or pause', () => {
+describe('compiled foreach: dispatch stops at the first failure, bail or pause', () => {
   it.for<[number, Segment]>([
     [2, 'closed'],
     [2, 'cancel'],
@@ -268,7 +273,7 @@ describe.concurrent('compiled foreach: dispatch stops at the first failure, bail
 /**
  * Each safeguard removed once, and the property that sees it. 2 lanes, closed segment unless noted.
  */
-describe.concurrent('compiled foreach: each safeguard is load-bearing (mutated copies)', () => {
+describe('compiled foreach: each safeguard is load-bearing (mutated copies)', () => {
   it('a settle that does not take the queue lets an item start after a recorded failure', T, async ({ expect }) => {
     const compiled = build([foreach(2)], mutated({ transition: /\.lane\d+\.fail$/, dropInput: /\.queue\.open$/, dropOutput: /\.queue\.closed$/ }));
     const r = await check(compiled, mutualExclusion(placeNamed(compiled, 's.0.items.queue.open'), placeNamed(compiled, 's.0.items.fault')));
@@ -308,7 +313,7 @@ describe.concurrent('compiled foreach: each safeguard is load-bearing (mutated c
  * — without a cancel none of these arcs is consulted — and flipping the cancel segment. The
  * structural check passes on each (none of them is an inhibitor on the signal).
  */
-describe.concurrent('compiled foreach: each cancellation safeguard is load-bearing (mutated copies, 1 lane)', () => {
+describe('compiled foreach: each cancellation safeguard is load-bearing (mutated copies, 1 lane)', () => {
   const closedProven = {
     'closed/deadlockFree': 'proven',
     'closed/terminatesAtSink': 'proven',

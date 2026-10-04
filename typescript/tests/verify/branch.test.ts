@@ -140,9 +140,17 @@ const sizeRows: SizeRow[] = [];
  * transition here declares an `and` of `xor`s, so the enumerated branch count is linear in the
  * number of arms; what grows exponentially is the reachable state space, because every subset of
  * arms and every interleaving is genuinely reachable.
+ *
+ * **Proven up to four arms.** Arms interact only at the fork, the join and the cancel, so three or
+ * four arms already show every interaction. Five and six were measured (registry libpetri 8.0.0,
+ * 2026-10-04): at k=5 the cancel segment outgrows enumeration's 50,000 classes and takes 13-20 s a
+ * query on SMT, and k=6 takes 85 s. libpetri confirmed the growth is inherent — no partial-order
+ * reduction exists, and its symmetry reduction permutes ν-names, not distinct arms — so larger sizes
+ * are not claimed. Proving them would need a compositional proof (an arm summary checked with
+ * `verifyOpenNet`, [VER-022]).
  */
 describe('compiled branch, scaling in the number of arms', () => {
-  for (const k of [1, 2, 3, 4, 5, 6]) {
+  for (const k of [1, 2, 3, 4]) {
     it(`proves every property of both segments with ${k} arm(s), and counts the net`, async () => {
       const compiled = compile(workflow(branch('route', ...arms(k))));
       const transitions = [...compiled.net.transitions];

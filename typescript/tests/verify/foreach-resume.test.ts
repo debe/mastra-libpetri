@@ -179,7 +179,7 @@ async function verdicts(label: string, compiled: CompiledWorkflow): Promise<Reco
 
 // ===========================================================================================
 
-describe.concurrent('foreach resume: every segment proven, from the foreach site', () => {
+describe('foreach resume: every segment proven, from the foreach site', () => {
   it.for([1, 2, 3])('foreach(c=%i): closed, cancel, resume@0, resume@0+cancel', T, async (lanes, { expect }) => {
     await proveAll(expect, `foreach(c=${lanes})`, build([foreach(lanes)]), ['0']);
   });
@@ -232,7 +232,7 @@ describe.concurrent('foreach resume: every segment proven, from the foreach site
   });
 });
 
-describe.concurrent('foreach resume: every new arc has teeth', () => {
+describe('foreach resume: every new arc has teeth', () => {
   it('re-enter without the `susp` flag on its reopenings: the resumed foreach can never decide — resume@0 violated, fresh segments unaffected', T, async ({ expect }) => {
     const v = await verdicts('mutant re-enter ¬susp', build([foreach(1)], mutated({ transition: /\.items\.re-enter$/, dropOutput: /\.items\.(no-)?susp$/ })));
     expect(v['closed/deadlockFree']).toBe('proven');

@@ -553,7 +553,7 @@ const proofShapes: ReadonlyArray<readonly [string, WorkflowDescription, readonly
 describe('every resume site of every shape, proven at k in {1, 2, unbounded}', () => {
   for (const [label, description, sites] of proofShapes) {
     for (const k of KS) {
-      it.concurrent(`${label}, ${kLabel(k)}`, async () => {
+      it(`${label}, ${kLabel(k)}`, async () => {
         await proveAll(`${label}, ${kLabel(k)}`, description, k, sites, 30_000);
       });
     }

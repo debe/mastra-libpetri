@@ -1,3 +1,5 @@
+import { availableParallelism } from 'node:os';
+import { pool } from '../internal/pool.js';
 import {
   SmtVerifier,
   deadlockFree,
@@ -22,12 +24,12 @@ import { initialCounts } from '../engine/kernel.js';
 
 
 /**
- * The enumeration route's class budget ([VER-017]). libpetri's default, 50,000, truncates symmetric
- * fan-outs — a limited block under a limit and the run budget — and drops them to SMT; the cost of
- * more is memory, roughly linear in classes. A query that still does not close in its total budget
- * is a net to redesign.
+ * The enumeration route's class budget ([VER-017]), kept at libpetri's default. Enumeration is
+ * synchronous: at 500,000 a net that outgrows the budget enumerates for minutes before falling back,
+ * blocking every other query in the process — measured on `tests/verify/foreach.test.ts`, 4.5 min
+ * against 1 min at 50,000. A net that needs more is a net to shrink or redesign.
  */
-export const ENUMERATION_MAX_CLASSES = 500_000;
+export const ENUMERATION_MAX_CLASSES = 50_000;
 
 /**
  * Which runs a proof covers.
@@ -192,6 +194,8 @@ export interface VerifyOptions {
    * demonstrate what the *proofs* cannot see on a mutant the structural check would refuse.
    */
   readonly structure?: 'check' | 'skip';
+  /** How many queries run at once. Defaults to half the cores, as `verify` does. */
+  readonly jobs?: number;
 }
 
 export interface PropertyReport {
@@ -350,23 +354,38 @@ export async function verifyWorkflow(
       .totalBudget(timeout);
 
   // Two segments with the same initial marking are the same query: asked once, cited under both.
-  const reports: PropertyReport[] = [];
-  const asked = new Map<string, { readonly segment: Segment; readonly result: SmtVerificationResult }>();
+  // The distinct queries run in a pool as wide as `verify`'s, and the reports keep segment order.
+  type Planned = { readonly property: string; readonly segment: Segment; readonly marking: string; readonly first?: Segment };
+  const planned: Planned[] = [];
+  const firstOf = new Map<string, Segment>();
+  const asks: (() => Promise<SmtVerificationResult>)[] = [];
+  const askIndex = new Map<string, number>();
   for (const segment of segments) {
     const initial = segmentInitialMarking(compiled, segment);
     const marking = describeMarking(initial);
     const key = markingKey(initial);
     for (const [property, prop] of completionProperties(compiled, segment)) {
-      const earlier = asked.get(`${key}|${property}`);
+      const id = `${key}|${property}`;
+      const earlier = firstOf.get(id);
       if (earlier !== undefined) {
-        reports.push({ property, segment, marking, result: earlier.result, sameProofAs: earlier.segment });
+        planned.push({ property, segment, marking, first: earlier });
         continue;
       }
-      const result = await base(initial).property(prop).verify();
-      asked.set(`${key}|${property}`, { segment, result });
-      reports.push({ property, segment, marking, result });
+      askIndex.set(id, asks.length);
+      asks.push(() => base(initial).property(prop).verify());
+      firstOf.set(id, segment);
+      planned.push({ property, segment, marking });
     }
   }
+  const width = options.jobs ?? Math.max(1, Math.floor(availableParallelism() / 2));
+  const answers = await pool(asks, width, (ask) => ask());
+  const reports: PropertyReport[] = planned.map((p) => {
+    const id = `${markingKey(segmentInitialMarking(compiled, p.segment))}|${p.property}`;
+    const result = answers[askIndex.get(id)!]!;
+    return p.first === undefined
+      ? { property: p.property, segment: p.segment, marking: p.marking, result }
+      : { property: p.property, segment: p.segment, marking: p.marking, result, sameProofAs: p.first };
+  });
   return reports;
 }
 

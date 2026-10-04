@@ -363,7 +363,7 @@ describe('claims derived from the pools', () => {
   });
 });
 
-describe.concurrent('every claim is proven on each sound net, in every segment', () => {
+describe('every claim is proven on each sound net, in every segment', () => {
   const cases: ReadonlyArray<readonly [string, () => CompiledWorkflow, readonly string[]]> = [
     ['slots c=1 of 2 arms', () => slotsNet(2, 1), ['closed/poolReturned(wf.slots.0)', 'cancel/poolReturned(wf.slots.0)', 'closed/bound(wf.slots.0<=1)', 'restart@0+cancel/bound(wf.slots.0<=1)', 'closed/bound(s.0.blk.active<=1)']],
     ['slots c=2 of 3 arms', () => slotsNet(3, 2), ['closed/poolReturned(wf.slots.0)', 'cancel/bound(wf.slots.0<=2)', 'closed/bound(s.0.blk.active<=2)', 'closed/live(t.0-2.c.run)']],

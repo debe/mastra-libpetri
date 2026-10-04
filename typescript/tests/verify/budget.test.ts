@@ -104,7 +104,7 @@ const shapes: ReadonlyArray<readonly [string, readonly EntryDescription[], numbe
   ['a step, parallel n=2, a step', [step('before'), { kind: 'parallel', id: 'fan', arms: arms(2) }, step('after')], 4],
 ];
 
-describe.concurrent('every gadget shape is proven under a budget (both segments, all properties)', () => {
+describe('every gadget shape is proven under a budget (both segments, all properties)', () => {
   for (const k of [1, 2]) {
     it.for(shapes)(`k=${k}: %s`, async ([label, entries, attempts], { expect }) => {
       const compiled = build(entries, k);
@@ -121,7 +121,7 @@ describe.concurrent('every gadget shape is proven under a budget (both segments,
 
 const foreach = (c: number, body: StepDescription = step('body')): EntryDescription => ({ kind: 'foreach', id: 'items', body, concurrency: c });
 
-describe.concurrent('foreach under a budget (both segments, all properties)', () => {
+describe('foreach under a budget (both segments, all properties)', () => {
   for (const k of [1, 2]) {
     it.for([1, 2])(`k=${k}: foreach c=%i`, async (c, { expect }) => {
       const compiled = build([foreach(c)], k);
@@ -131,7 +131,7 @@ describe.concurrent('foreach under a budget (both segments, all properties)', ()
   }
 });
 
-describe.concurrent('foreach c=3 under a budget (every segment, all properties)', () => {
+describe('foreach c=3 under a budget (every segment, all properties)', () => {
   for (const k of [1, 2]) {
     it(`k=${k}: foreach c=3`, async ({ expect }) => {
       const compiled = build([foreach(3)], k);
@@ -200,7 +200,7 @@ const outcomeOnly = (branch: Out): Out => {
   return branch.children[0];
 };
 
-describe.concurrent('non-vacuity: mutants of the step gadget', () => {
+describe('non-vacuity: mutants of the step gadget', () => {
   it('a step keeping its permit on failure: permitsReturned violated in both segments, and the structure names the branch', async ({ expect }) => {
     // Branch 1 is the failure: `xor(next, failed, bailed, suspended, paused)`, each `and`ed with
     // the permit. Initial marking k=1, two steps: a run where `a` fails rests with 0 permits.

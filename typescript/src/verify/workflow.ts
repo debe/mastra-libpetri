@@ -1,4 +1,5 @@
 import { availableParallelism } from 'node:os';
+import { pool } from '../internal/pool.js';
 import {
   SmtVerifier,
   StateSpaceCache,
@@ -331,19 +332,6 @@ function describeMarking(marking: ReadonlyMap<Place<unknown>, number>): string {
   return `{${[...marking].map(([p, n]) => `${p.name}: ${n}`).join(', ')}}`;
 }
 
-/** Runs `work` over `items` with at most `width` in flight; results in item order. */
-async function pool<T, R>(items: readonly T[], width: number, work: (item: T) => Promise<R>): Promise<R[]> {
-  const out = new Array<R>(items.length);
-  let next = 0;
-  const lane = async (): Promise<void> => {
-    while (next < items.length) {
-      const i = next++;
-      out[i] = await work(items[i]!);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(width, items.length) }, lane));
-  return out;
-}
 
 /**
  * One line per claim, as `describeReport` prints a completion proof — a witness adds how many
