@@ -174,11 +174,20 @@ export function resumeGateViolations(compiled: CompiledWorkflow): readonly strin
  *
  * A sleep is not a step attempt and never suspends. The check is by path, not by construct: a
  * site registered at the wrong path reads as missing, which it is.
+ *
+ * **Exempt: the attempts inside a counted decision's arms** ({@link decidingArmAttempts}, [ADR
+ * 0014]). Their suspension is a *miss* of the block, not a suspension of the run: the arm's suspended
+ * exit is collected into the block's `miss` by `collect-susp`, and a `race` / `quorum` block never
+ * suspends (wave 1; `docs/divergences.md` row 106). No resume site covers them and none should.
+ * They are not unchecked: `decisionStructureViolations` rule 7 holds every outcome of an arm attempt
+ * to its own chain or a declared collect, so a suspended exit that escaped the block would fail there.
  */
 export function suspensionCoverageViolations(compiled: CompiledWorkflow): readonly string[] {
   const out: string[] = [];
   const reported = new Set<string>();
+  const exempt = decidingArmAttempts(compiled);
   for (const name of compiled.stepAttempts) {
+    if (exempt.has(name)) continue;
     const entry = compiled.netMap.transitionToEntry.get(name);
     if (entry === undefined) {
       out.push(`step attempt '${name}' has no entry in the net map`);
@@ -192,6 +201,24 @@ export function suspensionCoverageViolations(compiled: CompiledWorkflow): readon
       reported.add(key);
       out.push(`step '${entry.id}' at [${entry.path.join(', ')}] ('${name}') can suspend, and no resume site covers it`);
     }
+  }
+  return out;
+}
+
+/**
+ * The step attempts inside an arm of a counted decision ([ADR 0014]): every attempt whose entry path
+ * lies strictly under a block's `path` (`[...path, i, …]`), nested arms included. Their suspension is
+ * a miss of the block, which never suspends, so {@link suspensionCoverageViolations} exempts them.
+ * Empty for a net with no decisions; an attempt with no net-map entry is never exempt (the coverage
+ * check reports it).
+ */
+export function decidingArmAttempts(compiled: CompiledWorkflow): ReadonlySet<string> {
+  const out = new Set<string>();
+  if (compiled.decisions.length === 0) return out;
+  for (const name of compiled.stepAttempts) {
+    const entry = compiled.netMap.transitionToEntry.get(name);
+    if (entry === undefined) continue;
+    if (compiled.decisions.some((d) => entry.path.length > d.path.length && d.path.every((x, j) => entry.path[j] === x))) out.add(name);
   }
   return out;
 }

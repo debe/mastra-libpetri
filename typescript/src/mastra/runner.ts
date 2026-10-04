@@ -29,7 +29,7 @@ import type { RunnerResume } from './resume-codec.js';
 import { runScorersForStep, type RunScorersParams } from './scorers.js';
 import type { StepSpans } from './spans.js';
 import { toMastraStepResult } from './step-result.js';
-import { attemptGate, type AttemptGate } from './attempt-gate.js';
+import { attemptGate, reportedVerdict, type AttemptGate } from './attempt-gate.js';
 
 /** `validateStepInput`'s result: the input every attempt uses, and the error that fails them all. */
 interface ValidatedInput {
@@ -189,8 +189,9 @@ export class MastraStepRunner implements StepRunner {
   #state: Record<string, unknown>;
   /**
    * Mastra's `executionContext.resumeLabels`: every `suspend(…, { resumeLabel })` of the run, by
-   * label, written the moment `suspend` is called (`handlers/step.ts:399-411`), a later label of
-   * the same name overwriting an earlier one.
+   * label, written the moment `suspend` is called (`handlers/step.ts:399-411`) and again when the
+   * attempt returns (`:491`), so the later-settling of two steps naming one label holds it — for a
+   * timed attempt or a deciding block's arm only on settling with its own verdict ([ADR 0014]).
    */
   readonly #resumeLabels: Record<string, ResumeLabel> = {};
   /**
@@ -240,6 +241,21 @@ export class MastraStepRunner implements StepRunner {
     return merged === undefined ? this.#resumeLabels : { ...merged, ...this.#resumeLabels };
   }
 
+  /**
+   * A `race` / `quorum` join rewrote `stepId`'s suspended record `canceled` ([ADR 0014]): every
+   * resume label naming `stepId` goes from {@link resumeLabels}, so the finished run names no
+   * resumable orphan. An arm is never a foreach body, so no carried label is involved. A nested
+   * workflow's own suspended child run stays as it is in storage (row 107).
+   *
+   * Labels are matched by the step id they resume (`ResumeLabel.stepId`), never by label name: a
+   * label of the same name a winner wrote later has overwritten the loser's already and is kept.
+   */
+  forgetSuspension(stepId: string): void {
+    for (const [label, target] of Object.entries(this.#resumeLabels)) {
+      if (target.stepId === stepId) delete this.#resumeLabels[label];
+    }
+  }
+
   /** A `.foreach()` item succeeded: its carried label goes (`handlers/control-flow.ts:1149-1152`). */
   #itemSucceeded(stepId: string, index: number): void {
     const labels = this.#carried.get(stepId);
@@ -280,19 +296,28 @@ export class MastraStepRunner implements StepRunner {
     const nestedRunId = nested && foreachIndex !== undefined ? randomUUID() : undefined;
     this.#lastView = call;
 
-    // What the resume hands this call is decided before the step runs. Where the default engine's
-    // resume rejects instead of running the step, the refusal is marked as the host's, so the leaf
-    // neither records nor retries it and the engine rejects the run with the cause.
-    let feed: ResumeFeed;
-    try {
-      feed = this.#resumeFeed(stepId, call, nested);
-    } catch (error) {
-      throw new HostPreconditionError(stepId, call.path, error);
-    }
-    const restart = this.#restartFeed(step.id, call, nested);
-    // The attempt's gate ([ADR 0013]): transparent without a deadline. Released once the step settles.
+    // The attempt's gate ([ADR 0013], [ADR 0014]): transparent without a deadline or a preemption.
+    // Released once the step settles.
     const gate = attemptGate(stepId, call, this.#o.abortController);
     try {
+      // Decided before the attempt ([ADR 0014]): a loser whose block decided while it waited — in a
+      // retry delay, behind a slot or a quota — is not started at all, and nothing about it is
+      // published. With the run aborted too the verdict is `own` and the step runs, its signal
+      // already aborted, as the default engine runs a retry after a cancel (`default.ts:455-460`).
+      if (gate.expired()) {
+        const verdict = gate.freeze();
+        return { status: 'failed', error: verdict.kind === 'own' ? undefined : verdict.reason, verdict: reportedVerdict(verdict, false) };
+      }
+      // What the resume hands this call is decided before the step runs. Where the default engine's
+      // resume rejects instead of running the step, the refusal is marked as the host's, so the leaf
+      // neither records nor retries it and the engine rejects the run with the cause.
+      let feed: ResumeFeed;
+      try {
+        feed = this.#resumeFeed(stepId, call, nested);
+      } catch (error) {
+        throw new HostPreconditionError(stepId, call.path, error);
+      }
+      const restart = this.#restartFeed(step.id, call, nested);
       return await this.#attempt(stepId, input, call, entry, step, nested, nestedRunId, feed, restart, gate);
     } finally {
       gate.release();
@@ -331,15 +356,25 @@ export class MastraStepRunner implements StepRunner {
       // Observation only: whatever building or publishing the start throws is kept, and the step runs.
       await this.#publishStart(stepId, inputData, call, feed, stepCallId).catch((error: unknown) => this.#o.events?.keep(error));
     }
-    // Gated per attempt ([ADR 0013]): once the deadline has fired, every chunk is dropped — through
-    // the step's writer and through the output writer the step is handed. Without a deadline both are
-    // the very objects of before.
+    // Gated per attempt ([ADR 0013], [ADR 0014]): while the verdict is not the step's own — the
+    // deadline or the preemption fired first — every chunk is dropped, through the step's writer and
+    // through the output writer the step is handed. A chunk cannot wait for the freeze, so this is the
+    // one effect gated live. Without a deadline or a preemption both are the very objects of before.
     const outputWriter = this.#o.outputWriter === undefined ? undefined : gate.writer(this.#o.outputWriter);
     const writer = gate.writer(new ToolStream({ prefix: 'workflow-step', callId: stepCallId, name: step.id, runId: this.#o.runId }, outputWriter));
 
     let stateUpdate: Record<string, unknown> | undefined;
     // The last `suspend` call's validated data: Mastra keeps the last (`handlers/step.ts:414`).
     let suspension: { readonly data: unknown } | undefined;
+    // The resume labels this attempt's `suspend` calls named, in call order. The default engine writes
+    // each the moment `suspend` is called (`handlers/step.ts:399-411`) and again when the attempt
+    // returns (`:491`, `contextMutations.resumeLabels`), so of two steps naming one label the one
+    // that settles later holds it. Without a deadline or a preemption the verdict is always `own`, so
+    // both writes happen here too. Behind a decisive gate the first write waits for the freeze and
+    // both are committed only on an `own` verdict ([ADR 0013], [ADR 0014]):
+    // a discarded attempt never touches the run's labels, so it can neither name a step whose record
+    // is not `suspended` nor erase a label of the same name another step wrote.
+    const pending: [string, ResumeLabel][] = [];
     // What `step.execute` returned — Mastra's `durableResult.output`, which scorers see (`handlers/step.ts:506`).
     let returned: { readonly value: unknown } | undefined;
     // The step's tracing context (`handlers/step.ts:352-356,382`): `mastra` wrapped with the step's
@@ -384,9 +419,12 @@ export class MastraStepRunner implements StepRunner {
               validateInputs: this.#o.validateInputs,
             });
             if (suspendError) throw suspendError;
-            // After the deadline a suspend is ignored: no label reaches the run ([ADR 0013]).
-            if (gate.expired()) return;
-            for (const label of labelsOf(options)) this.#resumeLabels[label] = { stepId: step.id, foreachIndex };
+            // Whether they stand is the verdict's, frozen when the step settles ([ADR 0014]).
+            for (const label of labelsOf(options)) {
+              const target: ResumeLabel = { stepId: step.id, foreachIndex };
+              pending.push([label, target]);
+              if (!gate.decisive) this.#resumeLabels[label] = target;
+            }
             suspension = { data: suspendData };
             // Marks the attempt suspended; its stamped copy of the data is replaced below.
             await executorSuspend(data);
@@ -405,7 +443,7 @@ export class MastraStepRunner implements StepRunner {
               validateInputs: this.#o.validateInputs,
             });
             if (stateError) throw stateError;
-            if (gate.expired()) return;
+            // Applied only on an `own` verdict, after the step has settled ([ADR 0014]).
             stateUpdate = stateData as Record<string, unknown> | undefined;
           },
         } as unknown as Parameters<MastraStep['execute']>[0]) as Promise<unknown>;
@@ -415,10 +453,13 @@ export class MastraStepRunner implements StepRunner {
       },
     });
 
-    // A deadline that fired before the step began ([ADR 0013]): the step is not started at all — it
-    // would only see an aborted signal — and the leaf discards this outcome for its timeout.
+    // A deadline or a preemption that fired while the input was validated ([ADR 0013], [ADR 0014]):
+    // the step is not started — it would only see an aborted signal — and the verdict is frozen here.
+    // Its start was published, so the leaf's record keeps a start. The error is the source's reason.
     if (gate.expired()) {
-      return toOutcome({ status: 'failed', error: gate.controller.signal.reason, payload: inputData });
+      const verdict = gate.freeze();
+      const reason = verdict.kind === 'own' ? undefined : verdict.reason;
+      return { ...toOutcome({ status: 'failed', error: reason, payload: inputData }), verdict: reportedVerdict(verdict, true) };
     }
     const result = (await this.#o.executor.execute({
       workflowId: this.#o.workflowId,
@@ -438,12 +479,17 @@ export class MastraStepRunner implements StepRunner {
     })) as HostResult;
 
     const { __state: _s, __stateDelta: _d, ...raw } = result as Record<string, unknown>;
-    // Once the deadline has fired the attempt has no effect ([ADR 0013]): no state, no item
-    // bookkeeping, no scorers, no suspension check. The leaf discards the outcome and records the
-    // timeout itself.
-    if (gate.expired()) {
-      return toOutcome({ ...raw, payload: inputData });
+    // **The verdict, frozen here** ([ADR 0014]): the step has settled, and this is the one point the
+    // attempt is decided. Everything below — state, item bookkeeping, scorers, the record the leaf
+    // writes — follows it, and nothing that fires later (a block deciding while the scorers run)
+    // changes it. Not the step's own: no state, no item bookkeeping, no scorers, no suspension check,
+    // and no resume label; the leaf discards the outcome for its timeout or its `preempted` branch.
+    const verdict = gate.freeze();
+    if (verdict.kind !== 'own') {
+      return { ...toOutcome({ ...raw, payload: inputData }), verdict: reportedVerdict(verdict, true) };
     }
+    for (const [label, target] of pending) this.#resumeLabels[label] = target;
+    const frozen = gate.decisive ? { verdict: reportedVerdict(verdict, true) } : {};
     // Applied once the step has run without failing, suspended and bailed included, as the
     // default engine applies `contextMutations.stateUpdate` whenever the attempt returned.
     if (raw['status'] !== 'failed' && stateUpdate !== undefined) Object.assign(this.#state, stateUpdate);
@@ -480,7 +526,7 @@ export class MastraStepRunner implements StepRunner {
     };
     // `resumedAt` tells the leaf the attempt is recorded as resumed (truthy resume data), so it
     // keeps the suspended record's start; absent, the record is a fresh start (`handlers/step.ts:166-175`).
-    const outcome = toOutcome(host);
+    const outcome = { ...toOutcome(host), ...frozen };
     return feed.record === undefined ? outcome : { ...outcome, resumedAt: feed.record.resumedAt };
   }
 

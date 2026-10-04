@@ -13,8 +13,9 @@ import {
 import type { EntryPath } from '../names.js';
 import { scopeOf, viewOf, type RunScope } from '../scope.js';
 import { StepTimeoutError } from '../timeout.js';
-import type { Exits, FailureToken, FlowToken, StepOutcome, StepRecord, StepSource } from '../types.js';
-import type { Gadget, GadgetContext } from './types.js';
+import type { StepPreemptedError } from '../preempt.js';
+import type { Exits, FailureToken, FlowToken, PreemptedToken, StepOutcome, StepRecord, StepSource } from '../types.js';
+import type { ArmPreemption, Gadget, GadgetContext } from './types.js';
 
 /**
  * Node's timer ceiling. Mastra waits with a bare `setTimeout`, and Node resets any delay above
@@ -64,6 +65,17 @@ export const MAX_RETRIES = 100;
  * before an entry. A retry is not gated: `executeStepWithRetry` never looks at the signal between
  * attempts (`default.ts:455-460`), so a retrying step keeps retrying, and the step's own
  * `abortSignal` (`scope.signal`) is what cuts a well-behaved step short.
+ *
+ * **An arm of a deciding block** ([ADR 0014]) — `ctx.preempt` set, by a `race` / `quorum` of two or
+ * more arms — gains one more branch on every attempt, retries included: `preempted`, with the permit
+ * and quotas back. Each attempt hands the runner `StepCall.preempt` and is always called: **whether
+ * the attempt was preempted is the host's verdict** (`StepOutcome.verdict`), frozen once, never read
+ * here from a signal. A `preempted` verdict leaves by that branch and records `canceled` with
+ * `reason`, the block's `StepPreemptedError`; with `started: false` (the block had decided before
+ * the attempt: a loser in a retry delay finishes the delay first, row 108; one behind a quota or a
+ * block slot enters only once it has drawn them, row 110) the record takes no start of its own. An
+ * `own` verdict stands even when the block decides afterwards — a surplus success, a suspension the
+ * join rewrites. Without `ctx.preempt` the leaf emits exactly what it did before M7b.
  */
 export const stepGadget: Gadget = (entry, next, ctx) => {
   if (entry.kind !== 'step') throw new Error(`stepGadget received a '${entry.kind}' entry`);
@@ -91,7 +103,7 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
   }
 
   const source = entry.source ?? 'step';
-  const { names, path, viewPath, exits, cancel, permits } = ctx;
+  const { names, path, viewPath, exits, cancel, permits, preempt } = ctx;
   const inPlace = place<FlowToken>(names.entryIn(path, entry.id));
   const transitions: Transition[] = [];
   if (cancel !== undefined) transitions.push(sweep(names.entryTransition(path, entry.id, 'cancel'), inPlace, cancel, exits, entry.id, viewPath));
@@ -164,6 +176,10 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
     const outcomes: Out[] = [next, exits.failed, exits.bailed, exits.suspended, exits.paused].map(branch);
     if (retry !== undefined) outcomes.push(branch(retry));
     if (timedOut !== undefined) outcomes.push(branch(timedOut.place));
+    // An arm of a deciding block ([ADR 0014]): one more branch on every attempt, retries included,
+    // with the permit and quotas back like every other. Not conditioned on the decision in the arcs —
+    // the action takes it only once the block's signal has fired (hence no liveness claim on it).
+    if (preempt !== undefined) outcomes.push(branch(preempt.place));
 
     const run = Transition.builder(
       attempt === 0 ? names.entryRun(path, entry.id) : names.entryTransition(path, entry.id, `run-${attempt}`),
@@ -183,6 +199,7 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
           permits,
           ...(returned.length > 0 ? { returned } : {}),
           ...(timeoutMs !== undefined && timedOut !== undefined ? { timeout: { ms: timeoutMs, ...timedOut } } : {}),
+          ...(preempt === undefined ? {} : { preempt }),
         }),
       );
     if (attempt === 0 && cancel !== undefined && demands.length === 0) run.inhibitor(cancel);
@@ -538,6 +555,15 @@ interface StepActionSpec {
   readonly timeout?:
     | { readonly ms: number; readonly kind: 'retry'; readonly place: Place<RetryToken> }
     | { readonly ms: number; readonly kind: 'final'; readonly place: Place<FailureToken> };
+  /**
+   * The arm's preemption ([ADR 0014]) and its `preempted` branch, on every attempt of an arm of a
+   * `race` / `quorum` block; absent everywhere else. The action hands the runner
+   * `StepCall.preempt = scope.preemption(block)` — passed on, never read — and takes the branch
+   * exactly when the runner's frozen verdict is `preempted`: it writes the arm's record `canceled`
+   * with that verdict's `reason` and deposits a {@link PreemptedToken} into `place`, permit and
+   * quotas back.
+   */
+  readonly preempt?: ArmPreemption;
 }
 
 const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bailed', 'suspended', 'paused']);
@@ -551,7 +577,7 @@ const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bai
  * duplicate tokens and satisfy none of the `xor`'s branches.
  */
 export function stepAction(spec: StepActionSpec): TransitionAction {
-  const { stepId, path, source, attempt, from, next, exits, retry, permits, returned = [], timeout } = spec;
+  const { stepId, path, source, attempt, from, next, exits, retry, permits, returned = [], timeout, preempt } = spec;
   return async (tctx) => {
     const incoming = tctx.input(from) as RetryToken;
     // The permit — and every quota token ([ADR 0012]) — goes back with whichever branch is
@@ -567,6 +593,37 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     // Mastra stamps the step's start before its retry loop, `Date.now()` at `handlers/step.ts:166`,
     // so the first attempt reads the clock before the call and the stamp rides the retry token.
     const fresh = incoming.startedAt ?? scope.epochNow();
+    const origin = withIndex({ stepId, path }, incoming);
+
+    // The deciding block's preemption ([ADR 0014]), one signal per block per segment, handed to the
+    // runner and never read here: the runner freezes the attempt's verdict, this maps it.
+    const preemption = preempt === undefined ? undefined : scope.preemption(preempt.block);
+    const leavePreempted = async (outcome: StepOutcome, reason: StepPreemptedError, started: boolean): Promise<void> => {
+      // The validated input, when the discarded outcome reported one; the incoming data otherwise.
+      const validated = 'payload' in outcome ? { stepPayload: outcome.payload } : {};
+      // An attempt the host never started takes no start of its own; a retry keeps the first one.
+      const startedAt = incoming.startedAt ?? (started ? fresh : undefined);
+      const record = {
+        ...(resumed && prior !== undefined ? withoutCompletion(prior) : {}),
+        status: 'canceled',
+        reason,
+        payload: 'stepPayload' in validated ? validated.stepPayload : incoming.data,
+        ...(startedAt === undefined ? {} : { startedAt }),
+        endedAt: scope.epochNow(),
+        ...metadataOf(prior, incoming),
+      } as StepRecord;
+      scope.recordStepResult(stepId, record);
+      const observed = scope.observe({ kind: 'step-settled', stepId, path, ...withIndex({}, incoming), record });
+      if (observed !== undefined) await observed;
+      const token: PreemptedToken = {
+        ...origin,
+        reason,
+        ...validated,
+        ...(startedAt === undefined ? {} : { stepStartedAt: startedAt }),
+      };
+      tctx.output(preempt!.place, token);
+      release();
+    };
 
     // The attempt's deadline ([ADR 0013]), armed on the run's clock before the call. Its error is
     // the signal's reason and, should it fire, the attempt's failure.
@@ -585,6 +642,7 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
         ...(incoming.iteration === undefined ? {} : { iteration: incoming.iteration }),
         startedAt: fresh,
         ...(deadline === undefined ? {} : { deadline: deadline.signal }),
+        ...(preemption === undefined ? {} : { preempt: preemption }),
       });
       if (result === null || typeof result !== 'object' || !OUTCOME_STATUSES.has((result as { status: unknown }).status as string)) {
         throw new Error(`runner returned an unrecognised outcome for step '${stepId}': ${describe(result)}`);
@@ -596,7 +654,8 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
       (value) => ({ ok: true as const, value }),
       (error: unknown) => ({ ok: false as const, error }),
     );
-    let timedOut = false;
+    // Whether the deadline beat the step, for a runner that freezes no verdict ([ADR 0013]).
+    let deadlineFirst = false;
     if (deadline !== undefined) {
       // The step against its deadline. A run abort before expiry disarms the deadline — `expired`
       // then never resolves — so the step's own outcome stands. Once it fires the outcome is the
@@ -604,7 +663,7 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
       // permit and quotas stay held and a retry never overlaps its predecessor.
       const winner = await Promise.race([running.then(() => 'step' as const), deadline.expired.then(() => 'deadline' as const)]);
       if (winner === 'step') deadline.disarm();
-      else timedOut = true;
+      else deadlineFirst = true;
     }
     const settled = await running;
 
@@ -621,10 +680,24 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
       release();
       return;
     }
+    // The host's verdict ([ADR 0014]), frozen once in the runner: `preempted` discards the step's
+    // outcome, whatever it was, and leaves by the arm's `preempted` branch — never retried, and never
+    // a timeout, whatever fired after (a deadline firing on a loser changes nothing). `own` stands
+    // even when the deadline fired after the freeze. Without a verdict the deadline's race decides.
+    const verdict = settled.ok ? settled.value.verdict : undefined;
+    if (settled.ok && verdict?.kind === 'preempted' && preempt !== undefined) {
+      await leavePreempted(settled.value, verdict.reason, verdict.started);
+      return;
+    }
+    const timedOut = expiry !== undefined && (verdict === undefined ? deadlineFirst : verdict.kind === 'timedOut');
     if (timedOut) {
       // The step's own result, late, is discarded ([ADR 0013]): a timeout is a plain failure,
       // retryable like a thrown error, and leaves by the `timedOut` branch below.
       outcome = { status: 'failed', error: expiry };
+    } else if (verdict !== undefined && verdict.kind !== 'own') {
+      // A verdict this step cannot take — a timeout without a deadline, a preemption off an arm —
+      // is the runner's defect, failed by name rather than recorded as the step's outcome.
+      outcome = { status: 'failed', error: new Error(`runner reported a '${verdict.kind}' verdict for step '${stepId}', which has no ${verdict.kind === 'timedOut' ? 'timeout' : 'deciding block'}`) };
     } else if (settled.ok) {
       outcome = settled.value;
     } else {
@@ -651,16 +724,7 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
       return;
     }
 
-    // Carry-over (`docs/divergences.md` row 48): Mastra starts a step's record from the prior record
-    // under the same id minus its completion fields (`handlers/step.ts:170-178`,
-    // `utils.ts:759-775`), and replaces `metadata` only when the call has an iteration count. So a
-    // loop's `iterationCount` survives a later `.then(s)` of the same step, and the next loop over
-    // it continues from there.
-    const priorMeta = prior?.metadata;
-    const metadata = {
-      ...(incoming.iteration === undefined ? (priorMeta?.iterationCount === undefined ? {} : { iterationCount: priorMeta.iterationCount }) : { iterationCount: incoming.iteration }),
-      ...(incoming.foreachIndex === undefined ? {} : { foreachIndex: incoming.foreachIndex }),
-    };
+    // Carry-over (row 48) is `metadataOf` below.
     // A suspended or paused step has not ended: Mastra stamps `suspendedAt` and no `endedAt`
     // (`handlers/step.ts:516-526`).
     const now = scope.epochNow();
@@ -675,7 +739,7 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     const kept = resumed && prior !== undefined ? withoutCompletion(prior) : {};
     // `resumedAt` is the runner's word to the leaf, not a record field: Mastra's own `resumedAt`
     // rides on the host record, which is what the codec writes.
-    const { resumedAt: _resumedAt, ...reported } = outcome;
+    const { resumedAt: _resumedAt, verdict: _verdict, ...reported } = outcome;
     const payload =
       recordedResumed && prior !== undefined && Object.hasOwn(prior, 'payload')
         ? prior.payload
@@ -688,7 +752,7 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
       payload,
       ...(startedAt === undefined ? {} : { startedAt }),
       ...when,
-      ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+      ...metadataOf(prior, incoming),
     } as StepRecord;
     scope.recordStepResult(stepId, record);
     // The step's final record, for its result event ([ADR 0008]) — after the write, before the
@@ -696,7 +760,6 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     const observed = scope.observe({ kind: 'step-settled', stepId, path, ...withIndex({}, incoming), record });
     if (observed !== undefined) await observed;
 
-    const origin = withIndex({ stepId, path }, incoming);
     // A foreach's aggregate record takes the deciding item's payload and its own start
     // (`handlers/step.ts:166,174`, kept by `handlers/control-flow.ts:1360-1369,1406`), which is not
     // the item's dispatch when a run budget held it in its lane.
@@ -749,6 +812,22 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
         return;
     }
   };
+}
+
+/**
+ * Carry-over (`docs/divergences.md` row 48): Mastra starts a step's record from the prior record
+ * under the same id minus its completion fields (`handlers/step.ts:170-178`, `utils.ts:759-775`),
+ * and replaces `metadata` only when the call has an iteration count. So a loop's `iterationCount`
+ * survives a later `.then(s)` of the same step, and the next loop over it continues from there.
+ * `{}` when there is nothing to stamp.
+ */
+function metadataOf(prior: StepRecord | undefined, incoming: FlowToken): { metadata?: { iterationCount?: number; foreachIndex?: number } } {
+  const priorMeta = prior?.metadata;
+  const metadata = {
+    ...(incoming.iteration === undefined ? (priorMeta?.iterationCount === undefined ? {} : { iterationCount: priorMeta.iterationCount }) : { iterationCount: incoming.iteration }),
+    ...(incoming.foreachIndex === undefined ? {} : { foreachIndex: incoming.foreachIndex }),
+  };
+  return Object.keys(metadata).length > 0 ? { metadata } : {};
 }
 
 /**

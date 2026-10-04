@@ -3,7 +3,7 @@ import { PetriNet, Transition, and, enumerateBranches, exactly, one, outPlace, p
 import type { MarkingState } from 'libpetri/verification';
 import { compile } from '../../src/compiler/index.js';
 import { describeClaim, livenessTargets, segmentInitialMarking, verify } from '../../src/verify/index.js';
-import { assertSameNet, executionWitnessesApply, executionWitnesses, stubOutputs, type ClaimResult } from '../../src/verify/witness.js';
+import { assertSameNet, avoidingPreemption, executionWitnessesApply, executionWitnesses, stubOutputs, type ClaimResult } from '../../src/verify/witness.js';
 import type { CompiledWorkflow, EntryDescription, StepDescription } from '../../src/compiler/types.js';
 
 /**
@@ -260,5 +260,81 @@ describe('assertSameNet', () => {
     ] as const) {
       expect(() => assertSameNet(original, changed), what).toThrow(/changed the net/);
     }
+  });
+});
+
+describe("a deciding arm's preempted branch is never taken (ADR 0014)", () => {
+  const race = (n: number, k: number, extra: Partial<StepDescription> = {}): CompiledWorkflow =>
+    compile(wf({ kind: 'parallel', id: 'q', arms: ['a', 'b', 'c', 'd'].slice(0, n).map((id) => step(id, extra)), decision: { k } }, step('next')));
+
+  // Breaks if: `avoidingPreemption` offers the policy a child writing an avoided place, or maps its
+  // answer back to the wrong index.
+  it('avoidingPreemption offers only the children writing no avoided place, and maps the answer back', () => {
+    const [x, y, z] = [place<unknown>('x'), place<unknown>('y'), place<unknown>('z.preempted')];
+    const children: Out[] = [outPlace(x), and(outPlace(z), outPlace(y)), outPlace(y)];
+    const offered: number[] = [];
+    const last = avoidingPreemption(new Set(['z.preempted']), (_, c) => {
+      offered.push(c.length);
+      return c.length - 1;
+    });
+    expect(last('t', children)).toBe(2);
+    expect(avoidingPreemption(new Set(['z.preempted']), () => 0)('t', children)).toBe(0);
+    expect(avoidingPreemption(new Set(['z.preempted']), () => 1)('t', children)).toBe(2);
+    expect(offered).toEqual([2]);
+    // Nothing avoided: the policy itself.
+    const own = (): number => 1;
+    expect(avoidingPreemption(new Set(), own)).toBe(own);
+  });
+
+  // Breaks if: the witness runs take an arm's `preempted` branch (the 'last' policy did: it is the
+  // last child of every arm attempt), so `short` is witnessed by preempting arms before any decision —
+  // a run no host can make. Pin: short's witness contains no collect-preempted firing, and every
+  // completion of an arm attempt deposits an ordinary outcome.
+  it.each([[3, 1], [3, 2], [3, 3], [2, 1]] as const)('n = %i, k = %i: met and short are witnessed by genuine outcomes', async (n, k) => {
+    const compiled = race(n, k);
+    const d = compiled.decisions[0]!;
+    const targets = livenessTargets(compiled);
+    const witnesses = await executionWitnesses(compiled, segmentInitialMarking(compiled, 'closed'), targets);
+    expect([...witnesses.keys()].sort()).toEqual(targets.map((t) => t.transition).sort());
+    const preempted = new Set(d.preempted);
+    for (const target of [d.met, d.shortTransition]) {
+      const w = witnesses.get(target)!;
+      expect(w.route, target).toBe('execution');
+      const steps = w.counterexampleTransitions;
+      for (const c of d.collectPreempted) expect(steps.some((s) => s === c || s === `complete:${c}`), `${target} fires ${c}`).toBe(false);
+      for (const m of w.counterexampleTrace) for (const p of m.placesWithTokens()) expect(preempted.has(p.name), `${target}: ${p.name} marked`).toBe(false);
+      const taken = replay(compiled.net, w, transitionNamed(compiled, target));
+      for (const branch of taken) for (const p of branch) expect(preempted.has(p), `${target} took ${p}`).toBe(false);
+      expect(String(w.report)).toContain('no preempted branch taken');
+    }
+    // short is reached by n − k + 1 genuine misses, collected by the ordinary miss collects.
+    const short = witnesses.get(d.shortTransition)!.counterexampleTransitions;
+    const misses = short.filter((s) => d.collectMiss.includes(s));
+    expect(misses.length).toBeGreaterThanOrEqual(n - k + 1);
+  });
+});
+
+describe('execution witnesses of a decision: no pause on a plain-step race', () => {
+  // Breaks if: the witness policies may take an attempt's `paused` branch when a failed, bailed or
+  // suspended one exists ('last' did: `paused` is the last ordinary child of every attempt), so
+  // `short` is witnessed by pauses — which only a nested-workflow step can produce, never a plain one.
+  it.each([[3, 1], [3, 2], [2, 1]] as const)('n = %i, k = %i: short is witnessed with no collect-pause', async (n, k) => {
+    const compiled = compile({
+      id: 'witness',
+      entries: [{ kind: 'parallel', id: 'q', arms: ['a', 'b', 'c'].slice(0, n).map((id) => ({ kind: 'step', id }) as StepDescription), decision: { k } }, { kind: 'step', id: 'next' }],
+    });
+    const d = compiled.decisions[0]!;
+    const pause = d.collectMiss.find((t) => t.endsWith('collect-pause'));
+    expect(pause).toBeDefined();
+    const targets = livenessTargets(compiled);
+    const witnesses = await executionWitnesses(compiled, segmentInitialMarking(compiled, 'closed'), targets);
+    for (const target of [d.met, d.shortTransition]) {
+      const w = witnesses.get(target)!;
+      expect(w.route, target).toBe('execution');
+      const steps = w.counterexampleTransitions;
+      expect(steps.some((s) => s === pause || s === `complete:${pause}`), `${target} fires ${pause}`).toBe(false);
+    }
+    const short = witnesses.get(d.shortTransition)!.counterexampleTransitions;
+    expect(short.filter((s) => d.collectMiss.includes(s)).length).toBeGreaterThanOrEqual(n - k + 1);
   });
 });

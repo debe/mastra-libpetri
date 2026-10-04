@@ -13,7 +13,7 @@ import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { Z3Unavailable } from 'libpetri/verification';
 import { nestedWorkflows, verifyMastraWorkflow, workflowsIn, type MastraVerifyOptions } from './index.js';
-import { describeClaim, FAMILIES, segmentLabel, type Family, type VerificationReport } from './verify/index.js';
+import { describeClaim, describeUnclaimedTarget, FAMILIES, segmentLabel, type Family, type VerificationReport } from './verify/index.js';
 
 export const USAGE = `usage: mastra-libpetri verify <module-path> [options]
 
@@ -146,7 +146,8 @@ export function routeMix(report: VerificationReport): string {
 
 /**
  * The text for one report: a `describeClaim` line per claim that does not hold, then the summary —
- * claims held, `k`, segments, families, route mix, and every unclaimed place with its reason.
+ * claims held, `k`, segments, families, route mix, every unclaimed place and every unclaimed liveness
+ * target ([ADR 0014]) with its reason.
  */
 export function formatReport(named: NamedReport): string {
   const { report } = named;
@@ -161,6 +162,8 @@ export function formatReport(named: NamedReport): string {
     `  routes: ${routeMix(report)}`,
     report.unclaimed.length === 0 ? '  unclaimed places: none' : `  unclaimed places (${report.unclaimed.length}):`,
     ...report.unclaimed.map((u) => `    ${u.place} — ${u.why}`),
+    report.unclaimedTargets.length === 0 ? '  unclaimed liveness targets: none' : `  unclaimed liveness targets (${report.unclaimedTargets.length}):`,
+    ...report.unclaimedTargets.map((u) => `    ${describeUnclaimedTarget(u)}`),
   ];
   return lines.join('\n');
 }
@@ -194,6 +197,7 @@ export function reportJson(named: NamedReport): unknown {
       holds: c.holds,
     })),
     unclaimed: report.unclaimed,
+    unclaimedTargets: report.unclaimedTargets,
   };
 }
 

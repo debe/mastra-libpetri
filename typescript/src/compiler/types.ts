@@ -1,5 +1,6 @@
 import type { Place, PetriNet, PrecompiledNet } from 'libpetri';
 import type { EntryPath } from './names.js';
+import type { StepPreemptedError } from './preempt.js';
 
 /**
  * Where a unit of work comes from. The net shape is identical for every source — one step is
@@ -96,6 +97,13 @@ export type EntryDescription =
       readonly arms: readonly StepDescription[];
       /** At most this many arms in flight, admitted in arm order — see {@link BlockConcurrency}. */
       readonly concurrency?: BlockConcurrency;
+      /**
+       * A counted decision on the block ([ADR 0014]) — Layer 3, from `init().race` / `init().quorum`:
+       * the block succeeds once `k` arms have succeeded and fails once `n − k + 1` have not, then
+       * preempts every unsettled arm and waits for all `n`. Absent, the block is today's parallel and
+       * compiles, and hashes, exactly as before M7b.
+       */
+      readonly decision?: BlockDecision;
     }
   /**
    * `.branch([[cond, step], ...])` — **inclusive**: conditions are evaluated concurrently and
@@ -149,6 +157,34 @@ export type EntryDescription =
  * unannotated one; the adapter passes the value through as the author wrote it.
  */
 export type BlockConcurrency = number;
+
+/**
+ * A `.parallel()` block's counted decision ([ADR 0014]): `race` is `{ k: 1 }`, `quorum(k)` is `{ k }`.
+ * `n` is the block's arm count, never stored. `k` is a whole number in [1, n] — the adapter refuses
+ * anything else as `quorum-value`, and an empty block as `race-empty`; the compiler throws on either,
+ * naming the block, in case a hand-built description slips past.
+ *
+ * **What counts.** A `success` is a hit. A `failed`, `bailed`, `paused` or `suspended` arm, and an arm
+ * preempted after the decision, is a miss (`Promise.any`). The block never suspends (wave 1).
+ */
+export interface BlockDecision {
+  readonly k: number;
+}
+
+/**
+ * An arm that left by its `preempted` branch ([ADR 0014]): its attempt ran after the block decided
+ * and its outcome was discarded, or the attempt saw the fired signal and never ran. The leaf has
+ * already written the arm's `canceled` record with `reason` (a {@link StepPreemptedError}, the
+ * preemption signal's own reason); the block's collect counts the token as a miss and the decision's
+ * absorb takes it.
+ */
+export interface PreemptedToken extends Origin {
+  readonly reason: StepPreemptedError;
+  /** The step's validated input, when an attempt ran — for the `canceled` record's `payload`. */
+  readonly stepPayload?: unknown;
+  /** When the step's first attempt started, when one did. */
+  readonly stepStartedAt?: number;
+}
 
 export interface WorkflowDescription {
   readonly id: string;
@@ -218,6 +254,28 @@ export type StepOutcome = (
    * records as a fresh start: the leaf then stamps a fresh `startedAt` (row 82).
    */
   readonly resumedAt?: number;
+  /**
+   * The attempt's verdict, frozen by the host at one point ([ADR 0014], [ADR 0013]) — present when
+   * the call carried a `deadline` or a `preempt`, and the host decided the attempt against them. The
+   * leaf maps it to a branch and never reads a signal to second-guess it:
+   *
+   * - `own` — the status above stands, whatever fires later. Every effect the attempt had (state,
+   *   resume labels, scorers, writer chunks) was applied by the host. A success a block's decision
+   *   reaches only after this point is a surplus success, not a loser.
+   * - `timedOut` — the deadline fired first: the leaf discards the status above and takes its
+   *   `timedOut` branch with its own `StepTimeoutError`. The host applied no effect.
+   * - `preempted` — the block's preemption fired before the run's abort and the deadline: the leaf
+   *   discards the status above and leaves by the arm's `preempted` branch, recording `canceled`
+   *   with `reason`. `started` is false when the host did not start the step at all (the block had
+   *   decided before the attempt); the record then takes no start of its own. No effect applied.
+   *
+   * Absent — a runner that freezes nothing — the leaf decides a timeout from the deadline itself
+   * ([ADR 0013]) and never takes the `preempted` branch: a preemption is only ever the host's verdict.
+   */
+  readonly verdict?:
+    | { readonly kind: 'own' }
+    | { readonly kind: 'timedOut' }
+    | { readonly kind: 'preempted'; readonly reason: StepPreemptedError; readonly started: boolean };
 };
 
 /**
@@ -233,7 +291,19 @@ export type StepRecord =
    * (`handlers/control-flow.ts:1164-1169`). Only a combinator writes it — it is not a
    * `StepOutcome`, so a runner cannot return it.
    */
-  | ({ readonly status: 'canceled'; readonly output?: unknown; readonly host?: unknown } & Partial<RecordFields>)
+  | ({
+      readonly status: 'canceled';
+      readonly output?: unknown;
+      readonly host?: unknown;
+      /**
+       * Why it stopped, when that was not the run's cancel: a `race` / `quorum` loser ([ADR 0014]),
+       * stamped by the leaf on its `preempted` branch, or by the join when it rewrites a suspended
+       * loser. Absent on a loop's or a foreach's `canceled` record and on every run-cancel record.
+       * `step-result.ts` writes it as the Mastra row's `error`, and restores it from a canceled row
+       * whose `error.name` is `'StepPreemptedError'` (M7b W1 C).
+       */
+      readonly reason?: StepPreemptedError;
+    } & Partial<RecordFields>)
   /**
    * A sleep that has begun waiting. Mastra writes `{status: 'waiting', payload, startedAt}` when a
    * sleep begins (`handlers/entry.ts:602-609`) and leaves it there if the run is canceled mid-wait;
@@ -328,6 +398,24 @@ export interface StepCall extends RunView {
    * and writes the `timedOut` branch itself.
    */
   readonly deadline?: AbortSignal;
+  /**
+   * The deciding block's preemption ([ADR 0014]): present exactly when this attempt runs as an arm of
+   * a `race` / `quorum` block of two or more arms — every attempt of the arm, retries included — and
+   * aborted, with a {@link StepPreemptedError}, when the block decides (`met` or `short`), by
+   * `RunScope.preempt`. Never by
+   * the run's abort, and never by a deadline. One signal per block per segment, shared by its arms.
+   *
+   * The runner adds it as one more source of the attempt's gate (`attemptGate`), beside `abortSignal`
+   * and `deadline`. The step's own signal aborts once, with the reason of the first source to fire.
+   * **The outcome is the host's verdict** (`StepOutcome.verdict`), frozen once, when the step settles,
+   * and the first of the run's abort, the deadline and the preemption to fire decides it: the run's
+   * abort lets the step's own outcome stand, the deadline is a timeout, the preemption is `preempted`.
+   * A later signal never re-decides, and nothing after the freeze changes it.
+   * Called with this signal already fired (and the run not aborted), the runner does not start the
+   * step and returns `preempted` at once; with the run aborted it runs the step, as Mastra's default
+   * engine runs a retry under an aborted signal.
+   */
+  readonly preempt?: AbortSignal;
 }
 
 /**
@@ -433,6 +521,17 @@ export interface StepRunner {
    * kernel refuses a marked workflow run with a runner that lacks it.
    */
   checkpoint?(event: CheckpointEvent): Promise<void>;
+
+  /**
+   * Drops what the runner holds for `stepId`'s suspension ([ADR 0014]): its resume labels. Called
+   * through `RunScope.forgetSuspension` by a `race` / `quorum` join when it rewrites a suspended
+   * loser's record `canceled`, so the finished run names no label that `Run.resume()` could take
+   * to an arm that is no longer suspended. Optional: a runner that keeps no labels needs none.
+   *
+   * It reaches only this run's own bookkeeping. A loser that is a **nested workflow** leaves its
+   * child run's own snapshot suspended in storage — a residual ([ADR 0014], row 107).
+   */
+  forgetSuspension?(stepId: string): void;
 }
 
 /**
@@ -781,6 +880,72 @@ export interface PoolCommon {
 }
 
 /**
+ * One `race` / `quorum` block as the verifier sees it ([ADR 0014], amended 2026-10-04): its counted
+ * decision's places and transitions, by name, as `compiler/blueprints/first-k.ts` emitted them, so
+ * `verify/decision.ts` can check them on the arcs and `verify/claims.ts` can name its targets —
+ * declared by the gadget, never derived from the arcs the check inspects.
+ *
+ * ```text
+ * fork:                     in -> armIn_* (or q_0 under concurrency) + permit
+ * collect-i:                armDone_i                 -> okSeen
+ * collect-{err,bail,susp,pause}, collect-preempted-i  -> miss
+ * met:                      permit + exactly(k, okSeen)       -> won    (action: scope.preempt(path, reason))
+ * short:                    permit + exactly(n-k+1, miss)     -> short  (action: scope.preempt(path, reason))
+ * absorb-{ok,miss}-won:     one(okSeen | miss) + read(won)    -> settled   (omitted when k = n)
+ * absorb-{ok,miss}-short:   one(okSeen | miss) + read(short)  -> settled   (omitted when k = 1)
+ * join-met:                 won   + exactly(n-k, settled)     -> next
+ * join-short:               short + exactly(k-1, settled)     -> exits.failed
+ * ```
+ *
+ * **What is omitted, and why.** A count of 0 omits its arc, and a transition that could never fire
+ * is not emitted: when `k = n`, `met` takes every arrival, so nothing is left to absorb after it and
+ * the `absorb-*-won` pair is omitted; when `k = 1`, `short` takes every arrival (n misses), so the
+ * `absorb-*-short` pair is omitted. `settled` is bounded by `max(n − k, k − 1)` (`settledBound`);
+ * that is 0 only for `n = 1`, where every absorb is omitted and `settled` with them — the place is
+ * not emitted and {@link settled} is `undefined`. For `n = 1` no other arm can decide first, so the
+ * arm gets no preemption at all: no `preempted` place, no `collect-preempted`, no `StepCall.preempt`.
+ *
+ * No `arrived`, no reset: every decision place is monotone, so VER-004 splits no collect (the W0
+ * spike; the ADR's amendment).
+ */
+export interface DecisionSite {
+  /** The block's top-level path, `[i]`. */
+  readonly path: EntryPath;
+  readonly blockId: string;
+  readonly k: number;
+  readonly n: number;
+  /** The one-token decision right, seeded by `fork`, consumed by `met` or `short`. */
+  readonly permit: string;
+  readonly okSeen: string;
+  readonly miss: string;
+  readonly won: string;
+  readonly short: string;
+  /** `undefined` exactly when `n = 1` (bound 0, every absorb omitted). */
+  readonly settled: string | undefined;
+  /**
+   * Arm `i`'s `preempted` place, arm order: produced only by arm `i`'s leaf, consumed by
+   * `collectPreempted[i]`. Empty when `n = 1`.
+   */
+  readonly preempted: readonly string[];
+  readonly met: string;
+  /** The `short` transition's name (the place shares the role name, in the place namespace). */
+  readonly shortTransition: string;
+  /** The success collects, arm order: the only producers of `okSeen`. */
+  readonly collectOk: readonly string[];
+  /** Every miss collect: `collect-err`, `-bail`, `-susp`, `-pause`, then `collect-preempted-i` in arm order. */
+  readonly collectMiss: readonly string[];
+  /** Arm order; empty when `n = 1`. */
+  readonly collectPreempted: readonly string[];
+  /**
+   * The absorbs emitted: `absorb-ok-won`, `absorb-miss-won` unless `k = n`, then `absorb-ok-short`,
+   * `absorb-miss-short` unless `k = 1` — four, two (`k = n` or `k = 1`, `n ≥ 2`) or none (`n = 1`).
+   */
+  readonly absorbs: readonly string[];
+  readonly joinMet: string;
+  readonly joinShort: string;
+}
+
+/**
  * A gadget's claim about how many tokens one of its places can hold ([ADR 0009]). A place nobody
  * claims for is claimed at 1 — so a gadget states only its exceptions, and a new place is held to
  * the strictest bound until someone says otherwise.
@@ -893,6 +1058,8 @@ export interface CompiledWorkflow {
   readonly boundaries: readonly BoundarySite[];
   /** The entries after which a checkpoint is taken, as the description marked them ([ADR 0010]). */
   readonly checkpoints: readonly number[];
+  /** Every `race` / `quorum` block, in emission order ([ADR 0014]); empty when there is none. */
+  readonly decisions: readonly DecisionSite[];
   /** Stable over structure alone, so it keys a compile cache across runs. */
   readonly structuralHash: string;
 }

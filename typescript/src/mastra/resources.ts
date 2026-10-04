@@ -131,3 +131,154 @@ export function resourcesOf(step: unknown): StepResources | undefined {
   }
   return undefined;
 }
+
+/**
+ * Where `init().race` / `init().quorum` keep a block's minted decision ([ADR 0014]): a key of the
+ * fresh `metadata` object they put in the `.parallel()` call's options. Mastra keeps `metadata` by
+ * reference in the step flow entry (`toEntryOptionFields`, `workflow.ts:647-653`), so the adapter
+ * finds the very {@link Decision} here; `JSON.stringify` drops a symbol key, so the serialized graph
+ * stays a plain `{ type: 'parallel' }` and the default engine never sees it.
+ *
+ * Module-private in the package's sense, as {@link STEP_RESOURCES}: exported for the adapter and the
+ * tests, never from `mastra/index.ts`.
+ */
+export const BLOCK_DECISION: unique symbol = Symbol('mastra-libpetri.blockDecision');
+
+/** Guards {@link Decision}'s constructor: only {@link race} and {@link quorum} mint one. */
+const mintedDecision: unique symbol = Symbol('mastra-libpetri.decision');
+
+/**
+ * A minted counted decision ([ADR 0014]): `k` of the arms the factory was given must succeed. **The
+ * arms are kept by identity**, so the adapter can refuse an entry whose arms are not exactly these
+ * arms in this order (`blueprint-arms`) — a decision copied onto another `.parallel()` by hand. An
+ * agent or tool arm reaches the entry without its Step object, so the adapter compares its ref and
+ * options by identity instead (`blockDecision` in `adapt.ts`). A decision spread into two
+ * `.parallel()` calls is refused as `blueprint-reused`.
+ */
+export class Decision {
+  /** @internal Use {@link race} or {@link quorum}. */
+  constructor(
+    key: typeof mintedDecision,
+    readonly kind: 'race' | 'quorum',
+    readonly k: number,
+    /** The Step objects the factory was given, in order. */
+    readonly arms: readonly object[],
+  ) {
+    if (key !== mintedDecision) throw new TypeError('a Decision is made by init().race or init().quorum');
+  }
+
+  /** `n`: the arm count. */
+  get n(): number {
+    return this.arms.length;
+  }
+}
+
+/**
+ * What `race` and `quorum` take beside their arms: Mastra's own `.parallel()` options. `metadata` is
+ * copied into a fresh object — so the author's object is never written to — with Layer 2 keys such
+ * as `concurrency` ([ADR 0011]) kept as they are.
+ */
+export interface DecisionOptions {
+  readonly id?: string;
+  readonly description?: string;
+  readonly metadata?: Record<string, unknown>;
+}
+
+/** The options `race` / `quorum` hand back, to spread into `.parallel()` with the arms. */
+export interface DecisionEntryOptions {
+  readonly id?: string;
+  readonly description?: string;
+  readonly metadata: Record<string, unknown> & { readonly [BLOCK_DECISION]: Decision };
+}
+
+/**
+ * `race(arms, options?)` ([ADR 0014]): `quorum(1, arms, options)` — the first arm to **succeed** wins;
+ * a failed, bailed, paused or suspended arm is a miss, and the block fails once every arm has missed.
+ * Returns `[arms, options]` for `wf.parallel(...race([a, b, c], { id }))`. Refused at once:
+ * `race-empty` (no arms).
+ */
+export function race<const TArms extends readonly object[]>(
+  arms: TArms,
+  options?: DecisionOptions,
+): [arms: TArms, options: DecisionEntryOptions] {
+  return mint('race', 1, arms, options);
+}
+
+/**
+ * `quorum(k, arms, options?)` ([ADR 0014]): the block succeeds once `k` arms have succeeded and fails
+ * once `n − k + 1` have not; then every unsettled arm is preempted and awaited, and each loser is
+ * recorded `canceled`. Refused at once: `race-empty` (no arms), `quorum-value` (`k` not a whole number
+ * in [1, n]), `blueprint-arms` (an arm listed twice, by object or by id).
+ */
+export function quorum<const TArms extends readonly object[]>(
+  k: number,
+  arms: TArms,
+  options?: DecisionOptions,
+): [arms: TArms, options: DecisionEntryOptions] {
+  return mint('quorum', k, arms, options);
+}
+
+/**
+ * Checks and mints one decision, and builds the `.parallel()` options carrying it. The checks run in
+ * the adapter's order — `race-empty`, `quorum-value`, `blueprint-arms` — so a refusal names the same
+ * reason at either point.
+ */
+function mint<const TArms extends readonly object[]>(
+  factory: Decision['kind'],
+  k: unknown,
+  arms: TArms,
+  options: DecisionOptions | undefined,
+): [arms: TArms, options: DecisionEntryOptions] {
+  const label = options?.id !== undefined ? `${factory}('${String(options.id)}')` : factory;
+  if (!Array.isArray(arms)) {
+    throw new TypeError(`${label}: blueprint-arms: the arms must be an array of steps, got ${typeof arms}`);
+  }
+  if (arms.length === 0) {
+    throw new RangeError(`${label}: race-empty: a decision needs at least one arm; a .parallel() of none has nothing to decide`);
+  }
+  if (typeof k !== 'number' || !Number.isInteger(k) || k < 1 || k > arms.length) {
+    throw new RangeError(
+      `${label}: quorum-value: k must be a whole number in [1, ${arms.length}] (the arm count), got ${String(k)}`,
+    );
+  }
+  const seenIds = new Set<unknown>();
+  arms.forEach((arm, i) => {
+    if (arm === null || (typeof arm !== 'object' && typeof arm !== 'function')) {
+      throw new TypeError(`${label}: blueprint-arms: arm ${i} is not a step`);
+    }
+    if (arms.indexOf(arm) !== i) {
+      throw new TypeError(`${label}: blueprint-arms: arm ${i} is the same step as arm ${arms.indexOf(arm)}; list each arm once`);
+    }
+    const id: unknown = (arm as { id?: unknown }).id;
+    if (seenIds.has(id)) {
+      throw new TypeError(
+        `${label}: blueprint-arms: two arms have the id ${JSON.stringify(id)}; Mastra keys a block's results by ` +
+          'step id, so the second would overwrite the first. Give one its own id with cloneStep().',
+      );
+    }
+    seenIds.add(id);
+  });
+  const decision = Object.freeze(new Decision(mintedDecision, factory, k, Object.freeze([...arms])));
+  // A fresh object: the author's metadata is never written to, and its keys (Layer 2 `concurrency`
+  // among them) are kept. The symbol key is enumerable, so a spread of this metadata carries the
+  // decision with it — and a copy on a second `.parallel()` is refused as `blueprint-reused` rather
+  // than silently running as a plain block.
+  const metadata = { ...(options?.metadata ?? {}), [BLOCK_DECISION]: decision } as DecisionEntryOptions['metadata'];
+  const entryOptions: DecisionEntryOptions = {
+    ...(options?.id !== undefined ? { id: options.id } : {}),
+    ...(options?.description !== undefined ? { description: options.description } : {}),
+    metadata,
+  };
+  return [arms, entryOptions];
+}
+
+/**
+ * The decision a `.parallel()` entry's `metadata` carries under {@link BLOCK_DECISION}, or
+ * `undefined` — every entry built without `race` / `quorum`. Anything under the key that is not a
+ * minted {@link Decision} is the adapter's to refuse (`blueprint-arms`).
+ */
+export function decisionOf(metadata: unknown): unknown {
+  if (metadata === null || typeof metadata !== 'object') return undefined;
+  if (!Object.prototype.hasOwnProperty.call(metadata, BLOCK_DECISION)) return undefined;
+  return (metadata as { [BLOCK_DECISION]?: unknown })[BLOCK_DECISION];
+}

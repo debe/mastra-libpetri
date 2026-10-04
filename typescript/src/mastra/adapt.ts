@@ -8,6 +8,7 @@ import {
 } from '../compiler/index.js';
 import type {
   BlockConcurrency,
+  BlockDecision,
   BuildOrRun,
   EntryDescription,
   QuotaRef,
@@ -16,7 +17,7 @@ import type {
   WorkflowDescription,
 } from '../compiler/types.js';
 import { entryId, type ExecutionGraph, type SingleStepEntry, type StepFlowEntry } from './host.js';
-import { Quota, resourcesOf } from './resources.js';
+import { Decision, decisionOf, Quota, resourcesOf } from './resources.js';
 
 /**
  * Mastra's tag for `.branch()`. There is no `'branch'` entry type in `StepFlowEntry`; the
@@ -45,6 +46,30 @@ export const LAYER2_METADATA_KEYS = ['checkpoint', 'concurrency'] as const;
 
 /** One of {@link LAYER2_METADATA_KEYS}. */
 export type Layer2MetadataKey = (typeof LAYER2_METADATA_KEYS)[number];
+
+/**
+ * The refusals of a counted decision ([ADR 0014]) — Layer 3, so not a {@link LAYER2_METADATA_KEYS}
+ * entry: the decision rides in `metadata` under a symbol (`BLOCK_DECISION`), which no string key
+ * names and the default engine never reads. Each is a prefix of `UnsupportedWorkflowError.reason`,
+ * as every refusal's name is, and recorded in `docs/divergences.md`.
+ *
+ * - `quorum-value` — `k` is not a whole number in [1, n] (a forged or altered `Decision`).
+ * - `race-empty` — a decision over no arms.
+ * - `blueprint-arms` — the entry's arms are not the minted arms, by identity and in order; an arm is
+ *   listed twice, by object or by step id; or the value under the key is not a minted `Decision`.
+ * - `blueprint-position` — the marker on any entry but a `.parallel()`: a `.branch()`, a `.foreach()`,
+ *   a loop, a sleep, a step, or an arm's own metadata.
+ * - `blueprint-reused` — one minted `Decision` marks more than one `.parallel()` of this workflow:
+ *   `const r = race([a, b]); wf.parallel(...r).parallel(...r)` spreads the same `metadata` object
+ *   twice, and both entries pass `blueprint-arms`, since their arms are the minted arms. Nothing else
+ *   catches it: neither Mastra nor this adapter refuses two entries with one id (names are by path),
+ *   so a decision is one block, and a second block needs its own `race` / `quorum` call. Scoped to
+ *   this workflow's description, as `quota-id-collision` is: a nested workflow is adapted on its own.
+ */
+export const BLUEPRINT_REFUSALS = ['quorum-value', 'race-empty', 'blueprint-arms', 'blueprint-position', 'blueprint-reused'] as const;
+
+/** One of {@link BLUEPRINT_REFUSALS}. */
+export type BlueprintRefusal = (typeof BLUEPRINT_REFUSALS)[number];
 
 export interface AdaptOptions {
   /** The workflow's id — `ExecutionGraph.id`, which is `Workflow.id`. */
@@ -117,6 +142,7 @@ export function adaptStepFlow(
   const ctx: AdaptContext = { options, quotas: new Map() };
   const adapted = entries.map((entry, index) => adaptEntry(entry, index, ctx));
   refuseMisplacedConcurrency(entries, adapted);
+  refuseMisplacedDecision(entries);
   const checkpoints = checkpointsOf(entries, adapted);
   return {
     id: options.workflowId,
@@ -425,11 +451,15 @@ function adaptEntry(entry: StepFlowEntry, index: number, ctx: AdaptContext): Ent
       // (`handlers/control-flow.ts:220,286-295`).
       const id = entry.id ?? `parallel_${index}`;
       const concurrency = blockConcurrency(entry, id);
+      const decision = blockDecision(entry, id);
       return {
         kind: 'parallel',
         id,
         arms: entry.steps.map((s) => adaptSingleStep(s, ctx)),
         ...(concurrency !== undefined ? { concurrency } : {}),
+        // Absent unless race / quorum marked the block ([ADR 0014]), so a plain .parallel() describes,
+        // keys the compile cache and hashes exactly as before M7b.
+        ...(decision !== undefined ? { decision } : {}),
       };
     }
 
@@ -909,6 +939,173 @@ function foreachConcurrency(id: string, opts: { readonly concurrency?: unknown }
     );
   }
   return lanes;
+}
+
+/**
+ * A `.parallel()` entry's counted decision ([ADR 0014]), read from its `metadata` under
+ * `BLOCK_DECISION`; `undefined` when it carries none, so an unannotated block describes, keys the
+ * compile cache and hashes exactly as before M7b. Refuses `blueprint-arms`, `race-empty` and
+ * `quorum-value` by name.
+ *
+ * **Matching an entry arm to its minted arm.** The decision keeps the Step objects `race` / `quorum`
+ * were given, in order. Mastra's `.parallel()` maps each through `toSingleStepEntry`
+ * (`workflow.ts:579-592`), which keeps the Step object only for a plain step: a step built by
+ * `createStep(agent | tool, options)` becomes a declarative `{ type: 'agent' | 'tool', id, agent |
+ * tool: __agentRef | __toolRef, options: __agentOptions | __toolOptions }` and the Step object is
+ * gone. So arm `i` of the entry matches minted arm `i` by its kind:
+ *
+ * - `{ type: 'step', step }` — `step === minted[i]`.
+ * - `{ type: 'agent', id, agent, options }` — `minted[i].component === 'AGENT'`, `id ===
+ *   minted[i].id`, `agent === minted[i].__agentRef` and `options === minted[i].__agentOptions`, each
+ *   by identity (`options` may be `undefined` on both: `createStep(agent)` with no options).
+ * - `{ type: 'tool', id, tool, options }` — the same with `'TOOL'`, `__toolRef`, `__toolOptions`.
+ * - anything else — `blueprint-arms`. A nested workflow passed as an arm is `{ type: 'step' }` and
+ *   matches by identity, as a plain step does.
+ *
+ * The options object is the carrier [ADR 0012] already relies on (`STEP_RESOURCES` rides on
+ * `__agentOptions` / `__toolOptions`, `resourcesOf`), so its identity is as stable here as there.
+ * Two `createStep(agent)` of one agent with no options are one id, which `race` / `quorum` already
+ * refuse as `blueprint-arms` (an arm twice, by id). Pinned by `tests/mastra/adapt-decision.test.ts`,
+ * "agent and tool arms match by ref and options identity" (and its negative: an equal but distinct
+ * options object is `blueprint-arms`).
+ *
+ * @internal Exported for the tests.
+ */
+export function blockDecision(entry: StepFlowEntry, id: string): BlockDecision | undefined {
+  const value = decisionOf(metadataOfEntry(entry));
+  if (value === undefined) return undefined;
+  const type = entry.type;
+  if (!(value instanceof Decision) || !Array.isArray(value.arms)) {
+    refuse(
+      type,
+      id,
+      'blueprint-arms: this block\'s metadata carries a decision that init().race or init().quorum did not ' +
+        'make. Build the block with `.parallel(...race(arms, options))` or `.parallel(...quorum(k, arms, options))`.',
+    );
+  }
+  const minted: readonly unknown[] = value.arms;
+  const n = minted.length;
+  if (n === 0) {
+    refuse(type, id, 'race-empty: the decision is over no arms; a block of none has nothing to decide.');
+  }
+  const k: unknown = value.k;
+  if (typeof k !== 'number' || !Number.isInteger(k) || k < 1 || k > n) {
+    refuse(type, id, `quorum-value: the decision's k is ${describeValue(k)}; it must be a whole number in [1, ${n}] (the arm count).`);
+  }
+  const steps = entry.type === 'parallel' ? entry.steps : [];
+  const fix =
+    `Spread the very result of race / quorum into this .parallel() — \`.parallel(...${value.kind}(...))\` — ` +
+    'without changing its arms.';
+  if (steps.length !== n) {
+    refuse(type, id, `blueprint-arms: the block has ${steps.length} arm(s), but its decision was made over ${n}. ${fix}`);
+  }
+  const ids = new Set<string>();
+  steps.forEach((arm, i) => {
+    if (!armMatches(arm, minted[i])) {
+      refuse(
+        type,
+        id,
+        `blueprint-arms: arm ${i} ('${entryId(arm)}') is not the step the decision was made with at that position. ${fix}`,
+      );
+    }
+    const armId = entryId(arm);
+    if (ids.has(armId)) {
+      refuse(type, id, `blueprint-arms: two arms have the id '${armId}'; a decision counts each arm once, by id.`);
+    }
+    ids.add(armId);
+  });
+  return { k: k as number };
+}
+
+/**
+ * Whether entry arm `arm` is minted arm `minted`, by its kind (see {@link blockDecision}): a plain
+ * step or nested workflow by identity; an agent or tool by its id, and its ref and options object by
+ * identity, since Mastra's `toSingleStepEntry` keeps those and not the Step object.
+ */
+function armMatches(arm: SingleStepEntry, minted: unknown): boolean {
+  if (minted === null || (typeof minted !== 'object' && typeof minted !== 'function')) return false;
+  const m = minted as {
+    readonly id?: unknown;
+    readonly component?: unknown;
+    readonly __agentRef?: unknown;
+    readonly __agentOptions?: unknown;
+    readonly __toolRef?: unknown;
+    readonly __toolOptions?: unknown;
+  };
+  switch (arm.type) {
+    case 'step':
+      return arm.step === minted;
+    case 'agent':
+      return m.component === 'AGENT' && m.__agentRef !== undefined && arm.id === m.id && arm.agent === m.__agentRef && arm.options === m.__agentOptions;
+    case 'tool':
+      return m.component === 'TOOL' && m.__toolRef !== undefined && arm.id === m.id && arm.tool === m.__toolRef && arm.options === m.__toolOptions;
+    default:
+      return false;
+  }
+}
+
+/**
+ * `blueprint-position` ([ADR 0014]): a decision marker on any entry but a `.parallel()` call's own
+ * options — including an arm's or a body's own `metadata`. And `blueprint-reused`: one minted
+ * `Decision` on more than one `.parallel()` of `entries`. Workflow-wide, as
+ * `refuseMisplacedConcurrency` is.
+ *
+ * Identity is the value under the key, so a spread copy of the metadata (which carries the same
+ * `Decision`) is caught as well as the same options object passed twice.
+ *
+ * @internal Exported for the tests.
+ */
+export function refuseMisplacedDecision(entries: readonly StepFlowEntry[]): void {
+  const fix =
+    'A decision marks a .parallel() call\'s own options only: `.parallel(...race(arms, options))` or ' +
+    '`.parallel(...quorum(k, arms, options))`.';
+  const seen = new Map<unknown, string>();
+  entries.forEach((entry, index) => {
+    const id = topLevelId(entry, index);
+    for (const { inner, role } of innerSteps(entry)) {
+      if (decisionOf(metadataOfSingle(inner)) === undefined) continue;
+      refuse(
+        entry.type,
+        id,
+        `blueprint-position: step '${entryId(inner)}' carries a race / quorum decision in its own metadata as ${role}. ${fix}`,
+      );
+    }
+    const decision = decisionOf(metadataOfEntry(entry));
+    if (decision === undefined) return;
+    if (entry.type !== 'parallel') {
+      refuse(entry.type, id, `blueprint-position: a race / quorum decision is on ${positionOf(entry)}. ${fix}`);
+    }
+    const first = seen.get(decision);
+    if (first !== undefined) {
+      refuse(
+        entry.type,
+        id,
+        `blueprint-reused: this block carries the same race / quorum decision as block '${first}'. A decision ` +
+          'decides one block; call race / quorum again for each .parallel().',
+      );
+    }
+    seen.set(decision, id);
+  });
+}
+
+/** A top-level entry's id, as `adaptEntry` names it. */
+function topLevelId(entry: StepFlowEntry, index: number): string {
+  switch (entry.type) {
+    case 'step':
+    case 'agent':
+    case 'tool':
+    case 'mapping':
+      return entryId(entry);
+    case 'parallel':
+      return entry.id ?? `parallel_${index}`;
+    case MASTRA_BRANCH_ENTRY_TYPE:
+      return entry.id ?? `branch_${index}`;
+    case 'loop':
+    case 'foreach':
+      return entry.id ?? entryId(entry.step);
+    default:
+      return String((entry as { id?: unknown }).id ?? `#${index}`);
+  }
 }
 
 /** Every refusal reads the same way: which entry, which Mastra type, and why. */

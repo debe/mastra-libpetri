@@ -23,6 +23,7 @@ import type {
 import { admissionClaims, admissionPools, admit, bindingLimit, blockAdmission, collect } from './admission.js';
 import { blockClaims, blockReentry, suspendedBlock, type ArmArrival } from './reentry.js';
 import type { Gadget } from './types.js';
+import { firstKGadget } from '../blueprints/first-k.js';
 
 /**
  * `.parallel([...])` — every arm runs, every arm settles, then one join decides the block.
@@ -144,6 +145,8 @@ import type { Gadget } from './types.js';
  */
 export const parallelGadget: Gadget = (entry, next, ctx) => {
   if (entry.kind !== 'parallel') throw new Error(`parallelGadget received a '${entry.kind}' entry`);
+  // A counted decision ([ADR 0014]) is its own gadget; without one this is exactly today's parallel.
+  if (entry.decision !== undefined) return firstKGadget(entry, next, ctx);
 
   const { names, path, viewPath, cancel } = ctx;
   const arms = entry.arms;

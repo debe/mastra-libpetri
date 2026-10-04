@@ -17,7 +17,19 @@ import type { InferPublicSchema, PublicSchema, StandardSchemaWithJSON } from '@m
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
 import type { DynamicArgument } from '@mastra/core/types';
 import { PetriExecutionEngine, type PetriEngineOptions } from './engine.js';
-import { attachResources, limit, Quota, rateLimit, resourcesOf, type QuotaOptions, type StepResources } from './resources.js';
+import {
+  attachResources,
+  limit,
+  Quota,
+  quorum,
+  race,
+  rateLimit,
+  resourcesOf,
+  type DecisionEntryOptions,
+  type DecisionOptions,
+  type QuotaOptions,
+  type StepResources,
+} from './resources.js';
 
 declare const petriEngine: unique symbol;
 
@@ -240,6 +252,35 @@ export type PetriLimit = (n: number, options: QuotaOptions) => Quota;
  */
 export type PetriRateLimit = (burst: number, perMs: number, options: QuotaOptions) => Quota;
 
+/**
+ * `init().race` ([ADR 0014]): the first arm to succeed wins; the rest are preempted, awaited and
+ * recorded `canceled`. Spread into Mastra's own `.parallel()`:
+ *
+ * ```ts
+ * wf.parallel(...race([a, b, c], { id: 'fastest' }))
+ * ```
+ *
+ * The arms are petri steps, so the brand gates it ([ADR 0002]); the next entry still receives every
+ * declared arm, read from the step records, as after any `.parallel()` — **a loser's key holds
+ * `undefined`** (its record is `canceled`, with no `output`). Mastra validates a step's input by
+ * default (`validateInputs`), so the next step's input schema must make every arm's key optional
+ * (`z.object({ a: A.optional(), b: B.optional(), … })`), or the first run with a loser fails there.
+ */
+export type PetriRace = <const TArms extends readonly PetriStep<string, any, any, any, any, any, any>[]>(
+  arms: TArms,
+  options?: DecisionOptions,
+) => [arms: TArms, options: DecisionEntryOptions];
+
+/**
+ * `init().quorum` ([ADR 0014]): `k` of the arms must succeed; the block fails once `n − k + 1` have
+ * not. `quorum(1, arms)` is `race(arms)`. Spread into `.parallel()`, as {@link PetriRace}.
+ */
+export type PetriQuorum = <const TArms extends readonly PetriStep<string, any, any, any, any, any, any>[]>(
+  k: number,
+  arms: TArms,
+  options?: DecisionOptions,
+) => [arms: TArms, options: DecisionEntryOptions];
+
 /** What {@link init} returns. */
 export interface PetriFactories {
   readonly createWorkflow: PetriCreateWorkflow;
@@ -249,6 +290,10 @@ export interface PetriFactories {
   readonly limit: PetriLimit;
   /** Layer 3 ([ADR 0012]): a rate a petri step draws on through `createStep({ uses })`. */
   readonly rateLimit: PetriRateLimit;
+  /** Layer 3 ([ADR 0014]): the first success of a `.parallel()` wins. */
+  readonly race: PetriRace;
+  /** Layer 3 ([ADR 0014]): `k` successes of a `.parallel()` decide it. */
+  readonly quorum: PetriQuorum;
 }
 
 /**
@@ -323,7 +368,7 @@ export function init(options: PetriInitOptions = {}): PetriFactories {
     return clone;
   }) as unknown as PetriCloneStep;
 
-  return { createWorkflow, createStep, cloneStep, limit, rateLimit };
+  return { createWorkflow, createStep, cloneStep, limit, rateLimit, race: race as PetriRace, quorum: quorum as PetriQuorum };
 }
 
 /**

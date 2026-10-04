@@ -21,6 +21,8 @@ export type {
   PetriFactories,
   PetriInitOptions,
   PetriLimit,
+  PetriQuorum,
+  PetriRace,
   PetriRateLimit,
   PetriStep,
   PetriStepResources,
@@ -28,7 +30,10 @@ export type {
 } from './init.js';
 export { Quota } from './resources.js';
 export { StepTimeoutError } from '../compiler/timeout.js';
-export type { QuotaOptions } from './resources.js';
+export { StepPreemptedError } from '../compiler/preempt.js';
+export { QuorumNotMetError } from '../compiler/blueprints/first-k.js';
+export type { ArmStatus } from '../compiler/blueprints/first-k.js';
+export type { DecisionEntryOptions, DecisionOptions, QuotaOptions } from './resources.js';
 export { PetriExecutionEngine, UnsupportedRunModeError } from './engine.js';
 export type { PetriEngineOptions, RestartRefusalReason, UnsupportedRunMode } from './engine.js';
 export { restartActiveRuns } from './recovery.js';
@@ -36,12 +41,13 @@ export type { RestartActiveRunsOptions, RestartActiveRunsReport } from './recove
 export {
   adaptStepFlow,
   adaptExecutionGraph,
+  BLUEPRINT_REFUSALS,
   LAYER2_METADATA_KEYS,
   MASTRA_BRANCH_ENTRY_TYPE,
   MASTRA_WORKFLOW_COMPONENT,
   UnsupportedWorkflowError,
 } from './adapt.js';
-export type { AdaptOptions, Layer2MetadataKey } from './adapt.js';
+export type { AdaptOptions, BlueprintRefusal, Layer2MetadataKey } from './adapt.js';
 export { isMastraWorkflow, nestedWorkflows, verifyMastraWorkflow, workflowsIn } from './verify.js';
 export type { MastraVerification, MastraVerifyOptions, VerifiableWorkflow } from './verify.js';
 export { entryId, suspendTracingContext } from './host.js';

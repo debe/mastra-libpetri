@@ -1,4 +1,5 @@
 import type { RunView, StepRecord } from '../compiler/types.js';
+import { StepPreemptedError } from '../compiler/preempt.js';
 import type {
   StepBailed,
   StepCanceled,
@@ -90,6 +91,17 @@ const MODELLED: ReadonlySet<string> = new Set([
  * — carries exactly the fields it has and no invented ones: the loop's is a bare
  * `{ status: 'canceled' }`.
  *
+ * A `race` / `quorum` loser's `canceled` record ([ADR 0014]) carries `reason`, a
+ * `StepPreemptedError`. It is written as the row's `error`, through `normalizeError` as a failure's
+ * error is, so a client reading `steps[id].error` sees why the arm stopped; its `kind`, `block`,
+ * `path` and `outcome` are own enumerable fields, so they survive a JSON round trip of the row.
+ * Mastra's `StepCanceled` declares no `error`, and nothing of Mastra's reads one on a canceled row
+ * (`getStepOutput` reads `output` only). A canceled record without `reason` — a loop's, a foreach's,
+ * a run cancel's — gets no `error`, as today. A canceled row read back whose `error` is still the
+ * reason the record carries (the same object, or a stored copy naming the same block, path and
+ * outcome) is kept as it was stored, as a failure's error is. {@link fromMastraStepResult} restores
+ * `reason`; `tests/mastra/step-result-roundtrip.test.ts` pins both ways.
+ *
  * A `tripwire` that is an `Error` (a `TripWire` instance) is flattened as Mastra flattens it
  * (`default.ts:496-504`); one that is already `{ reason }` passes through; anything else is not a
  * tripwire by Mastra's own test (`default.ts:611-626`) and is left off, as the kernel already
@@ -105,6 +117,9 @@ export function toMastraStepResult(record: StepRecord, options: ToMastraOptions 
   const metadata = mergeMetadata(host['metadata'], record.metadata);
 
   if (record.status === 'canceled') {
+    const reason = record.reason;
+    // A row Mastra's storage already holds for this very reason is kept as stored ([ADR 0014]).
+    const stored = reason !== undefined && host['status'] === 'canceled' && samePreemption(host['error'], reason);
     return {
       ...kept,
       status: 'canceled',
@@ -112,8 +127,9 @@ export function toMastraStepResult(record: StepRecord, options: ToMastraOptions 
       ...(record.startedAt === undefined ? {} : { startedAt: record.startedAt }),
       ...('output' in record ? { output: record.output } : {}),
       ...(record.endedAt === undefined ? {} : { endedAt: record.endedAt }),
+      ...(reason === undefined ? {} : { error: stored ? host['error'] : (options.normalizeError ?? normalizeError)(reason) }),
       ...(metadata === undefined ? {} : { metadata }),
-    };
+    } as StepCanceled;
   }
 
   const time = (field: 'startedAt' | 'endedAt' | 'suspendedAt', own: number | undefined): number => {
@@ -202,12 +218,14 @@ export function fromMastraStepResult(result: StoredStepResult): StepRecord | und
   const metadata = engineMetadata(result.metadata);
   const withMetadata = metadata === undefined ? {} : { metadata };
   if (result.status === 'canceled') {
+    const reason = preemptionOf((result as { readonly error?: unknown }).error);
     return {
       status: 'canceled',
       ...('payload' in result ? { payload: result.payload } : {}),
       ...(result.startedAt === undefined ? {} : { startedAt: result.startedAt }),
       ...('output' in result ? { output: result.output } : {}),
       ...(result.endedAt === undefined ? {} : { endedAt: result.endedAt }),
+      ...(reason === undefined ? {} : { reason }),
       ...withMetadata,
       host: result,
     };
@@ -284,6 +302,34 @@ export function getStepResultView(
     const record: unknown = view.getStepResult(id) ?? (id === 'input' ? view.initData : undefined);
     return isRecord(record) && record['status'] === 'success' ? record['output'] : null;
   };
+}
+
+/**
+ * A canceled row's `error` as the `StepPreemptedError` it records ([ADR 0014]): the instance itself
+ * while the row is live, rebuilt from `block`, `path` and `outcome` once it has been through storage.
+ * Anything else — no error, another name, a malformed copy — is not a preemption, and the canceled
+ * row reads as one without a `reason`.
+ */
+function preemptionOf(error: unknown): StepPreemptedError | undefined {
+  if (error instanceof StepPreemptedError) return error;
+  if (!isRecord(error) || error['name'] !== 'StepPreemptedError') return undefined;
+  const { block, path, outcome } = error;
+  if (typeof block !== 'string' || (outcome !== 'met' && outcome !== 'short')) return undefined;
+  if (!Array.isArray(path) || !path.every((i) => Number.isInteger(i))) return undefined;
+  return new StepPreemptedError(block, path as number[], outcome);
+}
+
+/** Whether a canceled row's stored `error` records `reason` — the same object, or a copy naming the same preemption. */
+function samePreemption(error: unknown, reason: StepPreemptedError): boolean {
+  if (error === reason) return true;
+  const read = preemptionOf(error);
+  return (
+    read !== undefined &&
+    read.block === reason.block &&
+    read.outcome === reason.outcome &&
+    read.path.length === reason.path.length &&
+    read.path.every((i, n) => i === reason.path[n])
+  );
 }
 
 /** A stored failure's `suspendPayload` — a failed `.foreach()` aggregate's meta — or none. */

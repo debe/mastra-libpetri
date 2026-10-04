@@ -5,7 +5,9 @@ export { parallelGadget } from './gadgets/parallel.js';
 export { branchGadget } from './gadgets/branch.js';
 export { loopGadget, MAX_ITERATION_BOUND } from './gadgets/loop.js';
 export { foreachGadget, MAX_FOREACH_LANES } from './gadgets/foreach.js';
-export type { Gadget, GadgetContext, GadgetResult, NestedOptions } from './gadgets/types.js';
+export type { ArmPreemption, Gadget, GadgetContext, GadgetResult, NestedOptions } from './gadgets/types.js';
+export { firstKGadget, QuorumNotMetError, settledBound } from './blueprints/first-k.js';
+export type { ArmStatus } from './blueprints/first-k.js';
 export {
   NameVocabulary,
   pathSegment,
@@ -68,9 +70,13 @@ export type {
   PoolCommon,
   PoolHolder,
   PoolKind,
+  BlockDecision,
+  DecisionSite,
+  PreemptedToken,
 } from './types.js';
 export { resumeSeed, UnresumablePositionError } from './resume.js';
 export { HostPreconditionError } from './gadgets/leaf.js';
+export { StepPreemptedError } from './preempt.js';
 export type { ResumeRequest, ResumeSeed } from './resume.js';
 export { foreachSeed } from './resume-foreach.js';
 export { toDot } from './dot.js';

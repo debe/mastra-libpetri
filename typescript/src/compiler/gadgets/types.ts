@@ -1,12 +1,14 @@
 import type { Place, Transition } from 'libpetri';
 import type { NameVocabulary, EntryPath, QuotaRole } from '../names.js';
 import type {
+  DecisionSite,
   EntryDescription,
   ExclusionClaim,
   Exits,
   FlowToken,
   PlaceClaim,
   Pool,
+  PreemptedToken,
   QuotaRef,
   ResumeSite,
   StepChain,
@@ -41,6 +43,32 @@ export interface GadgetResult {
    * the gadget claims only its holders' bounds — `placeBound(active, c)` — through `claims`.
    */
   readonly pools?: readonly Pool[];
+  /**
+   * The counted decisions this gadget owns ([ADR 0014]) — one per `race` / `quorum` block. Collected by
+   * the builder into `CompiledWorkflow.decisions`; every name must be a place or transition of the net.
+   */
+  readonly decisions?: readonly DecisionSite[];
+}
+
+/**
+ * Where an arm of a deciding block leaves when the block has decided without it ([ADR 0014]). Given
+ * one, the leaf adds a `preempted` branch to **every** attempt (the permit and quotas back on it, as
+ * on every branch), hands each attempt `StepCall.preempt` = `RunScope.preemption(block)`, and takes
+ * that branch when the signal had fired before the call, or fired before the step settled and
+ * neither the run's abort nor the attempt's deadline had (precedence: run abort, then deadline, then
+ * preemption) — after awaiting the step and discarding its result, and after writing the arm's
+ * `canceled` record with `reason` = the signal's `StepPreemptedError`.
+ *
+ * Given only to the arms of a block of `n ≥ 2`: a block of one arm has no other arm to decide first.
+ * An attempt admitted after the decision still enters only once its quotas ([ADR 0012]) and its block
+ * slot ([ADR 0011]) are drawn, then sees the fired signal and leaves at once (row 110).
+ */
+export interface ArmPreemption {
+  /** Arm `i`'s own `preempted` place: the leaf's only producer, the block's `collect-preempted-i` its only consumer. */
+  readonly place: Place<PreemptedToken>;
+  /** The deciding block's naming path — the key of `RunScope.preempt` / `preemption`. */
+  readonly block: EntryPath;
+  readonly blockId: string;
 }
 
 /**
@@ -79,6 +107,12 @@ export interface GadgetContext {
    * delay and the budget cannot deadlock the net. Combinators pass it through untouched.
    */
   readonly permits: Place<null> | undefined;
+  /**
+   * The deciding block's preemption, when this entry is an arm of a `race` / `quorum` ([ADR 0014]);
+   * `undefined` everywhere else, and then the leaf emits exactly today's attempts. Only the leaf reads
+   * it; a combinator passes it through `NestedOptions.preempt`, never on to a further nesting.
+   */
+  readonly preempt: ArmPreemption | undefined;
   /**
    * One step occurrence's member of a quota place ([ADR 0012]) — the leaf calls it for each
    * `StepDescription.quotas` entry: `role: 'pool'` for every quota (a `limit`'s pool, a `rateLimit`'s
@@ -142,6 +176,8 @@ export interface GadgetContext {
 export interface NestedOptions {
   readonly viewPath?: EntryPath;
   readonly cancel?: Place<null>;
+  /** The arm's preemption ([ADR 0014]); only `firstKGadget` passes one. Defaults to none. */
+  readonly preempt?: ArmPreemption;
 }
 
 /**

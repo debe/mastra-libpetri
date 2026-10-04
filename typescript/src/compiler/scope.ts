@@ -1,6 +1,7 @@
 import type { TransitionContext } from 'libpetri';
 import type { EntryPath } from './names.js';
 import type { AttemptDeadline } from './timeout.js';
+import type { StepPreemptedError } from './preempt.js';
 import type { LifecycleEvent, RunView, StepRecord, StepRunner } from './types.js';
 
 /**
@@ -52,6 +53,34 @@ export interface RunScope {
    * own outcome stands. Nothing reads the machine clock, so a ManualClock advance fires it.
    */
   armDeadline(ms: number, reason: unknown): AttemptDeadline;
+  /**
+   * Preempts the deciding block at `path` ([ADR 0014]): aborts its one controller, with `reason` —
+   * a `StepPreemptedError` the block's action built — so every attempt of its arms still running
+   * sees `StepCall.preempt` fire, and every attempt called later is handed it already fired. What
+   * that does to an attempt is the runner's verdict, frozen once (`StepOutcome.verdict`): an attempt
+   * whose verdict was frozen before this call is not affected. Called by the
+   * block's `met` and `short` actions — exactly one of them fires per block per segment, so the
+   * second call that idempotence allows never happens; it is a no-op all the same. Never touches
+   * `signal`: the run goes on. Not called for a block of one arm, which has nothing to preempt.
+   *
+   * `.parallel()` is top-level, so `path` is `[i]` and a block is decided at most once per segment.
+   * Called before any arm asked for {@link preemption}, it still fires the signal that arm then gets.
+   */
+  preempt(path: EntryPath, reason: StepPreemptedError): void;
+  /**
+   * The deciding block's preemption signal at `path` — created on first ask, one per block per
+   * segment, shared by every attempt of every arm, aborted only by {@link preempt}. The leaf hands it
+   * to the runner as `StepCall.preempt` and never reads it: a gadget does not branch on a signal.
+   */
+  preemption(path: EntryPath): AbortSignal;
+  /**
+   * Forgets `stepId`'s suspension in the runner ([ADR 0014]): forwards to
+   * `StepRunner.forgetSuspension`, a no-op when the runner has none. Called by a `race` / `quorum`
+   * join, once per suspended loser, in the same firing that rewrites that loser's record `canceled`
+   * — so the finished run's resume labels name no arm of a decided block. A nested workflow's own
+   * suspended child run is not reached: that is the residual row 107 records.
+   */
+  forgetSuspension(stepId: string): void;
   /**
    * Hands a lifecycle event to the runner's `observe` ([ADR 0008]). `undefined` when the runner has
    * none, so an action awaits nothing and a run without an observer fires exactly as before. The

@@ -74,6 +74,19 @@ import { wholeMs } from './siphon.js';
  * branch by taking it. Every run stops at {@link MAX_STARTS} starts, at quiescence, or — under
  * `toward(t)` — as soon as `t` starts, with `close()` ([ADR 0004]: never `run(timeoutMs)`).
  *
+ * **A stub never takes an arm's `preempted` branch** ([ADR 0014]). That branch of a deciding arm's
+ * attempt is an xor output the arcs do not condition on the decision: at runtime the leaf takes it
+ * only once the block's `met` or `short` has fired (the signal is host data). A stub that took it
+ * before any decision would produce a run of the model no host run can be — a `short` reached by
+ * preempting arms nobody preempted. So every policy is wrapped by {@link avoidingPreemption}, which
+ * offers it only the children writing no `preempted` place: restricting a choice only removes runs,
+ * so every run left is still one the executor can make, and `short` is witnessed by genuine misses
+ * (an arm's failure, bail or suspension, each collected into `miss`). The same wrapper keeps a stub
+ * off an attempt's `paused` branch into a block's arm-pause place whenever the attempt has another
+ * branch — always, in a compiled net — since only a nested-workflow step can pause and a witness
+ * should be a run a plain step can make too. Nothing a stub skips is a target: each
+ * `collect-preempted-i` is listed unclaimed (`unclaimedTargets`), and `collect-pause` is none.
+ *
  * **Never the other way.** A run that does not reach `t` proves nothing: such a target is left to
  * the verifier, which is the only thing that can say `t` is dead. And no other claim kind is ever
  * settled from a run.
@@ -134,7 +147,11 @@ export async function executionWitnesses(
   if (targets.length === 0 || !executionWitnessesApply(compiled.net)) return out;
   const net = compiled.net;
 
-  // The stubs read the current run's policy from here; runs are sequential.
+  // The stubs read the current run's policy from here; runs are sequential. Every policy is offered
+  // only the children that write no arm's `preempted` place and no block's arm-pause place (see the
+  // module comment).
+  const preempted = new Set(compiled.decisions.flatMap((d) => d.preempted));
+  const avoided = new Set([...preempted, ...armPausePlaces(compiled)]);
   let policy: Policy = () => 0;
   const stub = (name: string, spec: Out | null) => async (ctx: TransitionContext): Promise<void> => {
     if (spec !== null) for (const p of stubOutputs(name, spec, policy)) ctx.output(p, null);
@@ -165,7 +182,7 @@ export async function executionWitnesses(
   const found = new Map<string, Witness>();
 
   const run = async (name: string, chosen: Policy, stopAt?: string): Promise<void> => {
-    policy = chosen;
+    policy = avoidingPreemption(avoided, chosen);
     const runStarted = performance.now();
     const current = new Map<string, number>([...initial].filter(([, n]) => n > 0).map(([p, n]) => [p.name, n]));
     const steps: string[] = [];
@@ -238,7 +255,8 @@ export async function executionWitnesses(
 
   for (const [transition, w] of found) {
     const completions = w.transitions.length - w.starts;
-    const what = `${w.starts} start(s) and ${completions} completion(s) of an executor run of the same net (untimed; stub actions, policy ${w.policy})`;
+    const avoidedNote = preempted.size === 0 ? '' : ', no preempted branch taken, no arm paused';
+    const what = `${w.starts} start(s) and ${completions} completion(s) of an executor run of the same net (untimed; stub actions, policy ${w.policy}${avoidedNote})`;
     out.set(transition, {
       verdict: { type: 'violated' },
       route: 'execution',
@@ -298,6 +316,51 @@ export function stubOutputs(transition: string, out: Out, policy: Policy): reado
   };
   walk(out);
   return written;
+}
+
+/**
+ * Each counted decision's arm-pause place ([ADR 0014]): the input of its `collect-pause` that its
+ * `collect-err` does not share (the two share only the block's admission). Only a nested-workflow step
+ * can pause (`StepOutcome` `paused`), so a run that pauses a plain step is not one a host run makes;
+ * the witness policies avoid the branch whenever an attempt has another, as they avoid `preempted`.
+ */
+function armPausePlaces(compiled: CompiledWorkflow): string[] {
+  const byName = new Map([...compiled.net.transitions].map((t) => [t.name, t]));
+  return compiled.decisions.flatMap((d) => {
+    const pause = d.collectMiss.map((n) => byName.get(n)).find((t) => t?.name.endsWith('collect-pause'));
+    const err = d.collectMiss.map((n) => byName.get(n)).find((t) => t?.name.endsWith('collect-err'));
+    if (pause === undefined || err === undefined) return [];
+    const shared = new Set(err.inputSpecs.map((i) => i.place.name));
+    return pause.inputSpecs.map((i) => i.place.name).filter((p) => !shared.has(p));
+  });
+}
+
+/**
+ * `chosen`, offered only the children of an xor that write none of `avoided` — an arm's `preempted`
+ * places ([ADR 0014]) — and its answer mapped back to the full list. An xor all of whose children
+ * write one is left to `chosen` unchanged (no compiled net has one: a `preempted` branch is always an
+ * extra branch beside the attempt's ordinary outcomes). With `avoided` empty, `chosen` itself.
+ */
+export function avoidingPreemption(avoided: ReadonlySet<string>, chosen: Policy): Policy {
+  if (avoided.size === 0) return chosen;
+  const writes = (o: Out): boolean => {
+    switch (o.type) {
+      case 'place':
+        return avoided.has(o.place.name);
+      case 'forward-input':
+        return avoided.has(o.to.name);
+      case 'timeout':
+        return false;
+      default:
+        return o.children.some(writes);
+    }
+  };
+  return (transition, children) => {
+    const allowed = children.map((c, i) => [c, i] as const).filter(([c]) => !writes(c));
+    if (allowed.length === 0 || allowed.length === children.length) return chosen(transition, children);
+    const i = Math.min(Math.max(0, chosen(transition, allowed.map(([c]) => c))), allowed.length - 1);
+    return allowed[i]![1];
+  };
 }
 
 /**

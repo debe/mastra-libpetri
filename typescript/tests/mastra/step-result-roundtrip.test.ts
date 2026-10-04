@@ -6,6 +6,7 @@ import { InMemoryStore } from '@mastra/core/storage';
 import { fromMastraStepResult, toMastraStepResult } from '../../src/mastra/step-result.js';
 import type { StoredStepResult } from '../../src/mastra/host.js';
 import type { StepRecord } from '../../src/compiler/types.js';
+import { StepPreemptedError } from '../../src/compiler/preempt.js';
 
 /**
  * `fromMastraStepResult` is the inverse of `toMastraStepResult` (contract C19, ADR 0007): a resume
@@ -39,6 +40,8 @@ const engineRoundTrip = (rec: StepRecord): unknown => {
 };
 
 const error = new Error('boom');
+/** A `race` / `quorum` loser's reason ([ADR 0014]). */
+const preempted = new StepPreemptedError('pick', [1], 'met');
 
 /** One Mastra `stepResults` entry per status, with the fields the engine does not model. */
 const MASTRA: Record<string, StoredStepResult> = {
@@ -101,6 +104,10 @@ const MASTRA: Record<string, StoredStepResult> = {
   waiting: { status: 'waiting', payload: 1, startedAt: T0 },
   'canceled (a loop: bare)': { status: 'canceled' },
   'canceled (a foreach: partial output)': { status: 'canceled', payload: [1, 2], startedAt: T0, output: [10, null], endedAt: T0 + 4 },
+  'canceled (a race loser, live)': { status: 'canceled', payload: 1, startedAt: T0, endedAt: T0 + 4, error: preempted } as StoredStepResult,
+  'canceled (a race loser, through storage)': JSON.parse(
+    JSON.stringify({ status: 'canceled', payload: 1, startedAt: T0, endedAt: T0 + 4, error: preempted }),
+  ) as StoredStepResult,
 };
 
 /** One engine record per status the engine produces. */
@@ -132,6 +139,7 @@ const ENGINE: Record<string, StepRecord> = {
   waiting: { status: 'waiting', payload: 1, startedAt: T0 },
   'canceled (bare)': { status: 'canceled' },
   'canceled (partial output)': { status: 'canceled', output: [1], payload: [1, 2], startedAt: T0, endedAt: T0 + 1 },
+  'canceled (a race loser)': { status: 'canceled', reason: preempted, payload: 1, startedAt: T0, endedAt: T0 + 4 },
 };
 
 describe('Mastra -> engine -> Mastra is the identity', () => {
@@ -265,5 +273,57 @@ describe("the records Mastra's default engine actually stores", () => {
       const restored = json.status === 'failed' ? { ...json, tripwire: undefined } : json;
       expect(mastraRoundTrip(json), `${r.status} through JSON`).toStrictEqual(restored);
     }
+  });
+});
+
+/**
+ * A `race` / `quorum` loser's `canceled` row ([ADR 0014]): the record's `reason` is the row's
+ * `error`, and reading the row back restores it — live, and after storage turned it into plain JSON.
+ */
+describe('a preempted canceled row', () => {
+  it("writes the reason as the row's error, the very object", () => {
+    // Mutation: drop the `error` spread in toMastraStepResult's canceled branch -> fails.
+    const row = toMastraStepResult({ status: 'canceled', reason: preempted, payload: 1, startedAt: T0, endedAt: T0 + 4 }) as { error?: unknown };
+    expect(row.error).toBe(preempted);
+  });
+
+  it('a canceled record without a reason gets no error key', () => {
+    // Mutation: write `error: reason` unconditionally -> an own `error: undefined` key appears.
+    expect(Object.hasOwn(toMastraStepResult({ status: 'canceled' }), 'error')).toBe(false);
+    expect(Object.hasOwn(toMastraStepResult({ status: 'canceled', payload: 1, startedAt: T0 }), 'error')).toBe(false);
+  });
+
+  it('through JSON the row serializes kind, block, path and outcome, and reads back as a StepPreemptedError', () => {
+    // Mutation: `preemptionOf` returning undefined for a non-instance -> no reason after storage.
+    const row = toMastraStepResult({ status: 'canceled', reason: preempted, payload: 1, startedAt: T0, endedAt: T0 + 4 });
+    const json = JSON.parse(JSON.stringify(row)) as StoredStepResult & { error: Record<string, unknown> };
+    expect(json.error).toMatchObject({ name: 'StepPreemptedError', kind: 'preempted', block: 'pick', path: [1], outcome: 'met' });
+    const back = fromMastraStepResult(json) as Extract<StepRecord, { status: 'canceled' }>;
+    expect(back.reason).toBeInstanceOf(StepPreemptedError);
+    expect(back.reason).toMatchObject({ block: 'pick', path: [1], outcome: 'met', kind: 'preempted' });
+    expect(back.reason?.message).toBe(preempted.message);
+    // And out again: the stored error is kept as stored, not rebuilt.
+    expect(toMastraStepResult(back)).toStrictEqual(json);
+  });
+
+  it('a short decision keeps its outcome', () => {
+    // Mutation: hard-code 'met' when rebuilding -> fails.
+    const row = JSON.parse(JSON.stringify({ status: 'canceled', error: new StepPreemptedError('q', [3], 'short') })) as StoredStepResult;
+    expect((fromMastraStepResult(row) as { reason?: StepPreemptedError }).reason).toMatchObject({ block: 'q', path: [3], outcome: 'short' });
+  });
+
+  it('a canceled row with any other error, or a malformed preemption, reads as one without a reason', () => {
+    // Mutation: drop the name check in `preemptionOf` -> the first case gains a reason.
+    const other = { status: 'canceled', error: { name: 'Error', message: 'x', block: 'b', path: [0], outcome: 'met' } } as unknown as StoredStepResult;
+    expect(fromMastraStepResult(other)).not.toHaveProperty('reason');
+    const malformed = { status: 'canceled', error: { name: 'StepPreemptedError', block: 'b', path: [0], outcome: 'won' } } as unknown as StoredStepResult;
+    expect(fromMastraStepResult(malformed)).not.toHaveProperty('reason');
+  });
+
+  it('a stored row naming another preemption than the record carries is replaced by the record', () => {
+    // Mutation: `samePreemption` always true -> the stale stored error survives.
+    const stored = JSON.parse(JSON.stringify({ status: 'canceled', error: new StepPreemptedError('pick', [1], 'short') })) as StoredStepResult;
+    const rec: StepRecord = { status: 'canceled', reason: preempted, host: stored };
+    expect((toMastraStepResult(rec) as { error?: unknown }).error).toBe(preempted);
   });
 });

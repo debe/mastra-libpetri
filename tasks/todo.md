@@ -524,8 +524,108 @@
 ## M7b — Blueprints (Layer 3 — new capability)
 - [ ] The `PetriEngineType` phantom brand gates the extended builder, so reaching for a
       blueprint is a typed, visible decision and never a silent incompatibility
-- [ ] First wave: `race()`, `quorum(k, n)` (`limit` and `rateLimit` shipped in M7). Design drafted
-      in [ADR 0014] (proposed): two designs judged, one synthesised, twelve maintainer questions open
+- [ ] First wave: `race()`, `quorum(k, n)` (`limit` and `rateLimit` shipped in M7), [ADR 0014]:
+  - [x] Maintainer decisions: the `init()` surface spread into `.parallel()` (B); first success wins
+        (the name stays `race`); the next entry gets every declared arm from step records; a
+        suspended arm is a miss, the block never suspends, a suspended loser is rewritten `canceled`.
+        Defaults taken: lowest-index failure forwarded (`QuorumNotMetError` only when none failed);
+        loser `canceled` with a `StepPreemptedError { kind: 'preempted', block }`; preempt on `met` and `short`; a loser in
+        a retry delay finishes it; winners FIFO; `.parallel()` only
+  - [x] W0 spike (libpetri 8.0.0 from npm, not linked): the drafted net is provable in budget (448
+        queries, slowest 10.5 s, n=4 cancel off enumeration) but its resets make every collect a
+        VER-004 split, 4–7× the baseline's classes. ADR amended to absorb the surplus into `settled`
+        after the decision: n=4 back on enumeration in both segments, slowest untimed 600 ms, timed
+        retry arm 3.4 s
+  - [x] W0 contract (uncommitted): `BlockDecision`, `PreemptedToken`, `DecisionSite` and
+        `CompiledWorkflow.decisions`; `StepPreemptedError` (`compiler/preempt.ts`, the signal's
+        reason, an `Error`) and the canceled `StepRecord`'s `reason`; `StepCall.preempt`;
+        `ArmPreemption` (`GadgetContext.preempt`, `NestedOptions.preempt`, `GadgetResult.decisions`);
+        `RunScope.preempt(path, reason)` / `preemption` / `forgetSuspension`,
+        `StepRunner.forgetSuspension`; `firstKGadget`, `QuorumNotMetError` (arrival statuses),
+        `settledBound` (`compiler/blueprints/first-k.ts`); `race` / `quorum` / `Decision` /
+        `BLOCK_DECISION` / `decisionOf`; `PetriRace` / `PetriQuorum` on `init()`;
+        `BLUEPRINT_REFUSALS` (five, with `blueprint-reused`), `blockDecision` (arm matching by kind),
+        `refuseMisplacedDecision`; `decisionStructureViolations`, `decisionTargets`,
+        `LivenessTarget.kind` `decision`; `structuralHash` carries `decision.k` only when present;
+        divergence rows 103–110 `planned (M7b)`. Every stub throws `not implemented (M7b W<n>)`; an
+        unannotated workflow compiles and hashes as before
+  - [x] W0 contract review: agent / tool arms matched by ref and options identity; the preempt
+        reason an `Error` on the record; a suspended loser's resume labels dropped
+        (`forgetSuspension`), a nested child's own snapshot a residual (row 107); `structuralHash`;
+        arm keys optional in the next schema (row 103); precedence run abort > deadline > preempt;
+        row 110 (a late loser waits for its quota); `collect-preempted-i` liveness unclaimed (vacuous);
+        dead absorbs omitted at k = n and k = 1, `settled` and preemption omitted at n = 1;
+        `blueprint-reused` (no existing refusal covered it)
+  - [x] W1 built and adversarially verified over three rounds (2026-10-05). What the reviews changed:
+        **one host-owned verdict** — the runner freezes each attempt's verdict when the step settles
+        (first fired of run abort -> `own`, deadline -> `timedOut`, preemption -> `preempted`; a later
+        signal never re-decides) and applies state, resume labels and scorers iff `own`; the leaf maps
+        the verdict and reads no signal (source guard green, no new allowance). It closed a
+        late-decision window a reviewer reproduced end to end (an async `scorers` fn committed a
+        canceled loser's state and left an orphan label). Resume labels written at `suspend` and
+        again at settle, as Mastra (`handlers/step.ts:491`), fixing a plain-path divergence that
+        predated M7b. `live(short)` witnessed through genuine misses only (no `preempted` or `paused`
+        branch before a decision); unclaimed liveness targets in the report and CLI; the deciding-arm
+        suspension-coverage exemption in `structure.ts`. Proofs, libpetri 8.0.0 from npm, not linked:
+        compiled race n=3 k=1..3 and n=4 k=1,2, every family, at most 908 ms a workflow, slowest
+        query 619 ms. `npm test` without `tests/verify`: 85 files, 2,662 passed; `tests/verify` without
+        the corpus, sequential: 17 files, 567 passed. Plan as it was:
+        Lead keeps the contract: `src/compiler/types.ts`, `src/compiler/gadgets/types.ts`,
+        `src/compiler/preempt.ts`, `src/compiler/compile.ts`, `src/compiler/index.ts`,
+        `src/mastra/index.ts`, `src/verify/index.ts`, ADR 0014, this file
+    - **W1a** (parallel; nothing in it reads another's work):
+      - **B — leaf**: `src/compiler/gadgets/leaf.ts`. The `preempted` xor branch on every attempt
+        (permit and quotas back), `StepCall.preempt = scope.preemption(block)`, not calling the
+        runner once fired, awaiting and discarding otherwise, precedence at settle (run abort >
+        deadline > preempt), the `canceled` record with `reason` = `signal.reason`. No branch when
+        `ctx.preempt` is absent (every non-arm, and the arm of an n = 1 block). Tests:
+        `tests/compiler/leaf-preempt.test.ts` (incl. an attempt behind an exhausted `limit` entering
+        after the decision)
+      - **C — scope, gate, runner, records**: `src/engine/scope.ts` (`preempt` / `preemption`, one
+        controller per block per segment; `forgetSuspension` forwarding to the runner),
+        `src/compiler/scope.ts` (its docs only), `src/mastra/attempt-gate.ts` (`preempt` as a third
+        source; `expired()` covers it; reason of the first to fire), `src/mastra/runner.ts`
+        (`forgetSuspension`: drop the step's resume labels), `src/mastra/step-result.ts` (`reason`
+        written as the row's `error`, restored from `error.name === 'StepPreemptedError'`). Tests:
+        `tests/engine/preempt-scope.test.ts`, `tests/mastra/runner-preempt.test.ts`, and the
+        preempted-row cases in `tests/mastra/step-result-roundtrip.test.ts`
+      - **D — surface and adapter**: `src/mastra/resources.ts` (`race`, `quorum`, `decisionOf`),
+        `src/mastra/init.ts`, `src/mastra/adapt.ts` (`blockDecision` into the `parallel` case with
+        arm matching by kind — `step` by identity, `agent` / `tool` by id, ref and options identity;
+        `refuseMisplacedDecision` beside `refuseMisplacedConcurrency`, with `blueprint-reused`; the
+        five refusals). Tests: `tests/mastra/race-surface.test.ts` (the brand gate as a
+        `@ts-expect-error` under `npm run check`: a default-engine step is not a petri arm),
+        `tests/mastra/adapt-decision.test.ts` ("agent and tool arms match by ref and options
+        identity", and an equal-but-distinct options object refused `blueprint-arms`)
+    - **W1b** (after B): **A — decision gadget**: `src/compiler/blueprints/first-k.ts`. The amended
+      net, per-arm `preempted` places through `emitNested(…, { preempt })` (none at n = 1), dead
+      absorb pairs omitted (k = n, k = 1), `settled` omitted at n = 1, admission under
+      `concurrency`, `met` / `short` building one `StepPreemptedError` for `scope.preempt(path,
+      reason)`, the join's output from records, the lowest-index failure or `QuorumNotMetError`
+      with arrival statuses, the suspended loser's record rewrite plus `scope.forgetSuspension`,
+      claims (`okSeen`/`miss` ≤ n, `settled` ≤ `settledBound` when emitted), the `won`/`short`
+      exclusion and one `DecisionSite`. Tests: `tests/compiler/quorum.test.ts` (shape, names, an
+      early-`preempted` firing, counts 0 omitting their arcs, dead absorbs omitted, n = 1, the hash
+      moving with `k`)
+    - **W1c** (after A, against its `DecisionSite`):
+      - **E — verify**: `src/verify/decision.ts` (the seven rules; mutants `inhibitor(won)` on
+        `short`, a success collect producing `miss`, a reset on `okSeen`, a dead absorb pair
+        emitted), `src/verify/claims.ts` (`decisionTargets` — `met` and `short` only — appended by
+        `livenessTargets`), `src/verify/properties.ts` (`decision structure` beside `pool
+        structure`). Tests: `tests/verify/decision.test.ts`
+      - **F — docs**: `docs/divergences.md` rows 103–110 checked against what W1 built; README's
+        Layer 3 list
+  - [ ] W2 integration (lead, after W1): `tests/engine/race.test.ts` (first success wins, all fail
+        reports the lowest index, `QuorumNotMetError` with `suspended` and `preempted` distinct,
+        suspended loser with its resume label gone, cancel mid-race, run abort / deadline / preempt
+        precedence, retrying loser, loser ignoring its signal, loser behind an exhausted limit,
+        `concurrency: 2`, `.then(next)` under `validateInputs` with arm keys optional — and failing
+        with them required); race and quorum in `tests/verify/blueprints.test.ts` — n=3 k=1/2/3 and
+        n=4 k=1/2, ± run budget 1, one arm retrying (retries 2, delay 5 ms), `limit` inside an arm;
+        a forced `cloneWorkflow` running it as a plain parallel. Every query under 30 s, figures
+        quoted with the libpetri provenance line
+  - [ ] W3: ADR 0014 accepted with Evidence; rows 103–110 `fixed (M7b)`; CI green on the `proofs`
+        shards
 - [ ] Second wave: `pipeline()` — the one the IR structurally cannot express, since
       join-before-next-index is its defining property — plus `supersede()`, `compensate()`,
       `circuitBreaker()`, `queue(depth)`, `correlate(key)`
