@@ -1,6 +1,6 @@
 # ADR 0010 — Restart continues from the latest author-marked checkpoint, a proven boundary of the same net
 
-Status: proposed (2026-10-04, M4b)
+Status: accepted (2026-10-04, M4b)
 
 ## Context
 
@@ -112,11 +112,22 @@ same net, proven at every boundary.**
 
 ## Evidence
 
-Untested until M4b lands. Planned: `tests/compiler/checkpoint.test.ts` (unmarked nets unchanged,
-refusals per position), `tests/verify/restart-segments.test.ts` (`restart@p` at every boundary,
-k = 1, 2, 4, unbounded, with timings and libpetri provenance), `tests/mastra/checkpoint-row.test.ts`,
-`tests/upstream/restart-seam.test.ts`, `tests/conformance/restart*.test.ts` (crash at every
-recorded row; petri>petri vs petri>default, default>default vs default>petri).
+- `tests/compiler/checkpoint.test.ts` — unmarked nets keep their structural hash; one place and two
+  transitions per mark; refusals; marked workflows prove `closed` and `cancel`.
+- `tests/mastra/adapt-checkpoint.test.ts` — the mark read from step and entry metadata, the
+  `checkpoint-position` / `checkpoint-value` refusals, and the Layer test on the default engine.
+- `tests/verify/restart-segments.test.ts` — `restart@p` and `restart@p+cancel` proven at every
+  boundary at k = 1, 2, 4 and unbounded; a shared marking cited, not re-asked; structure mutants.
+- `tests/engine/kernel-restart.test.ts`, `tests/compiler/restart-seed.test.ts` — seeding and refusals.
+- `tests/mastra/checkpoint-row.test.ts`, `tests/mastra/engine-restart.test.ts`,
+  `tests/mastra/restart-codec.test.ts` — the row key for key, a rejected write rejecting the run,
+  refusals that persist nothing.
+- `tests/upstream/restart-seam.test.ts` — Mastra reads `workflowEngineType` only before its first
+  `await`; `tests/mastra/restart-surface.test.ts`, `tests/mastra/recovery.test.ts`.
+- `tests/conformance/restart-differential.test.ts` — a crash at every row, restarted on a fresh
+  store: petri>petri 0 differences; default>petri differences only as rows 92 and 93 record.
+- The corpus gate with restart segments: every claim holds at 30 s a query on CI (PR #1, registry
+  libpetri 8.0.0).
 
 [ADR 0007]: 0007-resume-is-a-seeded-segment.md
 [ADR 0009]: 0009-verification-claims.md
