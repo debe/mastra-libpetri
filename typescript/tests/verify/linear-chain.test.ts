@@ -75,7 +75,7 @@ describe('compiled linear chain, proved', () => {
 
     // `compile` takes no runner: a net compiled only to be verified never fires.
     await expectProvenBothSegments(chain);
-  }, 90_000);
+  });
 
   it('proves a chain using every leaf form at once', async () => {
     const chain: WorkflowDescription = {
@@ -91,7 +91,7 @@ describe('compiled linear chain, proved', () => {
     };
 
     await expectProvenBothSegments(chain);
-  }, 180_000);
+  });
 });
 
 /**
@@ -189,7 +189,7 @@ describe('fixed sleeps around every gadget, proved', () => {
 
   // Each query's solver budget is 300s — what `tests/verify/foreach.test.ts` gives a two-lane
   // foreach, whose queries the 30s default leaves `unknown`.
-  it.concurrent.for(gadgets)('a fixed sleep before and after a %s', { timeout: 1_800_000 }, async ([, entry], { expect }) => {
+  it.concurrent.for(gadgets)('a fixed sleep before and after a %s', async ([, entry], { expect }) => {
     const description: WorkflowDescription = { id: 'sleepy', entries: [nap('before'), entry, nap('after')] };
     expect(cancelStructureViolations(compile(description))).toEqual([]);
     const compiled = compile(description);

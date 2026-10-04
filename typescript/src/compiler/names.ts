@@ -61,6 +61,25 @@ export const WF_CANCEL = 'wf.cancel';
 export const WF_CANCEL_REQUEST = 'wf.cancel.request';
 /** The transition that moves an arrived cancellation to the signal. */
 export const T_CANCEL_ARRIVE = 't.cancel.arrive';
+/** A block's slot pool ([ADR 0011]): `wf.slots.<path>`, outside the `s.<i>` namespace as `wf.permits` is. */
+export const WF_SLOTS = 'wf.slots';
+/** A quota's canonical places ([ADR 0012]): `wf.quota.<id>` and, for a rate limit, `.spent` / `.demand`. */
+export const WF_QUOTA = 'wf.quota';
+
+/**
+ * A quota place's role ([ADR 0012]). `pool` is the quota itself — a `limit`'s pool, a `rateLimit`'s
+ * bucket; `spent` and `demand` exist only for a `rateLimit`.
+ */
+export type QuotaRole = 'pool' | 'spent' | 'demand';
+
+/** What a quota id may contain ([ADR 0012]): a name segment as it stands. */
+export const QUOTA_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+/** A quota id as a name segment: verbatim, never slugged, so two ids never share a place. */
+function quotaSegment(id: string): string {
+  if (!QUOTA_ID_PATTERN.test(id)) throw new Error(`a quota id must match [A-Za-z0-9_-]+, got '${id}'`);
+  return id;
+}
 
 export class NameVocabulary {
   readonly #seen = new Map<string, string>();
@@ -124,6 +143,41 @@ export class NameVocabulary {
     return this.#mint(
       `t.${checkpointSegment(index)}.${canceled ? 'checkpoint-cancel' : 'checkpoint'}`,
       `${canceled ? 'cancel sweep of the ' : ''}checkpoint after entry ${index}`,
+    );
+  }
+
+  /**
+   * A block's slot pool ([ADR 0011]): `wf.slots.<path>`, seeded with the block's `concurrency`. It
+   * lives outside `s.<i>` so the barrier never counts it as the block's interior — it is marked at
+   * every boundary, as `wf.permits` is.
+   */
+  slotsPlace(path: EntryPath): string {
+    return this.#mint(`${WF_SLOTS}.${pathSegment(path)}`, `slot pool of entry ${pathSegment(path)}`);
+  }
+
+  /**
+   * A quota's canonical place ([ADR 0012]) — the one every using step's member is fused into, minted
+   * once per quota by the compiler: `wf.quota.<id>` for `pool`, `wf.quota.<id>.<role>` otherwise.
+   */
+  quotaPlace(id: string, role: QuotaRole): string {
+    const base = `${WF_QUOTA}.${quotaSegment(id)}`;
+    return this.#mint(role === 'pool' ? base : `${base}.${role}`, `quota '${id}' ${role}`);
+  }
+
+  /** A quota's one refill transition ([ADR 0012]): `t.quota.<id>.refill`, emitted by the compiler, never a gadget. */
+  quotaRefill(id: string): string {
+    return this.#mint(`t.quota.${quotaSegment(id)}.refill`, `refill of quota '${id}'`);
+  }
+
+  /**
+   * One step occurrence's member of a quota place ([ADR 0012]): `s.<path>.<slug>.quota.<id>.<role>`,
+   * fused into {@link quotaPlace} at build, so it never survives into the net. Six segments, which
+   * no other gadget name has.
+   */
+  quotaMember(path: EntryPath, stepId: string, id: string, role: QuotaRole): string {
+    return this.#mint(
+      `s.${pathSegment(path)}.${slug(stepId)}.quota.${quotaSegment(id)}.${role}`,
+      `quota '${id}' ${role} member of entry ${pathSegment(path)}`,
     );
   }
 

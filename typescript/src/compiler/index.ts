@@ -17,9 +17,14 @@ export {
   WF_FAILED,
   WF_PAUSED,
   WF_PERMITS,
+  WF_QUOTA,
+  WF_SLOTS,
   WF_SUSPENDED,
+  QUOTA_ID_PATTERN,
 } from './names.js';
-export type { EntryPath } from './names.js';
+export type { EntryPath, QuotaRole } from './names.js';
+export { StepTimeoutError } from './timeout.js';
+export type { AttemptDeadline } from './timeout.js';
 export { RUN_SCOPE_KEY, scopeOf, viewOf } from './scope.js';
 export type { RunScope } from './scope.js';
 export type {
@@ -57,6 +62,12 @@ export type {
   PlaceClaim,
   ExclusionClaim,
   TopLevelEntry,
+  BlockConcurrency,
+  QuotaRef,
+  Pool,
+  PoolCommon,
+  PoolHolder,
+  PoolKind,
 } from './types.js';
 export { resumeSeed, UnresumablePositionError } from './resume.js';
 export { HostPreconditionError } from './gadgets/leaf.js';

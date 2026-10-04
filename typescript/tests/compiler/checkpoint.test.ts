@@ -266,11 +266,11 @@ describe('a marked workflow still proves', () => {
     const report = await timed('chain [0,1]', compile(marked(chain, [0, 1])));
     expect(report.claims.some((c) => c.property.includes('s.0.checkpoint'))).toBe(true);
     expectHolds(report);
-  }, 120_000);
+  });
 
   it('a chain marked after every entry, with k = 1', async () => {
     expectHolds(await timed('chain [0,1] k=1', compile(marked(chain, [0, 1]), { concurrency: 1 })));
-  }, 120_000);
+  });
 
   // One small workflow per construct, every boundary marked. `mixed` above is near the budget
   // unmarked already (148s wall, deadlockFree 24.7s; at k = 2 deadlockFree is `unknown` unmarked), so
@@ -292,7 +292,7 @@ describe('a marked workflow still proves', () => {
       it(`${label}, marked ${JSON.stringify(all)}${k === undefined ? '' : `, k = ${k}`}`, async () => {
         const compiled = compile({ id: 'small', entries, checkpoints: all }, k === undefined ? {} : { concurrency: k });
         expectHolds(await timed(`${label} ${JSON.stringify(all)}${k === undefined ? '' : ` k=${k}`}`, compiled));
-      }, 120_000);
+      });
     }
   }
 });

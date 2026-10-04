@@ -12,7 +12,8 @@ import {
 } from 'libpetri';
 import type { EntryPath } from '../names.js';
 import { scopeOf, viewOf, type RunScope } from '../scope.js';
-import type { Exits, FlowToken, StepOutcome, StepRecord, StepSource } from '../types.js';
+import { StepTimeoutError } from '../timeout.js';
+import type { Exits, FailureToken, FlowToken, StepOutcome, StepRecord, StepSource } from '../types.js';
 import type { Gadget, GadgetContext } from './types.js';
 
 /**
@@ -76,37 +77,148 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
     throw new Error(`step '${entry.id}': retryDelayMs must be in [0, ${MAX_WAIT_MS}], got ${String(delayMs)}`);
   }
 
+  const timeoutMs = entry.timeoutMs;
+  if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_WAIT_MS)) {
+    throw new Error(`step '${entry.id}': timeoutMs must be a whole number in [1, ${MAX_WAIT_MS}], got ${String(timeoutMs)}`);
+  }
+  const quotaRefs = entry.quotas ?? [];
+  const quotaIds = quotaRefs.map((q) => q.id);
+  const repeated = quotaIds.find((id, i) => quotaIds.indexOf(id) !== i);
+  if (repeated !== undefined) {
+    // Two arcs on one place would be the honest reading of `uses: [q, q]`, and an ambiguous one
+    // ([ADR 0012] takes one token per quota per attempt), so it is refused, never deduplicated.
+    throw new Error(`step '${entry.id}' uses quota '${repeated}' more than once`);
+  }
+
   const source = entry.source ?? 'step';
   const { names, path, viewPath, exits, cancel, permits } = ctx;
   const inPlace = place<FlowToken>(names.entryIn(path, entry.id));
   const transitions: Transition[] = [];
   if (cancel !== undefined) transitions.push(sweep(names.entryTransition(path, entry.id, 'cancel'), inPlace, cancel, exits, entry.id, viewPath));
 
+  // The quota members ([ADR 0012]), asked once per step and shared by every attempt: what each
+  // attempt takes beside its permit, and what every one of its branches gives back. A `limit` is
+  // taken and returned; a `rateLimit`'s bucket token is taken and lands in `spent`, for the
+  // compiler's one refill, and a `demand` token — deposited by the attempt's `request` — is taken.
+  const taken: Place<null>[] = [];
+  const returned: Place<null>[] = [];
+  const demands: Place<null>[] = [];
+  for (const ref of quotaRefs) {
+    const pool = ctx.quotaMember(ref, 'pool');
+    if (ref.kind === 'limit') {
+      taken.push(pool);
+      returned.push(pool);
+    } else {
+      const demand = ctx.quotaMember(ref, 'demand');
+      demands.push(demand);
+      taken.push(demand, pool);
+      returned.push(ctx.quotaMember(ref, 'spent'));
+    }
+  }
+  const back: Place<null>[] = [...(permits === undefined ? [] : [permits]), ...returned];
+
   const attempts: string[] = [];
   const hops: string[] = [];
+  const timeouts: string[] = [];
+  const timedOutPlaces: string[] = [];
   let attemptIn = inPlace;
   for (let attempt = 0; attempt <= retries; attempt++) {
     const retry =
       attempt < retries ? place<FlowToken>(names.entryPlace(path, entry.id, `retry-${attempt + 1}`)) : undefined;
 
+    // A rate-limited attempt first announces itself ([ADR 0012]): `request-j` moves the token to
+    // `ready-j` and deposits one `demand` per rate quota, which is what enables the refill — so a
+    // bucket refills only while an attempt is waiting on it, and the net quiesces when none is. It
+    // is the entry gate in place of the attempt: Mastra checks abort before an entry, never between
+    // attempts, so only `request-0` is inhibited by the cancel signal.
+    let from = attemptIn;
+    if (demands.length > 0) {
+      const ready = place<FlowToken>(names.entryPlace(path, entry.id, `ready-${attempt}`));
+      const requestIn = attemptIn;
+      const request = Transition.builder(names.entryTransition(path, entry.id, `request-${attempt}`))
+        .inputs(one(requestIn))
+        .outputs(and(outPlace(ready), ...demands.map((d) => outPlace(d))))
+        .action(async (tctx) => {
+          tctx.output(ready, tctx.input(requestIn));
+          for (const d of demands) tctx.output(d, null);
+        });
+      if (attempt === 0 && cancel !== undefined) request.inhibitor(cancel);
+      transitions.push(request.build());
+      from = ready;
+    }
+
+    // A timeout ([ADR 0013]) is one more branch the action writes itself: what goes to the retry
+    // on a non-final attempt, and to the failure exit on the final one, through the funnel below.
+    const timedOut =
+      timeoutMs === undefined
+        ? undefined
+        : retry !== undefined
+          ? { kind: 'retry' as const, place: place<RetryToken>(names.entryPlace(path, entry.id, `timed-out-${attempt}`)) }
+          : { kind: 'final' as const, place: place<FailureToken>(names.entryPlace(path, entry.id, `timed-out-${attempt}`)) };
+
     // With a budget, every branch is its outcome *and* the permit back ([ADR 0006]): an Xor of
     // Ands, so each structural branch is exactly a runtime outcome and the verifier sees the permit
-    // returned on every one of them — the P-invariant `permits + in flight = k` is in the arcs.
-    const branch = (to: Place<unknown>): Out => (permits === undefined ? outPlace(to) : and(outPlace(to), outPlace(permits)));
+    // returned on every one of them — the P-invariant `permits + in flight = k` is in the arcs. The
+    // quotas ride the same branches ([ADR 0012]).
+    const branch = (to: Place<unknown>): Out => (back.length === 0 ? outPlace(to) : and(outPlace(to), ...back.map((p) => outPlace(p))));
     const outcomes: Out[] = [next, exits.failed, exits.bailed, exits.suspended, exits.paused].map(branch);
     if (retry !== undefined) outcomes.push(branch(retry));
+    if (timedOut !== undefined) outcomes.push(branch(timedOut.place));
 
     const run = Transition.builder(
       attempt === 0 ? names.entryRun(path, entry.id) : names.entryTransition(path, entry.id, `run-${attempt}`),
     )
-      .inputs(...(permits === undefined ? [one(attemptIn)] : [one(attemptIn), one(permits)]))
+      .inputs(one(from), ...(permits === undefined ? [] : [one(permits)]), ...taken.map((p) => one(p)))
       .outputs(xor(...outcomes))
-      .action(stepAction({ stepId: entry.id, path: viewPath, source, attempt, from: attemptIn, next, exits, retry, permits }));
-    if (attempt === 0 && cancel !== undefined) run.inhibitor(cancel);
+      .action(
+        stepAction({
+          stepId: entry.id,
+          path: viewPath,
+          source,
+          attempt,
+          from,
+          next,
+          exits,
+          retry,
+          permits,
+          ...(returned.length > 0 ? { returned } : {}),
+          ...(timeoutMs !== undefined && timedOut !== undefined ? { timeout: { ms: timeoutMs, ...timedOut } } : {}),
+        }),
+      );
+    if (attempt === 0 && cancel !== undefined && demands.length === 0) run.inhibitor(cancel);
     const built = run.build();
     ctx.stepAttempt(built.name);
     attempts.push(built.name);
     transitions.push(built);
+
+    if (timedOut !== undefined) {
+      // The funnel: immediate, ungated (a retry is never gated), forwarding the attempt's own token.
+      // Kept apart from the attempt so `timedOut_j` is a place the liveness witness can reach and
+      // the retry ceiling can see: link `j + 1` is produced by attempt `j` or funnel `j`, nothing else.
+      const funnel = Transition.builder(names.entryTransition(path, entry.id, `timeout-${attempt}`));
+      if (timedOut.kind === 'retry') {
+        const to = retry!;
+        const at = timedOut.place;
+        funnel
+          .inputs(one(at))
+          .outputs(outPlace(to))
+          .action(async (tctx) => {
+            tctx.output(to, tctx.input(at));
+          });
+      } else {
+        const at = timedOut.place;
+        funnel
+          .inputs(one(at))
+          .outputs(outPlace(exits.failed))
+          .action(async (tctx) => {
+            tctx.output(exits.failed, tctx.input(at));
+          });
+      }
+      const funnelBuilt = funnel.build();
+      timeouts.push(funnelBuilt.name);
+      timedOutPlaces.push(timedOut.place.name);
+      transitions.push(funnelBuilt);
+    }
 
     if (retry !== undefined) {
       const nextAttempt = place<FlowToken>(names.entryPlace(path, entry.id, `attempt-${attempt + 1}`));
@@ -123,7 +235,7 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
       attemptIn = nextAttempt;
     }
   }
-  ctx.stepChain({ stepId: entry.id, path, retries, inPlace: inPlace.name, attempts, hops });
+  ctx.stepChain({ stepId: entry.id, path, retries, inPlace: inPlace.name, attempts, hops, timeouts, timedOut: timedOutPlaces, quotas: quotaIds });
 
   return { inPlace, transitions };
 };
@@ -413,6 +525,19 @@ interface StepActionSpec {
   readonly retry: Place<FlowToken> | undefined;
   /** The run's permits, handed back with every outcome; absent when the run is unbounded. */
   readonly permits: Place<null> | undefined;
+  /**
+   * What every branch deposits beside the permit ([ADR 0012]): each `limit` quota's member, given
+   * back, and each `rateLimit`'s `spent` member. Absent when the step uses no quota.
+   */
+  readonly returned?: readonly Place<null>[];
+  /**
+   * The attempt's deadline ([ADR 0013]) and its `timedOut` branch: on a non-final attempt it carries
+   * the retry token (the funnel forwards it to `retry`), on the final one the failure token (the
+   * funnel forwards it to `exits.failed`). Absent when the step has no timeout.
+   */
+  readonly timeout?:
+    | { readonly ms: number; readonly kind: 'retry'; readonly place: Place<RetryToken> }
+    | { readonly ms: number; readonly kind: 'final'; readonly place: Place<FailureToken> };
 }
 
 const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bailed', 'suspended', 'paused']);
@@ -426,12 +551,14 @@ const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bai
  * duplicate tokens and satisfy none of the `xor`'s branches.
  */
 export function stepAction(spec: StepActionSpec): TransitionAction {
-  const { stepId, path, source, attempt, from, next, exits, retry, permits } = spec;
+  const { stepId, path, source, attempt, from, next, exits, retry, permits, returned = [], timeout } = spec;
   return async (tctx) => {
     const incoming = tctx.input(from) as RetryToken;
-    // The permit goes back with whichever branch is written — the same firing, never later.
+    // The permit — and every quota token ([ADR 0012]) — goes back with whichever branch is
+    // written: the same firing, never later.
     const release = (): void => {
       if (permits !== undefined) tctx.output(permits, null);
+      for (const p of returned) tctx.output(p, null);
     };
     const scope = scopeOf(tctx);
     const resumed = incoming.resumed === true;
@@ -441,9 +568,13 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     // so the first attempt reads the clock before the call and the stamp rides the retry token.
     const fresh = incoming.startedAt ?? scope.epochNow();
 
-    let outcome: StepOutcome;
-    try {
-      outcome = await scope.runner.run(stepId, incoming.data, {
+    // The attempt's deadline ([ADR 0013]), armed on the run's clock before the call. Its error is
+    // the signal's reason and, should it fire, the attempt's failure.
+    const expiry =
+      timeout === undefined ? undefined : new StepTimeoutError(stepId, path, timeout.ms, attempt, incoming.foreachIndex);
+    const deadline = timeout === undefined ? undefined : scope.armDeadline(timeout.ms, expiry);
+    const call = async (): Promise<StepOutcome> => {
+      const result = await scope.runner.run(stepId, incoming.data, {
         ...viewOf(scope, path),
         source,
         attempt,
@@ -453,25 +584,53 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
         ...(resumed ? { resumed: true as const } : {}),
         ...(incoming.iteration === undefined ? {} : { iteration: incoming.iteration }),
         startedAt: fresh,
+        ...(deadline === undefined ? {} : { deadline: deadline.signal }),
       });
-      if (outcome === null || typeof outcome !== 'object' || !OUTCOME_STATUSES.has((outcome as { status: unknown }).status as string)) {
-        throw new Error(`runner returned an unrecognised outcome for step '${stepId}': ${describe(outcome)}`);
+      if (result === null || typeof result !== 'object' || !OUTCOME_STATUSES.has((result as { status: unknown }).status as string)) {
+        throw new Error(`runner returned an unrecognised outcome for step '${stepId}': ${describe(result)}`);
       }
-    } catch (error) {
-      if (error instanceof HostPreconditionError) {
-        // The host refused before the step ran — Mastra's resume rejects there, before it writes
-        // the step's record or enters its retry loop (`handlers/step.ts:145-175`). A rethrow would
-        // lose the consumed input and permit ([EXEC-031]): libpetri drops a failed action's inputs
-        // and, under Mastra's abort signal, the executor never quiesces, so the run would hang
-        // rather than reject. So the refusal leaves by the declared failure branch — no record, no
-        // retry, the permit back — carrying the marker, which the engine turns into the rejection.
-        tctx.output(exits.failed, { ...withIndex({ stepId, path }, incoming), error });
-        release();
-        return;
-      }
+      return result;
+    };
+    // Settled, never rejected: the race below must not leave a rejection unobserved.
+    const running = call().then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    let timedOut = false;
+    if (deadline !== undefined) {
+      // The step against its deadline. A run abort before expiry disarms the deadline — `expired`
+      // then never resolves — so the step's own outcome stands. Once it fires the outcome is the
+      // timeout, but the action still waits for the step to settle: it never abandons it, so the
+      // permit and quotas stay held and a retry never overlaps its predecessor.
+      const winner = await Promise.race([running.then(() => 'step' as const), deadline.expired.then(() => 'deadline' as const)]);
+      if (winner === 'step') deadline.disarm();
+      else timedOut = true;
+    }
+    const settled = await running;
+
+    let outcome: StepOutcome;
+    if (!settled.ok && settled.error instanceof HostPreconditionError) {
+      // The host refused before the step ran — Mastra's resume rejects there, before it writes
+      // the step's record or enters its retry loop (`handlers/step.ts:145-175`). A rethrow would
+      // lose the consumed input and permit ([EXEC-031]): libpetri drops a failed action's inputs
+      // and, under Mastra's abort signal, the executor never quiesces, so the run would hang
+      // rather than reject. So the refusal leaves by the declared failure branch — no record, no
+      // retry, the permit back — carrying the marker, which the engine turns into the rejection.
+      // A refusal is not an outcome of the step, so it wins over a deadline that fired meanwhile.
+      tctx.output(exits.failed, { ...withIndex({ stepId, path }, incoming), error: settled.error });
+      release();
+      return;
+    }
+    if (timedOut) {
+      // The step's own result, late, is discarded ([ADR 0013]): a timeout is a plain failure,
+      // retryable like a thrown error, and leaves by the `timedOut` branch below.
+      outcome = { status: 'failed', error: expiry };
+    } else if (settled.ok) {
+      outcome = settled.value;
+    } else {
       // A runner that throws is a failed step, not a lost token — and, like a step whose
       // `execute` throws in Mastra, it is retryable.
-      outcome = { status: 'failed', error };
+      outcome = { status: 'failed', error: settled.error };
     }
 
     // A resumed attempt is recorded as resumed exactly when the runner says so, by `resumedAt`:
@@ -485,7 +644,9 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
       // The whole token rides the retry chain — `resumed` included, so the next attempt is still
       // the resumed one. `carried()` is what stops it at the step's exit.
       const carry: RetryToken = { ...incoming, ...(startedAt === undefined ? {} : { startedAt }) };
-      tctx.output(retry, carry);
+      // A timed-out attempt leaves by its own branch; its funnel forwards to the same retry.
+      if (timedOut && timeout?.kind === 'retry') tctx.output(timeout.place, carry);
+      else tctx.output(retry, carry);
       release();
       return;
     }
@@ -550,16 +711,20 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
         tctx.output(next, { ...carried(incoming), data: outcome.output });
         release();
         return;
-      case 'failed':
-        tctx.output(exits.failed, {
+      case 'failed': {
+        const failure: FailureToken = {
           ...origin,
           ...stepPayload,
           error: outcome.error,
           ...(outcome.tripwire === undefined ? {} : { tripwire: outcome.tripwire }),
           ...(outcome.nonRetryable === true ? { nonRetryable: true as const } : {}),
-        });
+        };
+        // The final attempt's timeout leaves by its own branch; its funnel forwards to the failure exit.
+        if (timedOut && timeout?.kind === 'final') tctx.output(timeout.place, failure);
+        else tctx.output(exits.failed, failure);
         release();
         return;
+      }
       case 'bailed':
         tctx.output(exits.bailed, { ...origin, ...stepPayload, output: outcome.output });
         release();

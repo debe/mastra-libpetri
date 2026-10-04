@@ -1,4 +1,5 @@
 import { availableParallelism } from 'node:os';
+import { pool } from '../internal/pool.js';
 import {
   SmtVerifier,
   StateSpaceCache,
@@ -21,6 +22,7 @@ import {
   type UnclaimedPlace,
 } from './claims.js';
 import {
+  ENUMERATION_MAX_CLASSES,
   completionProperties,
   describeReport,
   markingKey,
@@ -31,13 +33,16 @@ import {
   type Segment,
   type VerifyOptions,
 } from './properties.js';
+import { poolSinks } from './pools.js';
 
 /**
  * The four families `verify` proves ([ADR 0009]):
  *
  * - `completion` — `verifyWorkflow`'s set, the same queries: `deadlockFree` with every terminal a sink,
- *   `terminatesAtSink`, `exactlyOneTerminal`, `neverCanceled`, and the budget's two.
- * - `bounds` — `placeBound` on every place at its claimed bound (1 unless a gadget claims more).
+ *   `terminatesAtSink`, `exactlyOneTerminal`, `neverCanceled`, the budget's two, and one per other
+ *   pool ([ADR 0012]): `poolReturned` for slots and a `limit`, `demandDrained` for a rate quota.
+ * - `bounds` — `placeBound` on every place at its claimed bound (1 unless a gadget claims more; a
+ *   pool's places at what the pool implies, `boundClaims`).
  * - `exclusion` — `mutualExclusion` for Mastra's barrier between entries, and the gadgets' own.
  * - `liveness` — every step attempt, retries included, has a confirmed run that enables it: no
  *   dead steps, and the retry ceiling is reached, not merely bounded.
@@ -97,6 +102,12 @@ export interface ClaimReport {
    * ([ADR 0010]). The claim is listed under both labels; it is proven once.
    */
   readonly sameProofAs?: Segment;
+  /**
+   * What the claim does not say, where that is easy to misread. A rate quota's bucket bound
+   * ([ADR 0012]) carries one: it bounds the burst, while the rate over time is a timed property,
+   * tested under a ManualClock and not proven.
+   */
+  readonly note?: string;
 }
 
 /** The claim is `unknown` under in-flight firing and `proven` assuming atomic firing. */
@@ -121,7 +132,7 @@ export interface VerificationReport {
 /**
  * Proves every claim M6 makes about a compiled workflow ([ADR 0009]) and says which hold.
  *
- * **Structure first.** The six structural checks `verifyWorkflow` runs, plus
+ * **Structure first.** The seven structural checks `verifyWorkflow` runs (the pool check among them), plus
  * `retryCeilingViolations`, run before any query and throw on a violation — unless
  * `structure: 'skip'`, which exists for mutation tests only.
  *
@@ -155,7 +166,8 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
   }
 
   const t = compiled.terminals;
-  const sinks: Place<unknown>[] = [t.done, t.failed, t.bailed, t.suspended, t.paused, t.canceled, compiled.cancel, ...(compiled.budget ? [compiled.budget.permits] : [])];
+  // The pools are sinks as the permits always were ([ADR 0012]): `poolSinks` lists the permits too.
+  const sinks: Place<unknown>[] = [t.done, t.failed, t.bailed, t.suspended, t.paused, t.canceled, compiled.cancel, ...poolSinks(compiled)];
   // One state-space cache per call ([VER-017]): the graph depends only on the net and the initial
   // marking, so a segment's is built once and every claim on it reuses it — or, when it outgrew the
   // budget, goes straight to the solver pipeline, whose linear bound ([VER-015]) settles most claims
@@ -171,7 +183,12 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
       .sinkPlaces(...sinks)
       .semiflowInvariants(true)
       .stateSpaceCache(cache)
+      .enumerationMaxClasses(ENUMERATION_MAX_CLASSES)
       .timeout(timeout)
+      // `timeout` bounds each z3 process; one query may start several, plus solver-free work no
+      // timeout covers ([VER-013]). The total budget caps the whole query, so 30 s is the limit it
+      // says, and an exhausted one names the phase it ran out in.
+      .totalBudget(timeout)
       .property(property);
     // [VER-016]'s firing counters: opt-in in libpetri because they slow a violated query's witness
     // search, so asked only of a completion proof that came back `unknown`.
@@ -225,13 +242,24 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
     readonly property: string;
     readonly segment: Segment;
     readonly smt: SmtProperty;
+    readonly note?: string;
   }
   const jobs: Job[] = [];
   const { claimed, unclaimed } = boundClaims(compiled);
+  const rateNotes = new Map(
+    compiled.pools.flatMap((pool) =>
+      pool.kind === 'bucket'
+        ? [[pool.place.name, `bounds the burst of quota '${pool.quota}'; its rate, ${pool.seed} per ${pool.perMs} ms, is timed: tested, not proven`] as const]
+        : [],
+    ),
+  );
   const exclusive = exclusions(compiled);
   for (const segment of asking) {
     if (families.includes('bounds')) {
-      for (const c of claimed) jobs.push({ family: 'bounds', kind: 'proof', property: `bound(${c.place.name}<=${c.bound})`, segment, smt: placeBound(c.place, c.bound) });
+      for (const c of claimed) {
+        const note = rateNotes.get(c.place.name);
+        jobs.push({ family: 'bounds', kind: 'proof', property: `bound(${c.place.name}<=${c.bound})`, segment, smt: placeBound(c.place, c.bound), ...(note === undefined ? {} : { note }) });
+      }
     }
     if (families.includes('exclusion')) {
       for (const e of exclusive) jobs.push({ family: 'exclusion', kind: 'proof', property: `exclusive(${e.a.name},${e.b.name})`, segment, smt: mutualExclusion(e.a, e.b) });
@@ -247,7 +275,7 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
   jobs.forEach((job, i) => {
     const result = results[i]!;
     const holds = settles(job.kind, result);
-    claims.push({ family: job.family, kind: job.kind, property: job.property, segment: job.segment, marking: markingOf(job.segment), result, holds });
+    claims.push({ family: job.family, kind: job.kind, property: job.property, segment: job.segment, marking: markingOf(job.segment), result, holds, ...(job.note === undefined ? {} : { note: job.note }) });
   });
 
   // The labelled fallback: a proof the split net could not decide, asked again assuming atomic
@@ -304,19 +332,6 @@ function describeMarking(marking: ReadonlyMap<Place<unknown>, number>): string {
   return `{${[...marking].map(([p, n]) => `${p.name}: ${n}`).join(', ')}}`;
 }
 
-/** Runs `work` over `items` with at most `width` in flight; results in item order. */
-async function pool<T, R>(items: readonly T[], width: number, work: (item: T) => Promise<R>): Promise<R[]> {
-  const out = new Array<R>(items.length);
-  let next = 0;
-  const lane = async (): Promise<void> => {
-    while (next < items.length) {
-      const i = next++;
-      out[i] = await work(items[i]!);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(width, items.length) }, lane));
-  return out;
-}
 
 /**
  * One line per claim, as `describeReport` prints a completion proof — a witness adds how many
@@ -332,5 +347,6 @@ export function describeClaim(claim: ClaimReport): string {
     : ' (no witness found)';
   const atomic = claim.assumingAtomic === undefined ? ''
     : ` [assuming atomic firing: ${claim.assumingAtomic.verdict.type} via ${claim.assumingAtomic.route} in ${claim.assumingAtomic.elapsedMs}ms]`;
-  return `${claim.holds ? 'holds' : 'FAILS'} ${claim.family}: ${line}${reading}${atomic}`;
+  const note = claim.note === undefined ? '' : ` (${claim.note})`;
+  return `${claim.holds ? 'holds' : 'FAILS'} ${claim.family}: ${line}${reading}${note}${atomic}`;
 }

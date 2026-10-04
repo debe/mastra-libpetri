@@ -58,7 +58,7 @@ describe('verifyMastraWorkflow', () => {
     expectEveryClaimBacked(nested);
 
     expect(verification.holds).toBe(true);
-  }, 120_000);
+  });
 
   it('an explicit concurrency overrides the engine\'s, for the nested workflow too', async () => {
     const verification = await verifyMastraWorkflow(outer, { concurrency: 1, families: ['completion'], resume: 'none', restart: 'none' });

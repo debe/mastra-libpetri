@@ -1,5 +1,6 @@
 import { systemClock, type Clock } from 'libpetri';
 import type { RunScope } from '../compiler/scope.js';
+import type { AttemptDeadline } from '../compiler/timeout.js';
 import type { CheckpointEvent, LifecycleEvent, StepRecord, StepRunner } from '../compiler/types.js';
 
 export interface RunScopeOptions {
@@ -144,5 +145,81 @@ export class KernelRunScope implements RunScope {
     } finally {
       this.signal.removeEventListener('abort', onAbort);
     }
+  }
+
+  /**
+   * See `RunScope.armDeadline` ([ADR 0013]). The deadline is `ms` after this call on the run's
+   * firing clock ([TIME-015]), fixed here; the wait runs on `Clock.sleep`, looped as {@link wait}
+   * loops, so an early or spurious resolution never fires it early.
+   *
+   * **The first sleep starts one macrotask after arming.** The leaf arms, then calls the runner; an
+   * attempt that settles without waiting on anything (a resolved promise, a chain of microtasks)
+   * has settled — and disarmed — before the deadline asks the clock for its first wait. Without the
+   * turn, a virtual clock that advances on every finite `sleep` (the tests' `ManualClock`) would jump
+   * `ms` forward on every armed attempt, however quickly it returned. With a real clock it costs
+   * nothing: the instant is fixed before the turn, and the wait is `until - now()` after it.
+   *
+   * Disarmed — by `disarm()`, by the run's abort, or by the run signal being aborted already — it
+   * never fires and leaves nothing pending: the turn is cleared, the current `sleep` is aborted
+   * (which by the clock contract resolves it and releases its timer), and the run listener is
+   * removed. The `ready` predicate handed to the clock is `true` once disarmed — time-free — so a
+   * clock that consults it does not move time for a deadline nobody waits on.
+   */
+  armDeadline(ms: number, reason: unknown): AttemptDeadline {
+    const clock = this.#clock;
+    const run = this.signal;
+    const until = clock.now() + ms;
+    const controller = new AbortController();
+    let resolveExpired!: () => void;
+    const expired = new Promise<void>((resolve) => {
+      resolveExpired = resolve;
+    });
+    let fired = false;
+    let disarmed = false;
+    let sleeping: AbortController | undefined;
+    let turn: ReturnType<typeof setTimeout> | undefined;
+
+    const onRunAbort = (): void => disarm();
+    function disarm(): void {
+      if (fired || disarmed) return;
+      disarmed = true;
+      if (turn !== undefined) clearTimeout(turn);
+      turn = undefined;
+      sleeping?.abort();
+      run.removeEventListener('abort', onRunAbort);
+    }
+    const deadline: AttemptDeadline = {
+      signal: controller.signal,
+      expired,
+      get fired() {
+        return fired;
+      },
+      disarm,
+    };
+    if (run.aborted) {
+      disarmed = true;
+      return deadline;
+    }
+    run.addEventListener('abort', onRunAbort, { once: true });
+
+    const loop = async (): Promise<void> => {
+      while (!disarmed && clock.now() < until) {
+        sleeping = new AbortController();
+        await clock.sleep(until - clock.now(), () => disarmed, sleeping.signal);
+        sleeping.abort();
+        sleeping = undefined;
+      }
+      if (disarmed) return;
+      fired = true;
+      run.removeEventListener('abort', onRunAbort);
+      controller.abort(reason);
+      resolveExpired();
+    };
+    // A macrotask, not a timer reading: `setTimeout(0)` decides nothing by time.
+    turn = setTimeout(() => {
+      turn = undefined;
+      void loop();
+    }, 0);
+    return deadline;
   }
 }

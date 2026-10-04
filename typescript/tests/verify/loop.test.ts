@@ -220,7 +220,7 @@ describe('loop, proved from the entry place', () => {
     const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000 });
     record(`entry | ${name} | bound ${bound}`, reports);
     expectAllProven(reports, keysFor(compiled));
-  }, 300_000);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -254,7 +254,7 @@ describe('loop, proved from the post-start marking at a real allowance', () => {
 
     expect(atBound.verdict.type, atBound.report).toBe('proven');
     expect(tight.verdict.type, tight.report).toBe('violated');
-  }, 300_000);
+  });
 
   it.each([1, 2, 4])('keeps one iteration in flight at an allowance of %i, in both segments', async (k) => {
     const compiled = compile(only(loop(k)));
@@ -269,7 +269,7 @@ describe('loop, proved from the post-start marking at a real allowance', () => {
       expect(oneInFlight.verdict.type, `${segment}: ${oneInFlight.report}`).toBe('proven');
       expect(control.verdict.type, `${segment}: ${control.report}`).toBe('violated');
     }
-  }, 300_000);
+  });
 
   it('reaches wf.canceled from the post-start marking only when a cancel is seeded', async () => {
     // Non-vacuity of the cancel segment itself: the seeded request really lands and a sweep
@@ -280,7 +280,7 @@ describe('loop, proved from the post-start marking at a real allowance', () => {
 
     expect(closed.verdict.type, closed.report).toBe('proven');
     expect(canceled.verdict.type, canceled.report).toBe('violated');
-  }, 300_000);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -297,7 +297,7 @@ describe('loop: the allowance the entry-place proofs actually explore', () => {
     const understated = await verdict(fromEntry(compiled), placeBound(role(compiled.net, '.poll.budget'), 1));
 
     expect(understated.verdict.type, understated.report).toBe('proven');
-  }, 300_000);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -376,7 +376,7 @@ describe('loop: removing a safeguard flips a verdict (non-vacuity)', () => {
     const mutant = await verifyWorkflow(broken, { timeoutMs: 30_000, segments: ['closed'] });
     expectAllProven(real, CLOSED);
     expect(verdicts(mutant), described(mutant)).toMatchObject({ 'closed/deadlockFree': 'violated' });
-  }, 300_000);
+  });
 
   it("needs the post-start marking to see finish's reset at all", async () => {
     // Measured, not argued: from the entry place the allowance is one, it is always spent by the
@@ -392,7 +392,7 @@ describe('loop: removing a safeguard flips a verdict (non-vacuity)', () => {
     const mutant = await verdict(seeded(broken, 2), deadlockFree());
     expect(real.verdict.type, real.report).toBe('proven');
     expect(mutant.verdict.type, mutant.report).toBe('violated');
-  }, 300_000);
+  });
 
   it.each(['abort', 'leave-failed', 'leave-bailed', 'leave-suspended', 'leave-paused'])(
     "needs %s's reset on the allowance, at a real allowance",
@@ -411,7 +411,7 @@ describe('loop: removing a safeguard flips a verdict (non-vacuity)', () => {
 
     const mutant = await verifyWorkflow(broken, { timeoutMs: 30_000, segments: ['closed'] });
     expect(verdicts(mutant), described(mutant)).toMatchObject({ 'closed/deadlockFree': 'violated' });
-  }, 300_000);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -542,7 +542,7 @@ describe('loop: removing a cancellation safeguard is caught — by structure, by
     const reports = await verifyWorkflow(broken, { timeoutMs: 30_000 });
     expectAllProven(reports.filter((r) => r.segment === 'closed'), CLOSED);
     expect(verdicts(reports), described(reports)).toMatchObject({ 'cancel/deadlockFree': 'violated' });
-  }, 300_000);
+  });
 
   it('would strand the marker and the allowance if the body were gated as well', async () => {
     // Why the body is emitted without the signal, beyond Mastra never checking inside one: a leaf
@@ -559,5 +559,5 @@ describe('loop: removing a cancellation safeguard is caught — by structure, by
     const reports = await verifyWorkflow(broken, { timeoutMs: 30_000 });
     expectAllProven(reports.filter((r) => r.segment === 'closed'), CLOSED);
     expect(verdicts(reports), described(reports)).toMatchObject({ 'cancel/deadlockFree': 'violated' });
-  }, 300_000);
+  });
 });

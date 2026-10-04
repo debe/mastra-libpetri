@@ -463,19 +463,28 @@
       per net); liveness witnesses are untimed-model runs — on a net with a fixed sleep or retry
       delay a witness may be one the clock rules out, and none has been replayed on the executor
 
-## M7 — Structural resources (Layer 2 — degrades gracefully)
-- [ ] Mastra-vocabulary options (`concurrency`, `retries`, `retryConfig`, `timeout`) compile to
-      permit places, budget places with inhibitor fallbacks, leaky-bucket refill transitions and
-      mutexes; each carries its P-invariant as a proven `placeBound`
-- [ ] Each Layer 2 option is verified *ignorable*: a workflow carrying it still runs correctly
-      under `DefaultExecutionEngine`, merely unbounded. That is the layer's contract, and it is
-      a test rather than a claim
+## M7 — Structural resources ([ADR 0011], [ADR 0012], [ADR 0013])
+- [x] Survey against Mastra 1.67's source: `retries`/`retryConfig` and `.foreach` `concurrency` are
+      Layer 1 (enforced, compiled since M1); `timeout` does not exist; `.parallel`/`.branch` drop a
+      `concurrency` key, so it rides in `metadata`. CLAUDE.md's Layer rule amended
+- [x] Maintainer decisions: block concurrency (Layer 2); `limit` / `rateLimit` pulled in from M7b
+      (Layer 3, per-run quotas); a step timeout now (Layer 3), raced inside the attempt on the run's
+      clock after consulting libpetri (Out.Timeout runs on real time and abandons work; no abort hook
+      or threshold inhibitor planned); queued arms start with the abort; a late success after the
+      deadline is discarded and the timeout is retryable
+- [x] W0 contract (`e1951bd`); W1 (`b9fc1ba`): block slot pool and FIFO admission (A), leaf quota
+      arcs, timeout branch and funnel, `armDeadline` (B), adapter refusals (C), fused canonical quota
+      places and one refill per rate quota (D), one pool conservation check and pool claims (E), the
+      petri `createStep` surface, `limit`/`rateLimit`, the per-attempt gate in the runner (F)
+- [ ] W2 integration — limited fixtures in the differential and corpus, `layer2-ignorable`,
+      `blueprints` composition, timeout end to end
+- [ ] Track U asks: an `AbortSignal` on `TransitionContext` fired by `Out.Timeout`; `Out.Timeout` on
+      the TIME-015 clock; a settle-before-deposit timeout. Each would let ADR 0013 use `Out.Timeout`
 
 ## M7b — Blueprints (Layer 3 — new capability)
 - [ ] The `PetriEngineType` phantom brand gates the extended builder, so reaching for a
       blueprint is a typed, visible decision and never a silent incompatibility
-- [ ] First wave: `limit(n)`, `rateLimit(burst, per)` with a fusible permit place so separate
-      steps share one provider quota, `race()`, `quorum(k, n)`
+- [ ] First wave: `race()`, `quorum(k, n)` (`limit` and `rateLimit` shipped in M7)
 - [ ] Second wave: `pipeline()` — the one the IR structurally cannot express, since
       join-before-next-index is its defining property — plus `supersede()`, `compensate()`,
       `circuitBreaker()`, `queue(depth)`, `correlate(key)`

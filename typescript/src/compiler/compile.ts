@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { PetriNet, PrecompiledNet, Transition, one, outPlace, place, type Place } from 'libpetri';
+import { FusionSet, PetriNet, PrecompiledNet, Transition, delayed, one, outPlace, place, type Place } from 'libpetri';
 import {
   NameVocabulary,
   WF_BAILED,
@@ -13,8 +13,9 @@ import {
   WF_PERMITS,
   WF_SUSPENDED,
   type EntryPath,
+  type QuotaRole,
 } from './names.js';
-import { stepGadget, sleepGadget } from './gadgets/leaf.js';
+import { MAX_WAIT_MS, stepGadget, sleepGadget } from './gadgets/leaf.js';
 import { parallelGadget } from './gadgets/parallel.js';
 import { branchGadget } from './gadgets/branch.js';
 import { loopGadget } from './gadgets/loop.js';
@@ -34,6 +35,8 @@ import type {
   FlowToken,
   PauseToken,
   PlaceClaim,
+  Pool,
+  QuotaRef,
   ResumeSite,
   StepChain,
   StepDescription,
@@ -117,6 +120,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
   const steps: StepChain[] = [];
   const claims = new Map<string, PlaceClaim>();
   const exclusions: ExclusionClaim[] = [];
+  // Pools the gadgets own ([ADR 0011]); the permits and the quota pools are added at the end.
+  const gadgetPools: Pool[] = [];
   // Resume sites ([ADR 0007]), keyed by path; a gadget registers its own through GadgetResult.
   const resumeSites = new Map<string, ResumeSite>();
   const pathToEntry = new Map<string, { entryId: string; kind: EntryDescription['kind'] }>();
@@ -126,6 +131,15 @@ export function compile(description: WorkflowDescription, options: CompileOption
     if (resumeSites.has(key)) throw new Error(`two resume sites at path ${key}`);
     resumeSites.set(key, site);
   };
+
+  // The quotas ([ADR 0012]): one canonical set of places per id, minted up front in first-use order
+  // (the description read left to right), so the pools exist — and their takers are checked — even
+  // for an attempt a gadget compiled without its quota arc. Every member a gadget asks for is fused
+  // into these at build.
+  const quotas = new Map<string, QuotaPlaces>();
+  for (const [ref, where] of quotaRefsOf(description)) registerQuota(quotas, names, ref, where);
+  // Every member name minted, so a claim naming one fails with the reason, not just "not a place".
+  const memberNames = new Set<string>();
 
   // **The arrival is part of the net.** Registering `wf.cancel` itself as an environment place
   // would be the direct model, but libpetri routes any net with an environment place away from
@@ -204,6 +218,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
     const gadget = gadgets[entry.kind];
     if (gadget === undefined) throw new Error(`no gadget registered for '${entry.kind}'`);
 
+    // One member per (quota id, role) in this emission: retries of one step share it.
+    const members = new Map<string, Place<null>>();
     const ctx: GadgetContext = {
       path,
       viewPath: nested.viewPath ?? path,
@@ -214,6 +230,22 @@ export function compile(description: WorkflowDescription, options: CompileOption
       },
       stepChain: (chain) => {
         steps.push(chain);
+      },
+      // [ADR 0012]: one member per (emission, quota, role), fused into the quota's canonical place
+      // at build; the compiler, not the gadget, emits the one refill per rate quota.
+      quotaMember: (ref, role) => {
+        const quota = registerQuota(quotas, names, ref, `entry ${path.join('-')} ('${entry.id}')`);
+        if (role !== 'pool' && quota.ref.kind !== 'rate') {
+          throw new Error(`quota '${ref.id}' is a limit; only a rateLimit has a '${role}' place`);
+        }
+        const key = `${ref.id}|${role}`;
+        const known = members.get(key);
+        if (known !== undefined) return known;
+        const member = place<null>(names.quotaMember(path, entry.id, ref.id, role));
+        members.set(key, member);
+        memberNames.add(member.name);
+        quota.members[role].push(member);
+        return member;
       },
       names,
       exits,
@@ -237,6 +269,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
       claims.set(claim.place, claim);
     }
     exclusions.push(...(result.exclusions ?? []));
+    gadgetPools.push(...(result.pools ?? []));
     return result;
   };
 
@@ -272,7 +305,31 @@ export function compile(description: WorkflowDescription, options: CompileOption
     if (site) registerSite(site);
   }
 
-  const net = PetriNet.builder(description.id)
+  // **One refill per rate quota** ([ADR 0012]), whatever number of steps use it: fusion merges places,
+  // not transitions, so a refill per member would refill the one bucket once per using step. It is
+  // gated on outstanding demand — read, never consumed — so with no attempt waiting it is disabled and
+  // the net quiesces with the bucket's tokens resting in `spent` (n8n-libpetri ADR 0009 §6). After an
+  // idle spell its clock restarts at first demand ([TIME-011]): the rate is never exceeded, and may be
+  // under-used.
+  const refills = new Map<string, string>();
+  for (const quota of quotas.values()) {
+    if (quota.ref.kind !== 'rate') continue;
+    const { spent, demand } = quota;
+    const bucket = quota.pool;
+    const refill = Transition.builder(names.quotaRefill(quota.ref.id))
+      .inputs(one(spent!))
+      .read(demand!)
+      .timing(delayed(quota.ref.perMs))
+      .outputs(outPlace(bucket))
+      .action(async (tctx) => {
+        tctx.output(bucket, null);
+      })
+      .build();
+    refills.set(quota.ref.id, refill.name);
+    transitions.push(refill);
+  }
+
+  const builder = PetriNet.builder(description.id)
     .places(
       terminals.done,
       terminals.failed,
@@ -283,10 +340,25 @@ export function compile(description: WorkflowDescription, options: CompileOption
       cancel,
       cancelRequest,
       ...(permits ? [permits] : []),
+      // The canonical quota places are declared, so a pool no attempt touches yet is still a place
+      // of the net, seeded and checked, rather than vanishing with its arcs.
+      ...[...quotas.values()].flatMap((q) => [q.pool, ...(q.spent ? [q.spent] : []), ...(q.demand ? [q.demand] : [])]),
       ...extraPlaces,
     )
-    .transitions(...transitions)
-    .build();
+    .transitions(...transitions);
+  // One fusion set per (quota, role), canonical first ([MOD-060]/[MOD-061]): every member is replaced
+  // by the canonical place in every arc, and each rebuilt transition keeps a place alias ([MOD-031]),
+  // so an action that writes to its member by name lands in the canonical place. No quota, no
+  // `fuse` — the build is the plain one, and an unannotated net is exactly today's.
+  for (const quota of quotas.values()) {
+    for (const role of QUOTA_ROLES) {
+      const canonical = role === 'pool' ? quota.pool : role === 'spent' ? quota.spent : quota.demand;
+      const rest = quota.members[role];
+      if (canonical === undefined || rest.length === 0) continue;
+      builder.fuse(FusionSet.of(canonical.name, canonical, ...rest));
+    }
+  }
+  const net = builder.build();
 
   // An entry owns every place named under its index, its arms' and lanes' included (`s.1.` and
   // `s.1-0.`): the vocabulary names nothing else there, and nothing it owns is named elsewhere.
@@ -317,8 +389,48 @@ export function compile(description: WorkflowDescription, options: CompileOption
     return { kind: 'boundary', index, entryId: entry.id, entryKind: entry.kind, place: input as Place<FlowToken> };
   });
   for (const name of [...claims.keys(), ...exclusions.flatMap((e) => [e.a, e.b])]) {
+    // A member is fused away at build: a claim on it would name nothing ([ADR 0012]).
+    if (memberNames.has(name)) throw new Error(`a claim names '${name}', a quota member that fusion removes from the net`);
     if (!placeNames.includes(name)) throw new Error(`a claim names '${name}', which is not a place of the net`);
   }
+  for (const pool of gadgetPools) {
+    for (const name of [pool.place.name, ...pool.holders.map((h) => h.place)]) {
+      if (memberNames.has(name)) throw new Error(`a gadget pool names '${name}', a quota member that fusion removes from the net`);
+    }
+  }
+
+  // Every conserved resource ([ADR 0012]): the run permits first — also kept as `budget` — then the
+  // gadgets' slot pools, then one pool per quota in first-use order. Every step attempt takes a permit
+  // and returns it, so the permits' takers and givers are both `stepAttempts`. A quota's takers are
+  // the attempts of every step whose chain the leaf registered with that quota id — from the
+  // registration, never from the arcs, so an attempt compiled without its quota arc is caught.
+  const attemptsUsing = (id: string): string[] => steps.filter((s) => s.quotas.includes(id)).flatMap((s) => s.attempts);
+  const quotaPools: Pool[] = [...quotas.values()].map((quota): Pool => {
+    const takers = attemptsUsing(quota.ref.id);
+    if (quota.ref.kind === 'limit') {
+      return { kind: 'limit', quota: quota.ref.id, place: quota.pool, seed: quota.ref.n, holders: [], takers, givers: [...takers] };
+    }
+    return {
+      kind: 'bucket',
+      quota: quota.ref.id,
+      place: quota.pool,
+      seed: quota.ref.burst,
+      holders: [{ place: quota.spent!.name, weight: 1 }],
+      takers,
+      givers: [refills.get(quota.ref.id)!],
+      spent: quota.spent!,
+      demand: quota.demand!,
+      refill: refills.get(quota.ref.id)!,
+      perMs: quota.ref.perMs,
+    };
+  });
+  const pools: Pool[] = [
+    ...(permits && k !== undefined
+      ? [{ kind: 'permits' as const, place: permits, seed: k, holders: [], takers: [...stepAttempts], givers: [...stepAttempts] }]
+      : []),
+    ...gadgetPools,
+    ...quotaPools,
+  ];
 
   return {
     net,
@@ -329,6 +441,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
     cancel,
     cancelRequest,
     ...(permits && k !== undefined ? { budget: { permits, k } } : {}),
+    pools,
     stepAttempts,
     steps,
     claims,
@@ -339,6 +452,102 @@ export function compile(description: WorkflowDescription, options: CompileOption
     checkpoints,
     structuralHash: structuralHash(description, checkpoints, names.names()),
   };
+}
+
+/** A quota's canonical places and the members to fuse into each ([ADR 0012]). */
+interface QuotaPlaces {
+  /** The first ref seen for the id: it fixes the parameters. */
+  readonly ref: QuotaRef;
+  /** Where the first ref was seen, for the collision message. */
+  readonly where: string;
+  /** `wf.quota.<id>`: a `limit`'s pool, a `rateLimit`'s bucket. */
+  readonly pool: Place<null>;
+  /** `wf.quota.<id>.spent` and `.demand`, for a `rateLimit` only. */
+  readonly spent?: Place<null>;
+  readonly demand?: Place<null>;
+  readonly members: Record<QuotaRole, Place<null>[]>;
+}
+
+const QUOTA_ROLES: readonly QuotaRole[] = ['pool', 'spent', 'demand'];
+
+const sameQuota = (a: QuotaRef, b: QuotaRef): boolean =>
+  a.kind === 'limit' ? b.kind === 'limit' && a.n === b.n : b.kind === 'rate' && a.burst === b.burst && a.perMs === b.perMs;
+
+const describeQuota = (ref: QuotaRef): string =>
+  ref.kind === 'limit' ? `limit(${ref.n})` : `rateLimit(${ref.burst}, ${ref.perMs}ms)`;
+
+const wholeIn = (value: number, min: number, max: number): boolean => Number.isInteger(value) && value >= min && value <= max;
+
+/**
+ * Registers a quota ref, or checks it against the one already registered under its id: one id is
+ * one set of places, so a second ref with other parameters is refused, naming both. A new id mints
+ * its canonical places (`quotaPlace` checks the id against `QUOTA_ID_PATTERN`).
+ */
+function registerQuota(quotas: Map<string, QuotaPlaces>, names: NameVocabulary, ref: QuotaRef, where: string): QuotaPlaces {
+  const known = quotas.get(ref.id);
+  if (known !== undefined) {
+    if (!sameQuota(known.ref, ref)) {
+      throw new Error(
+        `quota '${ref.id}' is ${describeQuota(known.ref)} at ${known.where} and ${describeQuota(ref)} at ${where}; ` +
+          'one id names one quota',
+      );
+    }
+    return known;
+  }
+  if (ref.kind === 'limit') {
+    if (!wholeIn(ref.n, 1, MAX_CONCURRENCY)) {
+      throw new Error(`quota '${ref.id}' at ${where}: a limit must be a whole number in [1, ${MAX_CONCURRENCY}], got ${String(ref.n)}`);
+    }
+  } else if (ref.kind === 'rate') {
+    if (!wholeIn(ref.burst, 1, MAX_CONCURRENCY)) {
+      throw new Error(`quota '${ref.id}' at ${where}: a burst must be a whole number in [1, ${MAX_CONCURRENCY}], got ${String(ref.burst)}`);
+    }
+    if (!wholeIn(ref.perMs, 1, MAX_WAIT_MS)) {
+      throw new Error(`quota '${ref.id}' at ${where}: a refill interval must be a whole number of ms in [1, ${MAX_WAIT_MS}], got ${String(ref.perMs)}`);
+    }
+  } else {
+    throw new Error(`quota '${(ref as QuotaRef).id}' at ${where}: unknown kind '${String((ref as { kind: unknown }).kind)}'`);
+  }
+  const quota: QuotaPlaces = {
+    ref,
+    where,
+    pool: place<null>(names.quotaPlace(ref.id, 'pool')),
+    ...(ref.kind === 'rate'
+      ? { spent: place<null>(names.quotaPlace(ref.id, 'spent')), demand: place<null>(names.quotaPlace(ref.id, 'demand')) }
+      : {}),
+    members: { pool: [], spent: [], demand: [] },
+  };
+  quotas.set(ref.id, quota);
+  return quota;
+}
+
+/**
+ * Every step's quota refs, read left to right through the description — arms, loop and foreach
+ * bodies included — with where each was seen. A step naming one id twice is refused: one attempt
+ * would take two tokens of one quota in one firing, which no author means.
+ */
+function quotaRefsOf(description: WorkflowDescription): readonly (readonly [QuotaRef, string])[] {
+  const out: (readonly [QuotaRef, string])[] = [];
+  const step = (s: StepDescription, path: string): void => {
+    const seen = new Set<string>();
+    for (const ref of s.quotas ?? []) {
+      if (seen.has(ref.id)) throw new Error(`step '${s.id}' at entry ${path} uses quota '${ref.id}' twice`);
+      seen.add(ref.id);
+      out.push([ref, `entry ${path} ('${s.id}')`]);
+    }
+  };
+  description.entries.forEach((entry, i) => {
+    switch (entry.kind) {
+      case 'step': step(entry, String(i)); break;
+      case 'parallel':
+      case 'branch': entry.arms.forEach((arm, a) => step(arm, `${i}-${a}`)); break;
+      case 'loop':
+      case 'foreach': step(entry.body, String(i)); break;
+      case 'sleep':
+      case 'sleepUntil': break;
+    }
+  });
+  return out;
 }
 
 /**
@@ -399,20 +608,29 @@ function entrySite(entry: EntryDescription, index: number, inPlace: Place<FlowTo
  * A per-run wait hashes as `perRun`, not as a value — that is the point of it being per run.
  */
 function structuralHash(description: WorkflowDescription, checkpoints: readonly number[], names: readonly string[]): string {
+  // M7 ([ADR 0011]-[ADR 0013]): a step's `timeoutMs` and `quotas`, and a block's `concurrency` where
+  // it binds (c < arms), join the shape only when present, so a description without them hashes
+  // exactly as before — the names alone do not separate two timeouts, or two quota sizes, of one shape.
   const step = (s: StepDescription): unknown => [
     'step',
     s.id,
     s.source ?? 'step',
     s.retries ?? 0,
     s.retryDelayMs ?? 0,
+    ...(s.timeoutMs !== undefined ? [{ timeoutMs: s.timeoutMs }] : []),
+    ...(s.quotas !== undefined && s.quotas.length > 0
+      ? [{ quotas: s.quotas.map((q) => (q.kind === 'limit' ? [q.id, q.kind, q.n] : [q.id, q.kind, q.burst, q.perMs])) }]
+      : []),
   ];
+  const block = (arms: readonly StepDescription[], c: number | undefined): readonly unknown[] =>
+    c !== undefined && c < arms.length ? [{ concurrency: c }] : [];
   const shape = (entry: EntryDescription): unknown => {
     switch (entry.kind) {
       case 'step': return step(entry);
       case 'sleep': return [entry.kind, entry.id, entry.duration];
       case 'sleepUntil': return [entry.kind, entry.id, entry.until];
       case 'parallel':
-      case 'branch': return [entry.kind, entry.id, entry.arms.map(step)];
+      case 'branch': return [entry.kind, entry.id, entry.arms.map(step), ...block(entry.arms, entry.concurrency)];
       case 'loop': return [entry.kind, entry.id, entry.loopType, entry.iterationBound, step(entry.body)];
       case 'foreach': return [entry.kind, entry.id, entry.concurrency, step(entry.body)];
     }

@@ -391,13 +391,13 @@ describe('resume on the petri engine, against the default engine, every route', 
     expect(oracle.results[1]).toMatchObject({ status: 'success', result: { n: 70 }, stepExecutionPath: ['plus1', 'g', 'times10'] });
     expect(oracle.snapshots[1]).toMatchObject({ status: 'success', suspendedPaths: {} });
     await expectProven(compiledFor(linearShape), ['0', '1', '2']);
-  }, 180_000);
+  });
 
   it('the last entry resumed: the result is its output', async () => {
     const oracle = await allRoutes(lastShape, [{ step: 'g', resumeData: { add: 5 } }]);
     expect(oracle.results[1]).toMatchObject({ status: 'success', result: { n: 7 }, stepExecutionPath: ['plus1', 'g'] });
     await expectProven(compiledFor(lastShape), ['0', '1']);
-  }, 180_000);
+  });
 
   it('a resumed step that suspends again: the record and suspendedPaths are rewritten, and a second resume finishes', async () => {
     const oracle = await allRoutes(twiceShape, [
@@ -408,7 +408,7 @@ describe('resume on the petri engine, against the default engine, every route', 
     expect(oracle.snapshots[1]).toMatchObject({ suspendedPaths: { stubborn: [1] } });
     expect(oracle.results[2]).toMatchObject({ result: { n: 40 } });
     await expectProven(compiledFor(twiceShape), ['0', '1', '2']);
-  }, 180_000);
+  });
 
   it('a .parallel() with two suspended arms: resuming one re-suspends listing the other, resuming that one finishes', async () => {
     const oracle = await allRoutes(parallelShape, [
@@ -421,32 +421,32 @@ describe('resume on the petri engine, against the default engine, every route', 
     expect(oracle.snapshots[1]).toMatchObject({ suspendedPaths: { b: [1, 1] } });
     expect(oracle.results[2]).toMatchObject({ status: 'success', result: { n: 7 } });
     await expectProven(compiledFor(parallelShape), ['0', '1.0', '1.1', '2']);
-  }, 300_000);
+  });
 
   it('a .parallel() arm beside a finished sibling: the sibling is not re-run, its output is reused', async () => {
     const oracle = await allRoutes(mixedParallelShape, [{ step: 'g', resumeData: { add: 3 } }]);
     expect(oracle.results[1]).toMatchObject({ status: 'success', result: { n: 14 } });
     await expectProven(compiledFor(mixedParallelShape), ['0.0', '0.1', '1']);
-  }, 300_000);
+  });
 
   it('a .branch() arm: the conditions are not re-evaluated, the untaken arm stays unrun', async () => {
     const oracle = await allRoutes(branchShape, [{ step: 'ba', resumeData: { add: 4 } }]);
     expect(oracle.results[1]).toMatchObject({ status: 'success', result: { ba: { n: 6 } } });
     await expectProven(compiledFor(branchShape), ['0', '1.0', '1.1']);
-  }, 300_000);
+  });
 
   it('a loop body at iteration n: n re-runs with the resume data, n+1 onward fresh', async () => {
     const oracle = await allRoutes(loopShape, [{ step: 'body', resumeData: { add: 0 } }]);
     expect(oracle.results[1]).toMatchObject({ status: 'success', result: { n: 60 } });
     await expectProven(compiledFor(loopShape), ['0', '1']);
-  }, 300_000);
+  });
 
   it('a nested workflow: the outer step resumes the child from its own snapshot', async () => {
     const oracle = await allRoutes(nestedShape, [{ step: ['r-inner', 'ig'], resumeData: { add: 5 } }]);
     expect(oracle.results[0]).toMatchObject({ status: 'suspended', suspended: [['r-inner', 'ig']] });
     expect(oracle.results[1]).toMatchObject({ status: 'success', result: { n: 70 } });
     await expectProven(compiledFor(nestedShape), ['0', '1', '2']);
-  }, 180_000);
+  });
 
   it.each([1, 2])('under a run budget of %i the resumed runs are the default engine\'s, and the budgeted net is proven', async (k) => {
     await allRoutes(parallelShape, [
@@ -454,7 +454,7 @@ describe('resume on the petri engine, against the default engine, every route', 
       { step: 'a', resumeData: { add: 1 } },
     ], { concurrency: k });
     await expectProven(compiledFor(parallelShape, { concurrency: k }), ['0', '1.0', '1.1', '2']);
-  }, 300_000);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

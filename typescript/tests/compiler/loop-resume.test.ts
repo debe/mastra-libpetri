@@ -229,15 +229,15 @@ async function expectAllProven(label: string, compiled: CompiledWorkflow): Promi
 describe('loop resume: proofs', () => {
   it.each(['dowhile', 'dountil'] as const)('proves prime;%s(tick);ship fresh and resumed at [1]', async (loopType) => {
     await expectAllProven(`prime;${loopType}(tick, bound 3);ship`, build(between(loop(loopType, 3))));
-  }, 120_000);
+  });
 
   it.each([1, 2])('proves it at k=%i', async (k) => {
     await expectAllProven(`prime;dowhile(tick, bound 3);ship at k=${k}`, build(between(loop('dowhile', 3)), k));
-  }, 120_000);
+  });
 
   it('proves a retrying body (a timed retry hop behind the site)', async () => {
     await expectAllProven('prime;dowhile(tick retries 1 10ms, bound 3);ship', build(between(loop('dowhile', 3, { ...tick, retries: 1, retryDelayMs: 10 }))));
-  }, 120_000);
+  });
 });
 
 describe('loop resume: only the resumed iteration is resumed (control-flow.ts:785-788)', () => {

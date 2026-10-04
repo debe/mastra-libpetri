@@ -1,7 +1,7 @@
 import { appendFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { verifyMastraWorkflow, type MastraVerification } from '../../src/mastra/verify.js';
-import { describeClaim, segmentLabel, type VerificationReport } from '../../src/verify/index.js';
+import { compileMastraWorkflow, verifyMastraWorkflow, type MastraVerification } from '../../src/mastra/verify.js';
+import { FAMILIES, describeClaim, segmentLabel, segmentsFor, type VerificationReport } from '../../src/verify/index.js';
 import { FIXTURES, RESUME_FIXTURES, Recorder, engineConfig } from '../fixtures/mastra-workflows.js';
 
 /**
@@ -82,12 +82,60 @@ const corpus = [
   ...RESUME_FIXTURES.map((f) => ({ name: f.name, build: f.build })),
 ].filter((_, position) => shard === undefined || position % shard.n === shard.i - 1);
 
+/**
+ * Workflows whose claims take longer than one test may (60 s, `vitest.config.ts`): a `.foreach()` at
+ * concurrency 5 and the widest `.parallel()`, 140-240 s each in all. No query is slow (5-7 s at most);
+ * the time is twenty-odd segments of claims. Each is proven **one segment per test** — the same
+ * claims, every one, liveness in the `closed` test as `verify` asks it — so no test waits minutes
+ * and a slow segment is named. A workflow listed here that is not in the corpus fails the gate.
+ */
+const BY_SEGMENT = new Set([
+  'parallel-wide',
+  'foreach-c5',
+  'foreach-c5-failing-item',
+  'foreach-empty-cancel-before',
+  'foreach-empty-cancel-inside',
+  'emit-step-events-off',
+]);
+
+it('every workflow proven segment by segment is in the corpus', () => {
+  const all = new Set([...FIXTURES, ...RESUME_FIXTURES].map((f) => f.name));
+  expect([...BY_SEGMENT].filter((name) => !all.has(name))).toEqual([]);
+});
+
 describe.each([
   ['unbounded', undefined],
   ['k=1', 1],
 ] as const)('the corpus, %s', (label, k) => {
   for (const fixture of corpus) {
-    it(fixture.name, { timeout: 600_000 }, async () => {
+    if (BY_SEGMENT.has(fixture.name)) {
+      const probe = fixture.build(engineConfig('petri', k), new Recorder());
+      for (const segment of segmentsFor(compileMastraWorkflow(probe as never))) {
+        const name = `${fixture.name} @ ${segmentLabel(segment)}`;
+        const families = segment === 'closed' ? FAMILIES : FAMILIES.filter((f) => f !== 'liveness');
+        it(name, async () => {
+          const workflow = fixture.build(engineConfig('petri', k), new Recorder());
+          const started = Date.now();
+          const result = await verifyMastraWorkflow(workflow as never, { timeoutMs: TIMEOUT_MS, segments: [segment], families });
+          proofLog(summary(label, name, result.workflow, Date.now() - started));
+          // A nested workflow's sites are its own: these fixtures nest none.
+          expect(Object.keys(result.nested)).toEqual([]);
+          for (const c of result.workflow.claims) {
+            const line = `${name}: ${describeClaim(c)}`;
+            if (c.kind === 'proof') expect(c.result.verdict.type, line).toBe('proven');
+            else {
+              expect(c.result.verdict.type, line).toBe('violated');
+              expect(c.result.counterexampleConfirmed, line).toBe(true);
+            }
+          }
+          expect(result.workflow.families).toEqual(families);
+          for (const family of families) expect(result.workflow.claims.some((c) => c.family === family), `${name}: ${family}`).toBe(true);
+          expect(result.holds).toBe(true);
+        });
+      }
+      continue;
+    }
+    it(fixture.name, async () => {
       const workflow = fixture.build(engineConfig('petri', k), new Recorder());
       const started = Date.now();
       const result: MastraVerification = await verifyMastraWorkflow(workflow as never, { timeoutMs: TIMEOUT_MS });

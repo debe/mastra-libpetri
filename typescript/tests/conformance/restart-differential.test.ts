@@ -136,7 +136,7 @@ for (const k of BUDGETS) {
         for (const f of OPEN_FINDINGS.filter((x) => x.fixture === fixture.name)) {
           expect(verdicts.some((v) => openFinding(v) === f), `open finding on ${f.fixture} [${f.route}] no longer shows`).toBe(true);
         }
-      }, 120_000);
+      });
     }
   });
 }

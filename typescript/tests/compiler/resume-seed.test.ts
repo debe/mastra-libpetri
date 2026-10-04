@@ -184,7 +184,7 @@ describe('compile: entry sites', () => {
       ...['0', '2', '3'].flatMap((site) => [...props(`resume@${site}`, false), ...props(`resume@${site}+cancel`, true)]),
     ]);
     for (const report of reports) expect(report.result.verdict.type, describeReport(report)).toBe('proven');
-  }, 600_000);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

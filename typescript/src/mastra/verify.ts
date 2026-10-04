@@ -1,4 +1,5 @@
 import { compile } from '../compiler/compile.js';
+import type { CompiledWorkflow } from '../compiler/types.js';
 import { verify, type VerificationReport, type WorkflowVerifyOptions } from '../verify/workflow.js';
 import { adaptExecutionGraph, MASTRA_WORKFLOW_COMPONENT } from './adapt.js';
 import { PetriExecutionEngine } from './engine.js';
@@ -70,22 +71,33 @@ export async function verifyMastraWorkflow(
   options: MastraVerifyOptions = {},
 ): Promise<MastraVerification> {
   const { concurrency, iterationBound, ...verifyOptions } = options;
-  const verifyOne = (wf: VerifiableWorkflow): Promise<VerificationReport> => {
-    const engine = engineSettings(wf);
-    const bound = iterationBound ?? engine.iterationBound;
-    const k = concurrency ?? engine.concurrency;
-    const description = adaptExecutionGraph(wf.buildExecutionGraph(), {
-      ...(wf.retryConfig ? { retryConfig: wf.retryConfig } : {}),
-      ...(bound === undefined ? {} : { iterationBound: bound }),
-    });
-    return verify(compile(description, k === undefined ? {} : { concurrency: k }), verifyOptions);
-  };
+  const verifyOne = (wf: VerifiableWorkflow): Promise<VerificationReport> =>
+    verify(compileMastraWorkflow(wf, { ...(concurrency === undefined ? {} : { concurrency }), ...(iterationBound === undefined ? {} : { iterationBound }) }), verifyOptions);
 
   const report = await verifyOne(workflow);
   const nested: Record<string, VerificationReport> = {};
   // One at a time: each `verify` already runs its queries in a pool as wide as `jobs`.
   for (const [id, wf] of nestedWorkflows(workflow)) nested[id] = await verifyOne(wf);
   return { workflow: report, nested, holds: report.holds && Object.values(nested).every((r) => r.holds) };
+}
+
+/**
+ * The net `verifyMastraWorkflow` proves for `workflow` itself (not its nested workflows): adapted and
+ * compiled exactly as its engine would, with the engine's iteration bound and budget unless the
+ * options override them. For a caller that proves one segment at a time (`segmentsFor`).
+ */
+export function compileMastraWorkflow(
+  workflow: VerifiableWorkflow,
+  options: { readonly concurrency?: number; readonly iterationBound?: number } = {},
+): CompiledWorkflow {
+  const engine = engineSettings(workflow);
+  const bound = options.iterationBound ?? engine.iterationBound;
+  const k = options.concurrency ?? engine.concurrency;
+  const description = adaptExecutionGraph(workflow.buildExecutionGraph(), {
+    ...(workflow.retryConfig ? { retryConfig: workflow.retryConfig } : {}),
+    ...(bound === undefined ? {} : { iterationBound: bound }),
+  });
+  return compile(description, k === undefined ? {} : { concurrency: k });
 }
 
 /** The workflow's own engine's settings, when that engine is this one; otherwise none. */

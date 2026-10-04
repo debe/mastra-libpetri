@@ -32,6 +32,7 @@ const REQUIRED_VERIFIER_METHODS = [
   'semiflowInvariants',
   'stateEquation',
   'enumerationMaxClasses',
+  'totalBudget',
 ] as const;
 
 export interface SurfaceProbe {

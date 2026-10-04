@@ -84,7 +84,12 @@ for (const k of BUDGETS) {
           return 0;
         });
         expect(labels).toEqual(['closed', 'cancel', ...sites.flatMap((s) => [`resume@${s}`, `resume@${s}+cancel`])]);
-        const properties = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', ...(k === undefined ? [] : ['permitsBounded', 'permitsReturned'])];
+        // Every pool beyond the permits brings its quiescence claim ([ADR 0011], [ADR 0012]): a
+        // block-limited fixture's slots are returned in every segment.
+        const pooled = compiled.pools.flatMap((p) =>
+          p.kind === 'permits' ? [] : [p.kind === 'bucket' ? `demandDrained(${p.demand.name})` : `poolReturned(${p.place.name})`],
+        );
+        const properties = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', ...(k === undefined ? [] : ['permitsBounded', 'permitsReturned']), ...pooled];
         const expected: Record<string, string> = {};
         for (const label of labels) {
           for (const p of properties) expected[`${label}/${p}`] = 'proven';

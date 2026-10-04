@@ -470,16 +470,16 @@ async function expectAllProven(name: string, compiled: CompiledWorkflow, sites: 
 describe('parallel resume: every site is proven as its own segment, with and without a cancel', () => {
   it('fan(a, b) — sites 0.0, 0.1', async () => {
     await expectAllProven('fan2', compile(wf(fan('fan', [step('a'), step('b')]))), ['0.0', '0.1']);
-  }, 600_000);
+  });
 
   it('s; fan(a, b, c); z — sites 0, 1.0, 1.1, 1.2, 2', async () => {
     await expectAllProven('s-fan3-z', compile(wf(step('s'), fan('fan', [step('a'), step('b'), step('c')]), step('z'))), ['0', '1.0', '1.1', '1.2', '2']);
-  }, 600_000);
+  });
 
   for (const k of [1, 2]) {
     it(`fan(a, b); z at k=${k} — permits bounded and returned in every segment`, async () => {
       await expectAllProven(`fan2-z-k${k}`, compile(wf(fan('fan', [step('a'), step('b')]), step('z')), { concurrency: k }), ['0.0', '0.1', '1']);
-    }, 600_000);
+    });
   }
 
   it('non-vacuity: a replay whose failure branch loses its arrival is caught at the resume segment', async () => {
@@ -516,5 +516,5 @@ describe('parallel resume: every site is proven as its own segment, with and wit
     expect(verdict('closed/deadlockFree')).toBe('proven');
     expect(verdict('resume@0.0/deadlockFree')).toBe('violated');
     expect(verdict('resume@0.1/deadlockFree')).toBe('proven');
-  }, 600_000);
+  });
 });

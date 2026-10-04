@@ -24,6 +24,7 @@ import type {
   StepRecord,
   SuspendToken,
 } from '../types.js';
+import { admissionClaims, admissionPools, admit, bindingLimit, blockAdmission, collect } from './admission.js';
 import { blockClaims, blockReentry, suspendedBlock, type ArmArrival } from './reentry.js';
 import type { Gadget, GadgetResult } from './types.js';
 
@@ -152,6 +153,21 @@ export type { ArmArrival } from './reentry.js';
  * honoured after it: its outcome goes to the settle stage (or the next entry's input, whose sweep
  * is the same check), which re-stamps it `canceled` as `handlers/entry.ts:815-817` does.
  *
+ * **A block limit** ([ADR 0011], `./admission.ts`). With `concurrency = c` below the arm count,
+ * `decide` also writes a cursor `q_0`, each gate waits for the cursor, and a truthy arm waits at
+ * `ready_j` for a slot. A skipped or reused arm needs none: its gate routes it to its arrival and
+ * passes the cursor on in the same firing. So arms are admitted in arm order, at most `c` run at
+ * once, and every collect returns its slot. Nothing past `decide` is gated by cancel, as before.
+ *
+ * ```text
+ *   in --decide--> xor( and(gate_0 .. gate_{n-1}, q_0), exits.failed )
+ *   gate_j + q_j --gate-j--> xor( ready_j, and(arrived{skipped | ok(reused)}, q_{j+1}) )   (no q_n)
+ *   ready_j + slot --admit-j--> arm_j.in + active + q_{j+1}
+ *   every collect: ... + active -> ... + slot
+ * ```
+ *
+ * `c ≥ arms` compiles exactly the unlimited net.
+ *
  * **No `canceled` rung in the join.** Mastra's own ladder is failed > suspended > canceled >
  * success (`handlers/control-flow.ts:596-625`), but a `.branch()` is always a top-level entry (its
  * arms are single steps) and `entry.ts:815-817` re-stamps *any* result `canceled` whenever the signal
@@ -181,6 +197,11 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
 
   const n = arms.length;
   const inPlace = place<FlowToken>(names.entryIn(path, entry.id));
+  // The block's own limit, where it binds ([ADR 0011]); `undefined` compiles today's net.
+  const admission = blockAdmission(names, path, entry.id, bindingLimit(entry.id, entry.concurrency, n));
+  /** Under a limit, the FIFO cursor: `q_j` is arm `j`'s turn. */
+  const cursors: Place<null>[] =
+    admission === undefined ? [] : arms.map((_, j) => place<null>(names.entryPlace(path, entry.id, `q-${j}`)));
   // The block's only gate: whether it starts. Absent when the block is not gated.
   const cancelSweep: Transition[] =
     cancel === undefined
@@ -243,36 +264,66 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
     gates.push(gateIn);
     armIns.push(child.inPlace);
 
-    transitions.push(
-      Transition.builder(names.entryTransition(path, entry.id, `gate-${i}`))
-        .inputs(one(gateIn))
-        // Both legs are declared, which is what lets the verdict ride in a token value: the
-        // verifier is value-blind, so it explores run *and* skip whatever the token says.
-        // `reuse` writes the same place as `skip` — one declared place set, two runtime values.
-        .outputs(xor(outPlace(child.inPlace), outPlace(arrived)))
-        .action(async (tctx) => {
-          const gate = tctx.input(gateIn);
-          switch (gate.decision) {
-            case 'run':
-              tctx.output(child.inPlace, { data: gate.data });
+    if (admission === undefined) {
+      transitions.push(
+        Transition.builder(names.entryTransition(path, entry.id, `gate-${i}`))
+          .inputs(one(gateIn))
+          // Both legs are declared, which is what lets the verdict ride in a token value: the
+          // verifier is value-blind, so it explores run *and* skip whatever the token says.
+          // `reuse` writes the same place as `skip` — one declared place set, two runtime values.
+          .outputs(xor(outPlace(child.inPlace), outPlace(arrived)))
+          .action(async (tctx) => {
+            const gate = tctx.input(gateIn);
+            switch (gate.decision) {
+              case 'run':
+                tctx.output(child.inPlace, { data: gate.data });
+                return;
+              case 'skip':
+                tctx.output(arrived, { status: 'skipped' });
+                return;
+              case 'reuse':
+                tctx.output(arrived, { status: 'ok', index: i, data: gate.output });
+                return;
+            }
+          })
+          .build(),
+      );
+    } else {
+      // Under a limit the gate takes the cursor: a truthy arm keeps it while it waits at `ready_i`
+      // for a slot — `admit-i` passes it on — and a skipped or reused arm passes it straight on,
+      // with no slot. Each leg is a complete output set ([IO-015]).
+      const ready = place<FlowToken>(names.entryPlace(path, entry.id, `ready-${i}`));
+      const cursor = cursors[i]!;
+      const following = i + 1 < n ? cursors[i + 1]! : undefined;
+      const settled = following === undefined ? outPlace(arrived) : and(outPlace(arrived), outPlace(following));
+      transitions.push(
+        Transition.builder(names.entryTransition(path, entry.id, `gate-${i}`))
+          .inputs(one(gateIn), one(cursor))
+          .outputs(xor(outPlace(ready), settled))
+          .action(async (tctx) => {
+            const gate = tctx.input(gateIn);
+            if (gate.decision === 'run') {
+              tctx.output(ready, { data: gate.data });
               return;
-            case 'skip':
-              tctx.output(arrived, { status: 'skipped' });
-              return;
-            case 'reuse':
-              tctx.output(arrived, { status: 'ok', index: i, data: gate.output });
-              return;
-          }
-        })
-        .build(),
+            }
+            tctx.output(arrived, gate.decision === 'skip' ? { status: 'skipped' } : { status: 'ok', index: i, data: gate.output });
+            if (following !== undefined) tctx.output(following, null);
+          })
+          .build(),
+        admit(
+          admission,
+          names.entryTransition(path, entry.id, `admit-${i}`),
+          ready,
+          child.inPlace,
+          following === undefined ? undefined : { place: following, pass: () => null },
+        ),
+      );
+    }
 
-      Transition.builder(names.entryTransition(path, entry.id, `collect-${i}`))
-        .inputs(one(armDone))
-        .outputs(outPlace(arrived))
-        .action(async (tctx) => {
-          tctx.output(arrived, { status: 'ok', index: i, data: tctx.input(armDone).data });
-        })
-        .build(),
+    transitions.push(
+      collect(admission, names.entryTransition(path, entry.id, `collect-${i}`), armDone, [arrived], (tctx, done) => {
+        tctx.output(arrived, { status: 'ok', index: i, data: done.data });
+      }),
     );
   }
 
@@ -281,7 +332,7 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
     // Either the evaluation succeeded and every gate is armed, or it broke and nothing
     // downstream exists at all. No gate armed means no sibling token to strand, so the failure
     // goes straight to the block's failure exit rather than through the join.
-    .outputs(xor(and(...gates.map(outPlace)), outPlace(exits.failed)))
+    .outputs(xor(and(...gates.map(outPlace), ...cursors.slice(0, 1).map(outPlace)), outPlace(exits.failed)))
     .action(async (tctx) => {
       const incoming = tctx.input(inPlace);
       const scope = scopeOf(tctx);
@@ -305,6 +356,8 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
         return;
       }
       for (let i = 0; i < n; i++) tctx.output(gates[i]!, verdicts[i]!);
+      // Under a limit, arm 0's turn: the cursor starts the FIFO admission.
+      if (cursors[0] !== undefined) tctx.output(cursors[0], null);
     });
   // Mastra's check before the entry: the block starts only while the signal is absent.
   if (cancel !== undefined) decide.inhibitor(cancel);
@@ -314,47 +367,28 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
     ...cancelSweep,
 
     // One firing writes the arrival and the marker together. That is the race-freedom argument.
-    Transition.builder(names.entryTransition(path, entry.id, 'collect-err'))
-      .inputs(one(armErr))
-      .outputs(and(outPlace(arrived), outPlace(errSeen)))
-      .action(async (tctx) => {
-        const failure = tctx.input(armErr);
-        tctx.output(arrived, { status: 'failed' });
-        tctx.output(errSeen, failure);
-      })
-      .build(),
+    // Under a limit the same firing returns the arm's slot.
+    collect(admission, names.entryTransition(path, entry.id, 'collect-err'), armErr, [arrived, errSeen], (tctx, failure) => {
+      tctx.output(arrived, { status: 'failed' });
+      tctx.output(errSeen, failure);
+    }),
 
-    Transition.builder(names.entryTransition(path, entry.id, 'collect-susp'))
-      .inputs(one(armSusp))
-      .outputs(and(outPlace(arrived), outPlace(suspSeen)))
-      .action(async (tctx) => {
-        const suspension = tctx.input(armSusp);
-        tctx.output(arrived, { status: 'suspended' });
-        tctx.output(suspSeen, suspension);
-      })
-      .build(),
+    collect(admission, names.entryTransition(path, entry.id, 'collect-susp'), armSusp, [arrived, suspSeen], (tctx, suspension) => {
+      tctx.output(arrived, { status: 'suspended' });
+      tctx.output(suspSeen, suspension);
+    }),
 
     // A bail inside an arm does not end the run: Mastra lets it fall through to the block's
     // success branch and leaves it out of the block's output (`handlers/control-flow.ts:616-624`).
-    Transition.builder(names.entryTransition(path, entry.id, 'collect-bail'))
-      .inputs(one(armBail))
-      .outputs(outPlace(arrived))
-      .action(async (tctx) => {
-        tctx.input(armBail);
-        tctx.output(arrived, { status: 'settled' });
-      })
-      .build(),
+    collect(admission, names.entryTransition(path, entry.id, 'collect-bail'), armBail, [arrived], (tctx) => {
+      tctx.output(arrived, { status: 'settled' });
+    }),
 
     // Likewise a paused nested workflow: not failed, not suspended, so it reaches the success
     // branch and contributes nothing to the block's output.
-    Transition.builder(names.entryTransition(path, entry.id, 'collect-pause'))
-      .inputs(one(armPause))
-      .outputs(outPlace(arrived))
-      .action(async (tctx) => {
-        tctx.input(armPause);
-        tctx.output(arrived, { status: 'settled' });
-      })
-      .build(),
+    collect(admission, names.entryTransition(path, entry.id, 'collect-pause'), armPause, [arrived], (tctx) => {
+      tctx.output(arrived, { status: 'settled' });
+    }),
 
     Transition.builder(names.entryTransition(path, entry.id, 'join-fail'))
       // `all` takes every failure and the reset drains every suspension: failed outranks
@@ -405,6 +439,7 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
     cancel,
     canceled: exits.canceled,
     failed: exits.failed,
+    admission,
   });
   transitions.push(...reentry.transitions);
 
@@ -412,7 +447,9 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
     inPlace,
     transitions,
     resumeSites: reentry.resumeSites,
-    claims: blockClaims([arrived, armErr, armSusp, armBail, armPause, errSeen, suspSeen], arms.length),
+    claims: [...blockClaims([arrived, armErr, armSusp, armBail, armPause, errSeen, suspSeen], arms.length), ...admissionClaims(admission)],
+    // Read after every collect, admit and re-admit is emitted: the pool's takers and givers.
+    pools: admissionPools(admission),
   };
 };
 

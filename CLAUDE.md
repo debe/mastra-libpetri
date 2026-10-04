@@ -23,10 +23,12 @@ source of truth; read it before structural changes.
 - The net decides what runs. The engine extends `ExecutionEngine` and owns `execute()` — never
   `DefaultExecutionEngine` with overridden hooks, which leaves Mastra's `for` loop as the
   scheduler. No host-side dispatch queue or permit gating in the kernel.
-- No Petri vocabulary in any Mastra-facing surface. Options stay in Mastra's words
-  (`concurrency`, `retries`, `retryConfig`, `timeout`). The test: *a Layer 1 or 2 workflow
-  carrying this config must stay meaningful if `DefaultExecutionEngine` runs it.* Layer 3 is
-  exempt by construction and says so through the engine-type brand.
+- No Petri vocabulary in any Mastra-facing surface. Options stay in Mastra's words. Layer 1 is
+  what Mastra already enforces (`retries`, `retryConfig`, `.foreach` `concurrency`); Layer 2
+  annotations ride in Mastra's own `metadata`, which its engine ignores (`concurrency` on a block,
+  `checkpoint`). The test: *a Layer 1 or 2 workflow carrying this config must stay meaningful if
+  `DefaultExecutionEngine` runs it.* Anything that changes an outcome there — a timeout — is
+  Layer 3, exempt by construction and saying so through the engine-type brand.
 - Cancellation is structural — an inhibitor arc on `_cancel` plus reset arcs. Stop the executor
   with `close()`, never `run(timeoutMs)`, whose default policy keeps firing after it rejects.
 - Every Mastra behaviour not reproduced is recorded in `docs/divergences.md`. No silent skips.
