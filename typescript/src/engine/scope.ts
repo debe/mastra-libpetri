@@ -1,6 +1,6 @@
 import { systemClock, type Clock } from 'libpetri';
 import type { RunScope } from '../compiler/scope.js';
-import type { LifecycleEvent, StepRecord, StepRunner } from '../compiler/types.js';
+import type { CheckpointEvent, LifecycleEvent, StepRecord, StepRunner } from '../compiler/types.js';
 
 export interface RunScopeOptions {
   readonly runner: StepRunner;
@@ -28,7 +28,7 @@ export class KernelRunScope implements RunScope {
   readonly #clock: Clock;
 
   constructor(options: RunScopeOptions) {
-    this.runner = options.runner;
+    this.runner = this.#keepingCheckpointErrors(options.runner);
     this.initData = options.initData;
     this.signal = options.signal ?? new AbortController().signal;
     this.#results = new Map(options.stepResults ?? []);
@@ -61,6 +61,49 @@ export class KernelRunScope implements RunScope {
       kept(error);
       return undefined;
     }
+  }
+
+  /**
+   * The first error a checkpoint write (`StepRunner.checkpoint`) threw or rejected with ([ADR 0010]),
+   * as the object itself. Unlike an observer's, it is **not** swallowed: the rejection still fails
+   * the checkpoint's firing, which ends the run as `stranded` ([ADR 0007]'s failed-firing rule). But
+   * libpetri's `transition-failed` event carries only the message and the type name, so this is
+   * where the engine gets the original error back to reject with — the storage error, as Mastra's
+   * own persist failure rejects.
+   */
+  get checkpointError(): { readonly error: unknown } | undefined {
+    return this.#checkpointError;
+  }
+  #checkpointError: { readonly error: unknown } | undefined;
+
+  /**
+   * The runner as the actions see it: the caller's own, except that `checkpoint` — when it has one —
+   * keeps its first throw or rejection here before passing it on unchanged. A proxy rather than a
+   * copy, so every other member (present or added later) reaches the runner itself, bound to it, and
+   * however an action calls `scope.runner.checkpoint` the error is kept. A runner without
+   * `checkpoint` is handed through as it is.
+   */
+  #keepingCheckpointErrors(runner: StepRunner): StepRunner {
+    const checkpoint = runner.checkpoint;
+    if (typeof checkpoint !== 'function') return runner;
+    const kept = (error: unknown): never => {
+      this.#checkpointError ??= { error };
+      throw error;
+    };
+    const wrapped = (event: CheckpointEvent): Promise<void> => {
+      try {
+        return Promise.resolve(checkpoint.call(runner, event)).then(undefined, kept);
+      } catch (error) {
+        return kept(error);
+      }
+    };
+    return new Proxy(runner, {
+      get(target, property) {
+        if (property === 'checkpoint') return wrapped;
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
   }
 
   /** Every record, in first-recorded order. */

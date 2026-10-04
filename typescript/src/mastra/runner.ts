@@ -22,7 +22,7 @@ import { createObservabilityContext, executeWithContext, wrapMastra, type AnySpa
 import { HostPreconditionError } from '../compiler/gadgets/leaf.js';
 import type { EntryPath } from '../compiler/names.js';
 import { UnresumablePositionError } from '../compiler/resume.js';
-import type { LifecycleEvent, RunView, StepCall, StepOutcome, StepRecord, StepRunner } from '../compiler/types.js';
+import type { CheckpointEvent, LifecycleEvent, RunView, StepCall, StepOutcome, StepRecord, StepRunner } from '../compiler/types.js';
 import type { StepEvents } from './events.js';
 import { entryId } from './host.js';
 import type { RunnerResume } from './resume-codec.js';
@@ -121,6 +121,18 @@ export interface MastraStepRunnerOptions {
   readonly disableScorers?: boolean | undefined;
   /** The engine's logger: a failing branch condition is tracked and logged on it (`handlers/control-flow.ts:477-478`), as are scorer failures. */
   readonly logger?: (() => IMastraLogger | undefined) | undefined;
+  /**
+   * Writes a checkpoint's row ([ADR 0010]) — the engine's `persistRun` with phase `checkpoint`.
+   * Awaited by the checkpoint firing; a rejection fails it, and the run with it. Absent, a
+   * workflow that marks a checkpoint fails at it rather than skip a durability point it asked for.
+   */
+  readonly checkpoint?: ((event: CheckpointEvent) => Promise<void>) | undefined;
+  /**
+   * The restart this segment continues ([ADR 0010]), when it is one: the stored `activeStepsPath`.
+   * A nested workflow step named there gets Mastra's `restart: true` (`handlers/step.ts:435-437`),
+   * so its own run restarts from its own row instead of starting afresh.
+   */
+  readonly restart?: { readonly activeStepsPath: Readonly<Record<string, readonly number[]>> } | undefined;
 }
 
 /**
@@ -197,12 +209,15 @@ export class MastraStepRunner implements StepRunner {
   readonly #itemPrior = new Map<string, StepRecord | undefined>();
   /** Each step call's `validateStepInput` result, by position, from its first attempt: see {@link #validatedInput}. */
   readonly #validated = new Map<string, ValidatedInput>();
+  /** The steps named in the restart's `activeStepsPath` that have not yet been handed `restart: true`. */
+  readonly #toRestart: Set<string>;
 
   constructor(options: MastraStepRunnerOptions) {
     this.#o = options;
     this.#state = { ...options.initialState };
     this.#mastra = options.mastra;
     this.#carried = carriedForeachLabels(options.graph, options.resume?.records);
+    this.#toRestart = new Set(Object.keys(options.restart?.activeStepsPath ?? {}));
   }
 
   /** The workflow state after every applied update — Mastra's `state`. */
@@ -273,6 +288,7 @@ export class MastraStepRunner implements StepRunner {
     } catch (error) {
       throw new HostPreconditionError(stepId, call.path, error);
     }
+    const restart = this.#restartFeed(step.id, call, nested);
 
     // Mastra's `stepCallId` (`handlers/step.ts:106`): one per step call, every retry sharing it — the
     // start event's, the result's and the writer's.
@@ -335,6 +351,7 @@ export class MastraStepRunner implements StepRunner {
           resumeData: feed.resumeData,
           suspendData: feed.suspendData,
           ...(feed.resume === undefined ? {} : { resume: feed.resume }),
+          ...(restart ? { restart: true } : {}),
           suspend: async (data: unknown, options?: SuspendOptions): Promise<void> => {
             const { suspendData, validationError: suspendError } = await validateStepSuspendData({
               suspendData: data,
@@ -551,6 +568,33 @@ export class MastraStepRunner implements StepRunner {
         ? { ...(prior !== undefined && 'payload' in prior ? { prior: { payload: prior.payload } } : {}), resumedAt: this.#now() }
         : undefined;
     return { resumeData, suspendData, resume: nestedResume, record };
+  }
+
+  /**
+   * Whether this call is handed Mastra's `restart: true` ([ADR 0010]): `!!restart.activeStepsPath
+   * [step.id]` (`handlers/step.ts:435-437`), which a nested `Workflow.execute` reads to restart its
+   * child run from that run's own row (`workflow.ts:3017-3018`) instead of starting it. Only a
+   * nested workflow reads the flag; it is handed to the **first attempt of the first call** of a
+   * step the stored row names, and to no later call — a loop's next iteration clears Mastra's
+   * restart too (`handlers/control-flow.ts:782`), and a retry restarting the child again would
+   * read the child's own failed row back as its result (`workflow.ts:4887-4936`).
+   */
+  #restartFeed(stepId: string, call: StepCall, nested: boolean): boolean {
+    if (!nested || call.attempt !== 0 || !this.#toRestart.has(stepId)) return false;
+    this.#toRestart.delete(stepId);
+    return true;
+  }
+
+  /**
+   * Takes a checkpoint ([ADR 0010]): the engine's row writer, awaited. Not observation: a rejection
+   * fails the checkpoint firing, and the engine rejects the run with the storage error.
+   */
+  async checkpoint(event: CheckpointEvent): Promise<void> {
+    const write = this.#o.checkpoint;
+    if (write === undefined) {
+      throw new Error(`run '${this.#o.runId}' reached a checkpoint after entry ${event.after}, but its runner was given no checkpoint writer`);
+    }
+    await write(event);
   }
 
   /** `stepResults[step.id]` for this call: see {@link #resumeFeed}. */

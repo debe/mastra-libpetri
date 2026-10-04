@@ -189,10 +189,19 @@ export type PetriCloneStep = <TStepId extends string>(
 ) => PetriStep<TStepId, any, any, any, any, any>;
 
 /**
- * `Workflow.engineType` for a workflow built by {@link init}. Mastra reads it in two places, and
- * both are the behaviour wanted until resume and restart land (M4): `Run.restart()` refuses any
- * engine but `'default'` and `'evented'` (`workflow.ts:4872-4875`), and `Mastra` restarts active
- * runs only of `'default'` workflows (`mastra/index.ts:3952`).
+ * `Workflow.engineType` for a workflow built by {@link init}. Mastra reads it in three places
+ * ([ADR 0010], "The Run.restart seam"):
+ *
+ * - `Run._restart` refuses any engine but `'default'` and `'evented'` (`workflow.ts:4872-4875`).
+ *   {@link init} lets a petri run through: each `Run` its workflow creates carries an instance
+ *   `_restart` that reports `'default'` for the synchronous prologue of Mastra's own `_restart` —
+ *   the only place the field is read — and restores `'petri'` before the first `await`. The
+ *   engine then decides what a restart may do, and refuses by its own error.
+ * - `Workflow.restartAllActiveWorkflowRuns` returns early for any engine but `'default'`
+ *   (`workflow.ts:3147-3165`); {@link init} replaces it on the instance with Mastra's body, ungated.
+ * - `Mastra.listActiveWorkflowRuns` keeps only `'default'` workflows (`mastra/index.ts:3952`), so
+ *   Mastra's boot hook still skips petri runs; `restartActiveRuns` (`recovery.ts`) is the
+ *   counterpart to call beside it.
  */
 export const PETRI_ENGINE_TYPE = 'petri';
 
@@ -233,6 +242,7 @@ export function init(options: PetriInitOptions = {}): PetriFactories {
     const workflow = new Workflow({ ...params, executionEngine: engine });
     engine.options = workflow.options;
     workflow.engineType = PETRI_ENGINE_TYPE;
+    openRestart(workflow);
     return workflow;
   }) as unknown as PetriCreateWorkflow;
 
@@ -244,4 +254,78 @@ export function init(options: PetriInitOptions = {}): PetriFactories {
   const cloneStep = mastraCloneStep as unknown as PetriCloneStep;
 
   return { createWorkflow, createStep, cloneStep };
+}
+
+/** Marks a `Run` whose `_restart` {@link openRestart} has already wrapped. */
+const restartSeam: unique symbol = Symbol('mastra-libpetri.restartSeam');
+
+/** The parts of Mastra's `Run` the seam touches: `_restart` is protected, `workflowEngineType` readonly. */
+interface RunSeam {
+  workflowEngineType: string;
+  _restart: (args: unknown) => Promise<unknown>;
+  [restartSeam]?: true;
+}
+
+/** The parts of Mastra's `Workflow` the seam touches: `logger` is protected. */
+interface WorkflowSeam {
+  readonly id: string;
+  readonly logger: { debug(message: string, args?: unknown): void; error(message: string, args?: unknown): void };
+  createRun(options?: unknown): Promise<unknown>;
+  listActiveWorkflowRuns(): Promise<{ runs: { runId: string }[] }>;
+  restartAllActiveWorkflowRuns(): Promise<void>;
+}
+
+/**
+ * Opens `Run.restart()` and `Workflow.restartAllActiveWorkflowRuns()` on a petri workflow
+ * ([ADR 0010], "The Run.restart seam"), on the instance only — no Mastra prototype is touched.
+ *
+ * `createRun` is replaced on the instance, so Mastra's own callers reach it: `restartAllActiveWorkflowRuns`
+ * and a nested workflow's `execute`, which restarts its child through `this.createRun`
+ * (`workflow.ts:2972-2974`, `3017`). Each run is wrapped once: `createRun` returns the cached run
+ * for a known `runId` (`workflow.ts:2738-2739`), and the symbol mark keeps a second wrap off it.
+ *
+ * The wrapped `_restart` sets `workflowEngineType` to `'default'`, calls Mastra's `_restart`, and
+ * restores `'petri'` in `finally`. Mastra's `_restart` is an `async` function, so the call returns
+ * its promise when the body reaches its first `await` (the snapshot load, `workflow.ts:4877`);
+ * the engine check (`workflow.ts:4872-4875`) runs before it, and the `finally` runs right after.
+ * No other code reads the field (`workflow.ts:4873-4874` are its only reads), and none can run
+ * while the synchronous prologue does. `tests/upstream/restart-seam.test.ts` pins both facts.
+ */
+function openRestart(workflow: Workflow<any, any, any, any, any, any, any, any>): void {
+  const seam = workflow as unknown as WorkflowSeam;
+  const createRun = seam.createRun.bind(seam);
+  seam.createRun = async (runOptions?: unknown) => {
+    const run = (await createRun(runOptions)) as RunSeam;
+    if (run[restartSeam] !== true) {
+      const restart = run._restart;
+      run._restart = function petriRestart(this: RunSeam, args: unknown) {
+        const engineType = this.workflowEngineType;
+        this.workflowEngineType = 'default';
+        try {
+          return restart.call(this, args);
+        } finally {
+          this.workflowEngineType = engineType;
+        }
+      };
+      run[restartSeam] = true;
+    }
+    return run;
+  };
+
+  // Mastra's body (`workflow.ts:3147-3165`) without the engine gate: sequential, each failure logged.
+  seam.restartAllActiveWorkflowRuns = async function restartAllActiveWorkflowRuns(this: WorkflowSeam) {
+    const activeRuns = await this.listActiveWorkflowRuns();
+    if (activeRuns.runs.length > 0) {
+      this.logger.debug('Restarting active workflow runs', { count: activeRuns.runs.length });
+    }
+    for (const runSnapshot of activeRuns.runs) {
+      try {
+        const run = (await this.createRun({ runId: runSnapshot.runId })) as { restart(): Promise<unknown> };
+        await run.restart();
+        this.logger.debug('Restarted workflow run', { workflowId: this.id, runId: runSnapshot.runId });
+      } catch (error) {
+        this.logger.error('Failed to restart workflow run', { workflowId: this.id, runId: runSnapshot.runId, error });
+      }
+    }
+  };
 }

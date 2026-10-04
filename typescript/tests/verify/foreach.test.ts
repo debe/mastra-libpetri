@@ -379,6 +379,14 @@ describe.concurrent('compiled foreach: each cancellation safeguard is load-beari
       'resume@0+cancel/deadlockFree': 'proven',
       'resume@0+cancel/terminatesAtSink': 'proven',
       'resume@0+cancel/exactlyOneTerminal': 'proven',
+      // Restarted at boundary 0 ([ADR 0010]): the entry place, so the fresh segments' proofs, cited.
+      'restart@0/deadlockFree': 'proven',
+      'restart@0/terminatesAtSink': 'proven',
+      'restart@0/exactlyOneTerminal': 'proven',
+      'restart@0/neverCanceled': 'violated',
+      'restart@0+cancel/deadlockFree': 'proven',
+      'restart@0+cancel/terminatesAtSink': 'proven',
+      'restart@0+cancel/exactlyOneTerminal': 'proven',
     });
   });
 });

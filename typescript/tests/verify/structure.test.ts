@@ -315,8 +315,24 @@ describe('verifyWorkflow runs the structural check first', () => {
         return properties.map((p) => `${segmentLabel(segment)}/${p}`);
       }),
     );
-    // The derivation above is not vacuous: both steps' sites are there.
-    expect(segmentsFor(mutant).map(segmentLabel)).toEqual(['closed', 'cancel', 'resume@0', 'resume@0+cancel', 'resume@1', 'resume@1+cancel']);
+    // The derivation above is not vacuous: both steps' sites are there, and both top-level
+    // boundaries' restart segments ([ADR 0010]).
+    expect(segmentsFor(mutant).map(segmentLabel)).toEqual([
+      'closed', 'cancel',
+      'resume@0', 'resume@0+cancel', 'resume@1', 'resume@1+cancel',
+      'restart@0', 'restart@0+cancel', 'restart@1', 'restart@1+cancel',
+    ]);
+    // Every boundary here is a step's input, so every resume and restart segment shares an earlier
+    // segment's marking and cites its proof: site 0 and boundary 0 are the entry place, boundary 1 is site 1.
+    const cites: Record<string, string | undefined> = {
+      closed: undefined, cancel: undefined,
+      'resume@0': 'closed', 'resume@0+cancel': 'cancel', 'resume@1': undefined, 'resume@1+cancel': undefined,
+      'restart@0': 'closed', 'restart@0+cancel': 'cancel', 'restart@1': 'resume@1', 'restart@1+cancel': 'resume@1+cancel',
+    };
+    for (const r of reports) {
+      const cited = r.sameProofAs === undefined ? undefined : segmentLabel(r.sameProofAs);
+      expect(cited, describeReport(r)).toBe(cites[segmentLabel(r.segment)]);
+    }
     for (const r of reports) expect(r.result.verdict.type, describeReport(r)).toBe('proven');
   }, 60_000);
 

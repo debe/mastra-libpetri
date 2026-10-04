@@ -162,11 +162,15 @@ describe('init() — runtime', () => {
     expect(seenBy).toEqual([mastra]);
   });
 
-  it("marks the workflow's engineType, so Mastra refuses restart() by name instead of running it", async () => {
+  it("marks the workflow's engineType, and still opens restart() past Mastra's engine check (ADR 0010)", async () => {
     const petri = petriLinear();
     expect(petri.engineType).toBe(PETRI_ENGINE_TYPE);
     const run = await petri.createRun();
-    await expect(run.restart()).rejects.toThrow(`restart() is not supported on ${PETRI_ENGINE_TYPE} workflows`);
+    // No storage, so Mastra's own `_restart` gets as far as loading the snapshot — past the engine
+    // check that refused petri workflows by name before M4b.
+    const restarted = run.restart();
+    await expect(restarted).rejects.toThrow(/^Snapshot not found for run /);
+    await expect(restarted).rejects.not.toThrow(`restart() is not supported on ${PETRI_ENGINE_TYPE} workflows`);
   });
 
   it('refuses the two parameters that would pick another engine, instead of dropping them', () => {

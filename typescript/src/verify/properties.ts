@@ -8,9 +8,10 @@ import {
   type SmtVerificationResult,
 } from 'libpetri/verification';
 import type { Place } from 'libpetri';
-import type { CompiledWorkflow, ResumeSite } from '../compiler/types.js';
+import type { BoundarySite, CompiledWorkflow, ResumeSite } from '../compiler/types.js';
 import {
   cancelStructureViolations,
+  checkpointStructureViolations,
   resumeGateViolations,
   resumeTimingViolations,
   suspensionCoverageViolations,
@@ -38,6 +39,8 @@ import { initialCounts } from '../engine/kernel.js';
  * budget reset on a cancel path. The loop's own tests also prove from the post-`start` marking.
  *
  * - a {@link ResumeSegment} — a resumed run ([ADR 0007]): one token at a registered resume site,
+ *   with or without one cancellation arriving at any point.
+ * - a {@link RestartSegment} — a restarted run ([ADR 0010]): one token at a top-level boundary,
  *   with or without one cancellation arriving at any point.
  */
 export type Segment = 'closed' | 'cancel' | ResumeSegment | RestartSegment;
@@ -89,7 +92,7 @@ export function resumeSegment(site: string, cancel: boolean): ResumeSegment {
   return segment;
 }
 
-/** `closed`, `cancel`, `resume@<site>` or `resume@<site>+cancel`. */
+/** `closed`, `cancel`, `resume@<site>[+cancel]` or `restart@<index>[+cancel]`. */
 export function segmentLabel(segment: Segment): string {
   if (typeof segment === 'string') return segment;
   if ('restart' in segment) return `restart@${segment.restart}${segment.cancel ? '+cancel' : ''}`;
@@ -112,9 +115,28 @@ function cancels(segment: Segment): boolean {
  * Throws on a site key the workflow does not register.
  */
 export function segmentInitialMarking(compiled: CompiledWorkflow, segment: Segment): ReadonlyMap<Place<unknown>, number> {
-  if (typeof segment !== 'string' && 'restart' in segment) throw new Error('restart segments are not proven yet (M4b W2)');
-  const start = typeof segment === 'string' ? compiled.entryPlace : siteOf(compiled, segment.resume).place;
+  const start =
+    typeof segment === 'string' ? compiled.entryPlace
+    : 'restart' in segment ? boundaryOf(compiled, segment.restart).place
+    : siteOf(compiled, segment.resume).place;
   return initialCounts(compiled, start, cancels(segment) ? compiled.cancelRequest : undefined);
+}
+
+/**
+ * The marking as a key that two equal markings share whatever their insertion order: `name=n`
+ * pairs, sorted. Equal keys mean the two segments are the same query, so `verifyWorkflow` and
+ * `verify` ask it once and cite the answer under both labels.
+ */
+export function markingKey(marking: ReadonlyMap<Place<unknown>, number>): string {
+  return [...marking].map(([p, n]) => `${p.name}=${n}`).sort().join(',');
+}
+
+function boundaryOf(compiled: CompiledWorkflow, index: number): BoundarySite {
+  const site = compiled.boundaries[index];
+  if (!Number.isInteger(index) || site === undefined || site.index !== index) {
+    throw new Error(`no top-level boundary ${index} in workflow '${compiled.net.name}' (boundaries: 0..${compiled.boundaries.length - 1})`);
+  }
+  return site;
 }
 
 function siteOf(compiled: CompiledWorkflow, key: string): ResumeSite {
@@ -147,6 +169,15 @@ export interface VerifyOptions {
    */
   readonly resume?: 'all' | 'none' | readonly string[];
   /**
+   * Which top-level boundaries to prove a restart from ([ADR 0010]), when `segments` is omitted:
+   * each selected boundary adds `restart@p` and `restart@p+cancel`, after the resume segments.
+   * `'all'` (the default) is every boundary, marked or not — a row from Mastra's own engine may name
+   * any; a list names entry indices, and an unknown one throws. A segment whose marking equals an
+   * earlier one's (`restart@0` is `closed`; `restart@p` is `resume@p` at a step or loop) is still
+   * listed, and cites that segment's proof.
+   */
+  readonly restart?: 'all' | 'none' | readonly number[];
+  /**
    * `'skip'` omits the structural cancel check, which otherwise throws first. Only for tests that
    * demonstrate what the *proofs* cannot see on a mutant the structural check would refuse.
    */
@@ -159,20 +190,39 @@ export interface PropertyReport {
   /** The initial marking the proof started from, e.g. `{s.0.a.in: 1, wf.permits: 2}`. */
   readonly marking: string;
   readonly result: SmtVerificationResult;
+  /**
+   * Present when this report was not asked separately: `segment`'s initial marking equals this
+   * earlier segment's, so the query is the same one, and `result` is that segment's answer to it.
+   */
+  readonly sameProofAs?: Segment;
 }
 
 /**
  * The segments `verifyWorkflow` proves for these options: `segments` verbatim when given, else
- * `closed`, `cancel`, then `resume@s` and `resume@s+cancel` per selected site, in site-key order.
+ * `closed`, `cancel`, then `resume@s` and `resume@s+cancel` per selected site, in site-key order,
+ * then `restart@p` and `restart@p+cancel` per selected boundary, in index order.
  */
-export function segmentsFor(compiled: CompiledWorkflow, options: Pick<VerifyOptions, 'segments' | 'resume'> = {}): readonly Segment[] {
+export function segmentsFor(
+  compiled: CompiledWorkflow,
+  options: Pick<VerifyOptions, 'segments' | 'resume' | 'restart'> = {},
+): readonly Segment[] {
   if (options.segments !== undefined) return options.segments;
   const selection = options.resume ?? 'all';
   const keys =
     selection === 'all' ? [...compiled.resumeSites.keys()].sort(compareSiteKeys)
     : selection === 'none' ? []
     : selection.map((key) => siteOf(compiled, key).path.join('.'));
-  return ['closed', 'cancel', ...keys.flatMap((key) => [resumeSegment(key, false), resumeSegment(key, true)])];
+  const restarts = options.restart ?? 'all';
+  const indices =
+    restarts === 'all' ? compiled.boundaries.map((b) => b.index)
+    : restarts === 'none' ? []
+    : restarts.map((index) => boundaryOf(compiled, index).index);
+  return [
+    'closed',
+    'cancel',
+    ...keys.flatMap((key) => [resumeSegment(key, false), resumeSegment(key, true)]),
+    ...indices.flatMap((index) => [restartSegment(index, false), restartSegment(index, true)]),
+  ];
 }
 
 /** `0` < `1` < `1.0` < `1.1` < `2` < `10`: numerically, segment by segment. */
@@ -227,6 +277,14 @@ function compareSiteKeys(a: string, b: string): number {
  * A claim about a workflow names all `2 + 2·|sites|` segments, `k`, and the route. The gates are
  * dead in the fresh segments, so a dead-transition analysis must take the union of all of them.
  *
+ * **Restart segments** ([ADR 0010]). By default every top-level boundary `p` is proven twice too,
+ * `restart@p` and `restart@p+cancel`, from `{in_p: 1}` plus the budget — so a claim names
+ * `2 + 2·|sites| + 2·|boundaries|` segments. Where a segment's initial marking equals an earlier
+ * one's — `restart@0` is `closed`, `restart@0+cancel` is `cancel`, and `restart@p` is `resume@p` at a
+ * top-level step or loop, whose site is its own input place — the query is asked once and its
+ * report is repeated under the later label with `sameProofAs` naming the segment that asked it.
+ * The `checkpoint structure` check runs with the others.
+ *
  * Callers must assert `proven` explicitly. `isViolated()` is false for `unknown` too, so
  * `expect(isViolated()).toBe(false)` passes on a query that timed out and the test is vacuous
  * from then on.
@@ -246,6 +304,7 @@ export async function verifyWorkflow(
       ['resume gate structure', resumeGateViolations],
       ['suspension coverage', suspensionCoverageViolations],
       ['resume timing structure', resumeTimingViolations],
+      ['checkpoint structure', checkpointStructureViolations],
     ];
     for (const [what, check] of checks) {
       const violations = check(compiled);
@@ -270,12 +329,22 @@ export async function verifyWorkflow(
       .semiflowInvariants(true)
       .timeout(timeout);
 
+  // Two segments with the same initial marking are the same query: asked once, cited under both.
   const reports: PropertyReport[] = [];
+  const asked = new Map<string, { readonly segment: Segment; readonly result: SmtVerificationResult }>();
   for (const segment of segments) {
     const initial = segmentInitialMarking(compiled, segment);
     const marking = describeMarking(initial);
+    const key = markingKey(initial);
     for (const [property, prop] of completionProperties(compiled, segment)) {
-      reports.push({ property, segment, marking, result: await base(initial).property(prop).verify() });
+      const earlier = asked.get(`${key}|${property}`);
+      if (earlier !== undefined) {
+        reports.push({ property, segment, marking, result: earlier.result, sameProofAs: earlier.segment });
+        continue;
+      }
+      const result = await base(initial).property(prop).verify();
+      asked.set(`${key}|${property}`, { segment, result });
+      reports.push({ property, segment, marking, result });
     }
   }
   return reports;
@@ -315,5 +384,6 @@ export function completionProperties(compiled: CompiledWorkflow, segment: Segmen
 export function describeReport(report: PropertyReport): string {
   const { verdict, route, elapsedMs } = report.result;
   const detail = verdict.type === 'unknown' ? ` (${verdict.reason})` : '';
-  return `${segmentLabel(report.segment)}/${report.property}: ${verdict.type} via ${route} in ${elapsedMs}ms${detail} from ${report.marking}`;
+  const cited = report.sameProofAs === undefined ? '' : ` (the proof of ${segmentLabel(report.sameProofAs)}, same marking)`;
+  return `${segmentLabel(report.segment)}/${report.property}: ${verdict.type} via ${route} in ${elapsedMs}ms${detail} from ${report.marking}${cited}`;
 }

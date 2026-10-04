@@ -23,6 +23,12 @@ export function pathSegment(path: EntryPath): string {
   return path.join('-');
 }
 
+/** A top-level index as a name segment; a checkpoint is only ever between top-level entries. */
+function checkpointSegment(index: number): string {
+  if (!Number.isInteger(index) || index < 0) throw new Error(`a checkpoint index must be a whole number, got ${String(index)}`);
+  return pathSegment([index]);
+}
+
 /**
  * Makes a user-supplied step id safe as a name segment. Step ids are arbitrary user strings,
  * so `/` (reserved) and whitespace are replaced. The positional path already guarantees
@@ -87,6 +93,37 @@ export class NameVocabulary {
     return this.#mint(
       `t.${pathSegment(path)}.${slug(stepId)}.${role}`,
       `${role} of entry ${pathSegment(path)}`,
+    );
+  }
+
+  /**
+   * The checkpoint after top-level entry `index` ([ADR 0010]): `s.<index>.checkpoint`, where entry
+   * `index`'s success waits for its row to be written.
+   *
+   * **Named as entry `index`'s interior.** It starts with `s.<index>.`, so the barrier counts it
+   * among the places entry `index` owns — which it is: only entry `index`'s success fills it.
+   *
+   * **It cannot collide.** It has three segments. Every place a gadget mints has at least four
+   * (`s.<path>.<slug>.<role>`, and a slug never contains `.`), so no step id — `checkpoint`
+   * included — can produce this name.
+   */
+  checkpointPlace(index: number): string {
+    return this.#mint(`s.${checkpointSegment(index)}.checkpoint`, `checkpoint after entry ${index}`);
+  }
+
+  /**
+   * The checkpoint's transitions: `t.<index>.checkpoint`, which writes the row, and
+   * `t.<index>.checkpoint-cancel`, the sweep that moves the token on unwritten.
+   *
+   * The sweep is **not** `t.<index>.checkpoint.cancel`, as ADR 0010 first wrote it: that is exactly
+   * the cancel sweep a top-level step with id `checkpoint` mints at the same index
+   * (`entryTransition([index], 'checkpoint', 'cancel')`), so marking such a step would fail to
+   * compile. Both names here have three segments, which no gadget mints.
+   */
+  checkpointTransition(index: number, canceled: boolean): string {
+    return this.#mint(
+      `t.${checkpointSegment(index)}.${canceled ? 'checkpoint-cancel' : 'checkpoint'}`,
+      `${canceled ? 'cancel sweep of the ' : ''}checkpoint after entry ${index}`,
     );
   }
 

@@ -52,8 +52,12 @@ same net, proven at every boundary.**
   on the last entry adds nothing: the terminal row covers it.
 - **The net.** For each marked *i* < last: place `s.<i>.checkpoint` becomes entry *i*'s `next`;
   `t.<i>.checkpoint` (inhibited by `wf.cancel`) awaits the write and outputs `in_{i+1}`; a sweep
-  `t.<i>.checkpoint.cancel` reads `wf.cancel` and moves the token on unwritten, so `in_{i+1}`'s own
-  sweep reports the cancel as today. An unmarked workflow compiles to exactly today's net.
+  `t.<i>.checkpoint-cancel` (not `.cancel`, which a step id `checkpoint` would mint as its own
+  sweep) reads `wf.cancel` and ends the run in `wf.canceled` unwritten, reporting entry *i+1* as not
+  started — what that entry's own sweep reports. *Amended in W1:* the sweep first moved the token on
+  to `in_{i+1}`; that kept the cancel signal live downstream, and liveness witnesses on a seven-entry
+  workflow went from ~100 ms to `unknown` at 30 s. Ending in `wf.canceled`, as every other sweep
+  does, brought them back to ~260 ms. An unmarked workflow compiles to exactly today's net.
 - **The write is a freeze, awaited in the firing.** The row is durable before any effect of entry
   *i+1*, and lands strictly before the terminal write — no queue. Its rows are `running` writes
   under the `#lastPersisted` guard, `shouldPersistSnapshot` and `pruneSnapshot`. A rejected write

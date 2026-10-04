@@ -107,6 +107,15 @@ npm publishes 6.0.0. `package.json` therefore declares
 publishes. `scripts/libpetri-pin` records the sibling revision, and
 `scripts/link-libpetri.sh --check` verifies it.
 
+## Checkpoints and restart
+
+Snapshots are not free, so this engine takes one only where the author asks:
+`metadata: { checkpoint: true }` on a top-level step or block. When that entry succeeds the run
+waits for one storage write, then goes on; nothing else pays. `Run.restart()` continues from the
+latest checkpoint — the whole run when none was taken — and `restartActiveRuns(mastra)` does it at
+boot for every active petri run. On Mastra's own engine the mark is ignored: that engine writes a
+row at every step anyway. See [ADR 0010](docs/adr/0010-restart-from-marked-checkpoints.md).
+
 ## Verifying a workflow
 
 ```bash
@@ -125,8 +134,9 @@ would, nested workflows included, and proves four families of claims about the n
 | exclusion | Mastra's barrier: no entry holds work once the next has started or an outcome is on its way out; plus each gadget's own pairs |
 | liveness | every step attempt, every retry included, has a confirmed run that reaches it: no dead steps, and each retry ceiling is reached |
 
-Each is proven for a fresh run, a run canceled at any point, and a run resumed at each resume
-site, under libpetri's model of the executor in which an action is in flight between consuming its
+Each is proven for a fresh run, a run canceled at any point, a run resumed at each resume site,
+and a run restarted at each top-level boundary ([ADR 0010](docs/adr/0010-restart-from-marked-checkpoints.md)),
+under libpetri's model of the executor in which an action is in flight between consuming its
 inputs and depositing its outputs. The CLI exits 0 only when every claim holds; `unknown` exits 1,
 and a missing solver 2. Every workflow of the differential corpus is gated this way in `npm test`
 ([`tests/verify/corpus.test.ts`](typescript/tests/verify/corpus.test.ts)), 30 s a query: a proof

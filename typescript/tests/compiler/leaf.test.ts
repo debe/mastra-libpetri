@@ -111,13 +111,19 @@ function failedWith(stepId: string, message: RegExp, path: readonly number[] = [
 }
 
 /**
- * Every report `verifyWorkflow` returns by default for `compiled`, in order: `closed`, `cancel`,
- * then `resume@s` and `resume@s+cancel` for every registered site ([ADR 0007]) — derived from
+ * The segments the leaf proofs ask for: `verifyWorkflow`'s default with the restart segments
+ * ([ADR 0010]) left out — those are `tests/verify/restart-segments.test.ts`'s.
+ */
+const SEGMENTS = { restart: 'none' } as const;
+
+/**
+ * Every report `verifyWorkflow` returns under {@link SEGMENTS} for `compiled`, in order: `closed`,
+ * `cancel`, then `resume@s` and `resume@s+cancel` for every registered site ([ADR 0007]) — derived from
  * `segmentsFor`/`segmentLabel`, never by dropping keys. `neverCanceled` only where no cancel
  * arrives; a budget adds its two permit properties to every segment.
  */
 function allReports(compiled: CompiledWorkflow): string[] {
-  return segmentsFor(compiled).flatMap((segment) => {
+  return segmentsFor(compiled, SEGMENTS).flatMap((segment) => {
     const label = segmentLabel(segment);
     const cancels = typeof segment === 'string' ? segment === 'cancel' : segment.cancel;
     return [
@@ -163,7 +169,7 @@ function expectAllProven(compiled: CompiledWorkflow, reports: readonly PropertyR
  */
 async function expectProvenBothSegments(description: WorkflowDescription, sites: readonly string[]): Promise<void> {
   const compiled = compile(description);
-  expectAllProven(compiled, await verifyWorkflow(compiled), sites);
+  expectAllProven(compiled, await verifyWorkflow(compiled, SEGMENTS), sites);
 }
 
 /**
@@ -1199,7 +1205,7 @@ describe('non-vacuity of the leaf', () => {
       "resume site 0 ('s.0.a.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
     ]);
     await expect(verifyWorkflow(mutant)).rejects.toThrow(/resume gate structure is unsound/);
-    expectAllProven(mutant, await verifyWorkflow(mutant, { structure: 'skip' }), ['0', '1']);
+    expectAllProven(mutant, await verifyWorkflow(mutant, { ...SEGMENTS, structure: 'skip' }), ['0', '1']);
   }, 90_000);
 
   it('routing one exit to a place that is not a terminal flips deadlockFree to violated', async () => {

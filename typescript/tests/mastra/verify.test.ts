@@ -61,7 +61,7 @@ describe('verifyMastraWorkflow', () => {
   }, 120_000);
 
   it('an explicit concurrency overrides the engine\'s, for the nested workflow too', async () => {
-    const verification = await verifyMastraWorkflow(outer, { concurrency: 1, families: ['completion'], resume: 'none' });
+    const verification = await verifyMastraWorkflow(outer, { concurrency: 1, families: ['completion'], resume: 'none', restart: 'none' });
     expect(verification.workflow.k).toBe(1);
     expect(verification.nested['inner']!.k).toBe(1);
     expect(verification.workflow.segments.map(segmentLabel)).toEqual(['closed', 'cancel']);

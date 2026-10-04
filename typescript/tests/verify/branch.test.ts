@@ -627,7 +627,8 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
         [twoArms, { ...armSegments('0.0'), ...armSegments('0.1') }],
         [middle, { ...asFresh('0'), ...armSegments('1.0'), ...armSegments('1.1'), ...allProven('2') }],
       ] as const) {
-        const reports = await verifyWorkflow(compile(description, { gadgets: { branch: gatedArms } }), { timeoutMs: 30_000 });
+        // The fresh and resume segments, pinned; the restart segments are restart-segments.test.ts's.
+        const reports = await verifyWorkflow(compile(description, { gadgets: { branch: gatedArms } }), { timeoutMs: 30_000, restart: 'none' });
         expect(verdicts(reports), reports.map(describeReport).join('; ')).toEqual({
           'closed/deadlockFree': 'proven',
           'closed/terminatesAtSink': 'proven',

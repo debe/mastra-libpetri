@@ -164,13 +164,14 @@ describe('compile: entry sites', () => {
     // {entry: 1, permits: 2} (closed), plus {cancel.request: 1} (cancel), and {site: 1, permits: 2}
     // [+ {cancel.request: 1}] for each of the three entry sites; closed net, whichever route the
     // verifier takes (the fixed sleep is timed). Structure checks run first inside verifyWorkflow.
+    // The restart segments ([ADR 0010]) are left out: `tests/verify/restart-segments.test.ts` proves them.
     const composite = compile(
       wf(step('a'), { kind: 'sleep', id: 'nap', duration: { fixed: 5 } }, step('child', { source: 'workflow' }), loop('poll', step('tick'))),
       { concurrency: 2 },
     );
     expect([...composite.resumeSites.keys()].sort()).toStrictEqual(['0', '2', '3']);
     expect(cancelStructureViolations(composite)).toStrictEqual([]);
-    const reports = await verifyWorkflow(composite, { timeoutMs: 30_000 });
+    const reports = await verifyWorkflow(composite, { timeoutMs: 30_000, restart: 'none' });
     const key = (r: PropertyReport) => `${String(r.segment)}/${r.property}`;
     const props = (segment: string, cancel: boolean) => [
       `${segment}/deadlockFree`, `${segment}/terminatesAtSink`, `${segment}/exactlyOneTerminal`,

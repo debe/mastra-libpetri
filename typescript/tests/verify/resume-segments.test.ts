@@ -62,7 +62,8 @@ import type {
  * all: a resume segment is proven from its seed, CORE-073's route); the decoder's mapping from
  * records to a site and its colour (unit-tested in `tests/compiler/resume-seed.test.ts`); timing;
  * termination of a loop (VER-002); the `.foreach()` site's proofs, which are the foreach area's
- * (`tests/verify/foreach-resume.test.ts`).
+ * (`tests/verify/foreach-resume.test.ts`); the restart segments ([ADR 0010]), which the proofs here
+ * leave out with `restart: 'none'` and `tests/verify/restart-segments.test.ts` proves.
  */
 
 const step = (id: string, extra: Partial<Omit<StepDescription, 'kind' | 'id'>> = {}): StepDescription =>
@@ -153,21 +154,34 @@ const sweepOf = (c: CompiledWorkflow, site: ResumeSite): Transition => {
 describe('segments', () => {
   const c = compile(wf(step('a'), fan('fan', ids('x', 'y')), loop('l', step('b'))), { concurrency: 2 });
 
-  it('the default is closed, cancel, then resume@s and resume@s+cancel for every site in path order', () => {
+  it('the default is closed, cancel, then resume@s and resume@s+cancel for every site in path order, then the restarts', () => {
     expect([...c.resumeSites.keys()].sort()).toEqual(['0', '1.0', '1.1', '2']);
-    expect(segmentsFor(c).map(segmentLabel)).toEqual([
+    const resumes = [
       'closed', 'cancel',
       'resume@0', 'resume@0+cancel',
       'resume@1.0', 'resume@1.0+cancel',
       'resume@1.1', 'resume@1.1+cancel',
       'resume@2', 'resume@2+cancel',
+    ];
+    expect(segmentsFor(c, { restart: 'none' }).map(segmentLabel)).toEqual(resumes);
+    // The restart segments ([ADR 0010]) follow by default, one pair per top-level boundary.
+    expect(c.boundaries.map((b) => b.index)).toEqual([0, 1, 2]);
+    expect(segmentsFor(c).map(segmentLabel)).toEqual([
+      ...resumes,
+      'restart@0', 'restart@0+cancel',
+      'restart@1', 'restart@1+cancel',
+      'restart@2', 'restart@2+cancel',
     ]);
     expect(segmentsFor(c, { resume: 'all' }).map(segmentLabel)).toEqual(segmentsFor(c).map(segmentLabel));
   });
 
   it("'none' leaves the fresh segments; a list selects sites; explicit segments win", () => {
-    expect(segmentsFor(c, { resume: 'none' })).toEqual(['closed', 'cancel']);
-    expect(segmentsFor(c, { resume: ['1.1'] }).map(segmentLabel)).toEqual(['closed', 'cancel', 'resume@1.1', 'resume@1.1+cancel']);
+    expect(segmentsFor(c, { resume: 'none', restart: 'none' })).toEqual(['closed', 'cancel']);
+    expect(segmentsFor(c, { resume: ['1.1'], restart: 'none' }).map(segmentLabel)).toEqual(['closed', 'cancel', 'resume@1.1', 'resume@1.1+cancel']);
+    // `resume: 'none'` alone still leaves the default restarts.
+    expect(segmentsFor(c, { resume: 'none' }).map(segmentLabel)).toEqual([
+      'closed', 'cancel', 'restart@0', 'restart@0+cancel', 'restart@1', 'restart@1+cancel', 'restart@2', 'restart@2+cancel',
+    ]);
     const only: readonly Segment[] = [resumeSegment('2', true)];
     expect(segmentsFor(c, { segments: only, resume: 'all' })).toBe(only);
   });
@@ -210,11 +224,32 @@ describe('segments', () => {
       'resume@0/permitsBounded', 'resume@0/permitsReturned',
       'resume@0+cancel/deadlockFree', 'resume@0+cancel/terminatesAtSink', 'resume@0+cancel/exactlyOneTerminal',
       'resume@0+cancel/permitsBounded', 'resume@0+cancel/permitsReturned',
+      'restart@0/deadlockFree', 'restart@0/terminatesAtSink', 'restart@0/exactlyOneTerminal', 'restart@0/neverCanceled',
+      'restart@0/permitsBounded', 'restart@0/permitsReturned',
+      'restart@0+cancel/deadlockFree', 'restart@0+cancel/terminatesAtSink', 'restart@0+cancel/exactlyOneTerminal',
+      'restart@0+cancel/permitsBounded', 'restart@0+cancel/permitsReturned',
     ]);
     for (const r of reports) expect(r.result.verdict.type, describeReport(r)).toBe('proven');
+    // One step: site 0 and boundary 0 are the entry place, so every segment but the two fresh ones
+    // has a fresh segment's marking and cites its proof rather than asking again.
+    const cited = Object.fromEntries(reports.map((r) => [`${r.segment}/${r.property}`, r.sameProofAs === undefined ? '-' : segmentLabel(r.sameProofAs)]));
+    for (const r of reports) {
+      const label = segmentLabel(r.segment);
+      const expected = label === 'closed' || label === 'cancel' ? '-' : label.endsWith('+cancel') ? 'cancel' : 'closed';
+      expect(cited[`${r.segment}/${r.property}`], `${r.segment}/${r.property}`).toBe(expected);
+      if (r.sameProofAs !== undefined) {
+        const source = reports.find((x) => segmentLabel(x.segment) === expected && x.property === r.property)!;
+        expect(r.result).toBe(source.result);
+        expect(r.marking).toBe(source.marking);
+      }
+    }
+    const resumed = reports.find((r) => `${r.segment}/${r.property}` === 'resume@0+cancel/permitsReturned')!;
+    expect(describeReport(resumed)).toMatch(
+      /^resume@0\+cancel\/permitsReturned: proven via \S+ in [\d.]+ms from \{s\.0\.a\.in: 1, wf\.cancel\.request: 1, wf\.permits: 1\} \(the proof of cancel, same marking\)$/,
+    );
     const last = reports[reports.length - 1]!;
     expect(describeReport(last)).toMatch(
-      /^resume@0\+cancel\/permitsReturned: proven via \S+ in [\d.]+ms from \{s\.0\.a\.in: 1, wf\.cancel\.request: 1, wf\.permits: 1\}$/,
+      /^restart@0\+cancel\/permitsReturned: proven via \S+ in [\d.]+ms from \{s\.0\.a\.in: 1, wf\.cancel\.request: 1, wf\.permits: 1\} \(the proof of cancel, same marking\)$/,
     );
     expect(describeReport(reports[0]!)).toMatch(/^closed\/deadlockFree: proven via \S+ in [\d.]+ms from \{s\.0\.a\.in: 1, wf\.permits: 1\}$/);
   });
@@ -488,7 +523,8 @@ async function proveAll(label: string, description: WorkflowDescription, k: numb
   const c = compile(description, k === undefined ? {} : { concurrency: k });
   expect([...c.resumeSites.keys()].sort(), `${label}: registered sites`).toEqual([...sites].sort());
   const started = performance.now();
-  const reports = await verifyWorkflow(c, { timeoutMs });
+  // The resume segments alone: the restart segments are `tests/verify/restart-segments.test.ts`'s.
+  const reports = await verifyWorkflow(c, { timeoutMs, restart: 'none' });
   const ms = performance.now() - started;
   expect(reports.map((r) => `${r.segment}/${r.property}`), label).toEqual(expectedKeys(c, sites));
   for (const r of reports) expect(r.result.verdict.type, `${label}: ${describeReport(r)}`).toBe('proven');
@@ -599,7 +635,7 @@ describe('non-vacuity: the resume segments discriminate', () => {
       expect(verdictOf(reports, `resume@${site}/exactlyOneTerminal`), site).toBe('violated');
     }
     // The fresh segments never reach `replay-2`: only a resume segment can see this defect.
-    const fresh = await verifyWorkflow(mutant, { resume: 'none', timeoutMs: 30_000 });
+    const fresh = await verifyWorkflow(mutant, { resume: 'none', restart: 'none', timeoutMs: 30_000 });
     for (const r of fresh) expect(r.result.verdict.type, describeReport(r)).toBe('proven');
   }, 300_000);
 

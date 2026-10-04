@@ -31,7 +31,8 @@ vi.mock('../../src/mastra/persist.js', async (importOriginal) => {
  * as far as the engine can tell) unless a test says otherwise.
  *
  * Every shape's net is proven too: `verifyWorkflow` with its default segments — `closed`,
- * `cancel`, and `resume@s` / `resume@s+cancel` for every registered site — after its structural
+ * `cancel`, `resume@s` / `resume@s+cancel` for every registered site, and `restart@p` /
+ * `restart@p+cancel` for every top-level boundary ([ADR 0010]) — after its structural
  * checks (cancel, budget, resume gates, threshold arcs, suspension coverage, resume timing), each
  * property asserted `proven` by name.
  */
@@ -331,8 +332,12 @@ function compiledFor(shape: Shape, config: EngineConfig = shape.engine ?? {}): C
 }
 
 /**
- * Every segment `verifyWorkflow` proves by default — `closed`, `cancel`, and both resume segments of
- * every site — with every property in it `proven`, asserted by name so `unknown` cannot pass.
+ * Every segment `verifyWorkflow` proves by default — `closed`, `cancel`, both resume segments of
+ * every site, and both restart segments of every top-level boundary ([ADR 0010]) — with every
+ * property in it `proven`, asserted by name so `unknown` cannot pass. A segment whose marking an
+ * earlier one already has cites that one's proof: `resume@0` and `restart@0` are `closed`, and
+ * `restart@p` is `resume@p` where entry `p` is itself a site (a step, a nested workflow, a loop);
+ * a block's boundary is a marking of its own and is asked.
  */
 async function expectProven(compiled: CompiledWorkflow, sites: readonly string[]): Promise<void> {
   expect([...compiled.resumeSites.keys()].sort()).toEqual([...sites].sort());
@@ -340,7 +345,28 @@ async function expectProven(compiled: CompiledWorkflow, sites: readonly string[]
   const routes = reports.map(describeReport).join('\n');
   console.log(`[proof] ${compiled.net.name} k=${compiled.budget?.k ?? 'unbounded'}:\n${routes}`);
   const labels = segmentsFor(compiled).map(segmentLabel);
-  expect(labels).toEqual(['closed', 'cancel', ...[...sites].sort().flatMap((s) => [`resume@${s}`, `resume@${s}+cancel`])]);
+  // Every top-level entry of these shapes holds a site, so the boundaries are 0..(last entry).
+  const entries = Math.max(...sites.map((s) => Number(s.split('.')[0]))) + 1;
+  expect(compiled.boundaries.map((b) => b.index)).toEqual([...Array(entries).keys()]);
+  const restarts = [...Array(entries).keys()].flatMap((p) => [`restart@${p}`, `restart@${p}+cancel`]);
+  expect(labels).toEqual(['closed', 'cancel', ...[...sites].sort().flatMap((s) => [`resume@${s}`, `resume@${s}+cancel`]), ...restarts]);
+  const cites = (label: string): string | undefined => {
+    const [, kind, at, cancel] = /^(resume|restart)@([\d.]+)(\+cancel)?$/.exec(label) ?? [];
+    if (kind === undefined) return undefined;
+    if (at === '0') return cancel ? 'cancel' : 'closed';
+    if (kind === 'restart' && sites.includes(at!)) return `resume@${at}${cancel ?? ''}`;
+    return undefined;
+  };
+  for (const r of reports) {
+    const label = segmentLabel(r.segment);
+    const cited = cites(label);
+    expect(r.sameProofAs === undefined ? undefined : segmentLabel(r.sameProofAs), describeReport(r)).toBe(cited);
+    if (cited !== undefined) {
+      const source = reports.find((x) => segmentLabel(x.segment) === cited && x.property === r.property)!;
+      expect(r.result, describeReport(r)).toBe(source.result);
+      expect(r.marking, describeReport(r)).toBe(source.marking);
+    }
+  }
   const properties = ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', ...(compiled.budget ? ['permitsBounded', 'permitsReturned'] : [])];
   const expected: Record<string, string> = {};
   for (const label of labels) {
@@ -738,7 +764,9 @@ describe('a refused resume persists nothing, and Run releases its claim', () => 
     expect(rescued).toMatchObject({ status: 'success', result: { n: 70 } });
   });
 
-  it('restart and timeTravel stay refused by name', async () => {
+  // Restart is implemented (ADR 0010), and Mastra reads `restart` before `resume`
+  // (`default.ts:794-803`), so only timeTravel is refused here.
+  it('timeTravel stays refused by name, on a resume as on a start', async () => {
     const wf = workflowOn(linearShape, 'petri');
     const engine = (wf as unknown as { executionEngine: ExecutionEngine }).executionEngine;
     const base = {
@@ -753,7 +781,6 @@ describe('a refused resume persists nothing, and Run releases its claim', () => 
       resume: { steps: ['g'], stepResults: {}, resumePayload: {}, resumePath: [1] },
     };
     for (const [mode, extra] of [
-      ['restart', { restart: { activePaths: [0], activeStepsPath: {}, stepResults: {}, state: {} } }],
       ['timeTravel', { timeTravel: { executionPath: [0], steps: ['a'], stepResults: {}, state: {} } }],
     ] as const) {
       const error = await engine.execute({ ...base, ...extra } as never).then(() => undefined, (e: unknown) => e);

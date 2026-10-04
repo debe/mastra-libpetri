@@ -976,13 +976,18 @@ const FRESH_PROVEN = {
   'cancel/exactlyOneTerminal': 'proven',
 };
 /**
- * Every verdict `verifyWorkflow` returns by default for `compiled`, each `proven`: the fresh
- * segments, then `resume@s` and `resume@s+cancel` per registered site ([ADR 0007]). Keys come
+ * The segments these proofs ask for: `verifyWorkflow`'s default with the restart segments
+ * ([ADR 0010]) left out, so each mutant's pinned flips stay about the fresh and resumed runs.
+ */
+const SEGMENTS = { restart: 'none' } as const;
+/**
+ * Every verdict `verifyWorkflow` returns under {@link SEGMENTS} for `compiled`, each `proven`: the
+ * fresh segments, then `resume@s` and `resume@s+cancel` per registered site ([ADR 0007]). Keys come
  * from `segmentsFor`/`segmentLabel`; `neverCanceled` only where no cancel arrives; no budget here.
  */
 function allProven(compiled: CompiledWorkflow): Record<string, string> {
   expect(compiled.budget).toBeUndefined();
-  const keys = segmentsFor(compiled).flatMap((segment) => {
+  const keys = segmentsFor(compiled, SEGMENTS).flatMap((segment) => {
     const cancels = typeof segment === 'string' ? segment === 'cancel' : segment.cancel;
     return ['deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal', ...(cancels ? [] : ['neverCanceled'])].map(
       (property) => `${segmentLabel(segment)}/${property}`,
@@ -1056,7 +1061,7 @@ describe('an adapted leaf-shaped workflow, proved', () => {
     const compiled = compile(adapt(flow, options));
     expect(cancelStructureViolations(compiled)).toEqual([]);
 
-    const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000 });
+    const reports = await verifyWorkflow(compiled, { ...SEGMENTS, timeoutMs: 30_000 });
     console.log(`[proof] adapted leaf flow: ${routes(reports)}`);
 
     expect([...compiled.resumeSites.keys()].sort()).toStrictEqual(SITES);
@@ -1075,7 +1080,7 @@ describe('an adapted leaf-shaped workflow, proved', () => {
       });
 
     const mutant = compile(adapt(flow, options), { gadgets: { step: orphaningStep } });
-    const reports = await verifyWorkflow(mutant, { timeoutMs: 30_000 });
+    const reports = await verifyWorkflow(mutant, { ...SEGMENTS, timeoutMs: 30_000 });
 
     // Every site is a step, so every resumed segment can reach an orphaned failure too: the same
     // flips, segment for segment.
@@ -1112,7 +1117,7 @@ describe('an adapted leaf-shaped workflow, proved', () => {
       "resume site 0 ('s.0.validate.in') has no sweep: nothing reads 'wf.cancel' and consumes it",
     ]);
     await expect(verifyWorkflow(compiled)).rejects.toThrow(/resume gate structure is unsound/);
-    const reports = await verifyWorkflow(compiled, { timeoutMs: 30_000, structure: 'skip' });
+    const reports = await verifyWorkflow(compiled, { ...SEGMENTS, timeoutMs: 30_000, structure: 'skip' });
     console.log(`[proof] adapted leaf flow without sweeps: ${routes(reports)}`);
     // Every segment a cancel arrives in breaks, the resumed ones included; none without one does.
     expect(verdicts(reports), routes(reports)).toStrictEqual({

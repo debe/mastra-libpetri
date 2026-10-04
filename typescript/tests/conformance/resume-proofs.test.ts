@@ -66,12 +66,14 @@ for (const k of BUDGETS) {
         expect(structure).toEqual(Object.fromEntries(STRUCTURE.map(([name]) => [name, []])));
 
         const t0 = performance.now();
-        const reports = await verifyWorkflow(compiled, { timeoutMs: BUDGET_MS });
+        // The fresh and resume segments: the restart segments ([ADR 0010]) are left out here, and
+        // proven in tests/verify/restart-segments.test.ts and tests/mastra/engine-resume.test.ts.
+        const reports = await verifyWorkflow(compiled, { timeoutMs: BUDGET_MS, restart: 'none' });
         const ms = performance.now() - t0;
         const routes = reports.map(describeReport).join('\n');
         console.log(`[proof] ${fixture.id} k=${k ?? 'unbounded'} ${ms.toFixed(0)}ms:\n${routes}`);
 
-        const labels = segmentsFor(compiled).map(segmentLabel);
+        const labels = segmentsFor(compiled, { restart: 'none' }).map(segmentLabel);
         const sites = [...fixture.sites].sort((a, b) => {
           const pa = a.split('.').map(Number);
           const pb = b.split('.').map(Number);

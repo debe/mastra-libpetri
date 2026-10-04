@@ -145,6 +145,14 @@ export interface RunReport {
    * Present only when one did. It changed nothing about the run ([ADR 0008]); the host reports it.
    */
   readonly observerError?: { readonly error: unknown };
+  /**
+   * The first error a checkpoint write (`StepRunner.checkpoint`) threw or rejected with, as the
+   * object itself ([ADR 0010]). Present only when one did. Unlike an observer's, it **did** change
+   * the run: the checkpoint's firing failed, so the outcome is `stranded` with a `failure` naming
+   * the checkpoint transition — whose `message` is only the error's text. The engine rejects with
+   * this, the original object, as Mastra rejects with a persist failure's own error.
+   */
+  readonly checkpointError?: { readonly error: unknown };
 }
 
 /**
@@ -177,6 +185,17 @@ export async function runWorkflowDetailed(
     // whose `net` was swapped after compiling would run one net and be proven on another — the
     // one thing "one net serves execution and verification" rules out.
     throw new Error(`compiled workflow '${compiled.net.name}': its program was compiled from a different net`);
+  }
+  if (options.resume !== undefined && options.restart !== undefined) {
+    throw new Error(`compiled workflow '${compiled.net.name}': a run is either resumed or restarted, not both`);
+  }
+  if (compiled.checkpoints.length > 0 && typeof options.runner.checkpoint !== 'function') {
+    // Refused before anything runs: the checkpoint transition awaits the write, so a runner that
+    // cannot take one would fail the first checkpoint's firing after entry `i` already ran — an
+    // explicitly requested durability point is never skipped silently ([ADR 0010]).
+    throw new Error(
+      `compiled workflow '${compiled.net.name}' takes checkpoints after entries [${compiled.checkpoints.join(', ')}], and its runner has no checkpoint()`,
+    );
   }
   if (options.stepResults) assertStepResults(options.stepResults);
   const { signal } = options;
@@ -255,6 +274,7 @@ export async function runWorkflowDetailed(
       outcome: { status: 'stranded', places: markedPlaces(compiled, marking), failure },
       stepResults: scope.stepResults(),
       ...observerErrorOf(scope, teeError),
+      ...(scope.checkpointError === undefined ? {} : { checkpointError: scope.checkpointError }),
     };
   }
   const outcome = classify(compiled, marking);
@@ -277,7 +297,14 @@ export async function runWorkflowDetailed(
       });
     }
   }
-  return { outcome, stepResults: scope.stepResults(), ...observerErrorOf(scope, teeError) };
+  return {
+    outcome,
+    stepResults: scope.stepResults(),
+    ...observerErrorOf(scope, teeError),
+    // Only reachable when a checkpoint threw and the firing still did not count as failed — which the
+    // executor never does; kept so the error can never be lost whatever the outcome.
+    ...(scope.checkpointError === undefined ? {} : { checkpointError: scope.checkpointError }),
+  };
 }
 
 /** `observerError` for the report, only when an observer or the tee threw — the observer's first. */
@@ -343,21 +370,24 @@ export function initialCounts(
  * - **Resumed segment** ([ADR 0007]): one token — the seed's value, as it is — in the site's place,
  *   **instead of** the entry place. Nothing is restored from a marking (no CORE-073), so clocks
  *   start fresh, as in Mastra.
- * - Either way: `k` permits when a budget was compiled in, and the cancel **signal** when the run's
+ * - **Restarted segment** ([ADR 0010]): one `FlowToken` — the seed's value — in a top-level
+ *   boundary's place (entry `index`'s input), instead of the entry place. Exclusive with a resume.
+ * - Every way: `k` permits when a budget was compiled in, and the cancel **signal** when the run's
  *   signal had already fired.
  *
  * **Checked, then returned.** Every check runs before any executor is built, so a refused run
  * starts nothing:
- * 1. A resume site must be the one this workflow registered at that path — by identity, so a site
- *    from another compile (even of the same workflow) cannot slip in.
+ * 1. A resume site must be the one this workflow registered at that path, and a restart boundary
+ *    the one at its index in `compiled.boundaries` — by identity, so a site from another compile
+ *    (even of the same workflow) cannot slip in.
  * 2. The token count of every place must equal {@link initialCounts} for the same start — the
- *    marking the `closed` or `resume@site` segment is proven from — plus the cancel signal when
+ *    marking the `closed`, `resume@site` or `restart@index` segment is proven from — plus the cancel signal when
  *    pre-aborted. A pre-aborted run's marking is therefore **not** the one a `+cancel` segment is
  *    proven from: it is that marking's successor after `t.cancel.arrive` (the request moved to the
  *    signal), so it is reachable from the proven one, which is what the `+cancel` proof covers.
- * 3. A resumed segment holds exactly one token outside the permits and the cancel signal, at its
+ * 3. A resumed or restarted segment holds exactly one token outside the permits and the cancel signal, at its
  *    site — which (2) cannot see when a site is registered on the cancel place itself.
- * 4. An entry site's seed is a `FlowToken` (a non-null object with `data`). The verifier is
+ * 4. An entry site's seed, and every restart seed, is a `FlowToken` (a non-null object with `data`). The verifier is
  *    value-blind, so a proof says nothing about a malformed seed; without this a `null` seed fails
  *    inside the step's first attempt. An arm's `ArmResume` and a foreach's `ForeachResume` are
  *    checked by their own gates, which refuse a misfit by name as the block's `failed` outcome.
@@ -367,8 +397,15 @@ export function initialMarking(
   input: unknown,
   options: Pick<RunOptions, 'clock' | 'signal' | 'resume' | 'restart'>,
 ): Map<Place<unknown>, Token<unknown>[]> {
-  const { resume, signal } = options;
-  if (options.restart !== undefined) throw new Error('initialMarking: restart seeding is not implemented (M4b W2)');
+  const { resume, restart, signal } = options;
+  if (resume !== undefined && restart !== undefined) {
+    throw new Error(`compiled workflow '${compiled.net.name}': a run is either resumed or restarted, not both`);
+  }
+  if (restart !== undefined && compiled.boundaries[restart.site.index] !== restart.site) {
+    throw new Error(
+      `compiled workflow '${compiled.net.name}': the restart boundary at ${restart.site.index} ('${restart.site.entryId}') is not the one this workflow registered there`,
+    );
+  }
   if (resume !== undefined) {
     const key = resume.site.path.join('.');
     if (compiled.resumeSites.get(key) !== resume.site) {
@@ -381,9 +418,12 @@ export function initialMarking(
   // A marking is built before any executor exists, so the ordinary constructor stamps wall time
   // and would differ on every replay — inside the marking. Seed through the clock.
   const seed = <T>(value: T): Token<T> => (options.clock ? seedToken<T>(options.clock, value) : tokenOf<T>(value));
-  const start: Place<unknown> = resume === undefined ? compiled.entryPlace : resume.site.place;
+  const start: Place<unknown> =
+    resume !== undefined ? resume.site.place : restart !== undefined ? restart.site.place : compiled.entryPlace;
   const initial = new Map<Place<unknown>, Token<unknown>[]>();
-  initial.set(start, [resume === undefined ? seed<FlowToken>({ data: input }) : seed(resume.value)]);
+  initial.set(start, [
+    resume !== undefined ? seed(resume.value) : restart !== undefined ? seed<FlowToken>(restart.value) : seed<FlowToken>({ data: input }),
+  ]);
   // Aborted before it began: the signal is already in the marking, so the first entry's sweep
   // takes the run straight to `wf.canceled`, as Mastra's check before the first entry does — and a
   // resume site's gate or sweep does the same, as Mastra's check before each entry holds for a
@@ -402,18 +442,33 @@ export function initialMarking(
     initial.set(permits, [...(initial.get(permits) ?? []), ...Array.from({ length: k }, () => seed(null))]);
   }
 
-  assertProvenCounts(compiled, initial, initialCounts(compiled, start, aborted ? compiled.cancel : undefined), resume, aborted);
-  if (resume !== undefined) {
+  const segment =
+    resume !== undefined ? `resume@${resume.site.path.join('.')}` : restart !== undefined ? `restart@${restart.site.index}` : 'closed';
+  assertProvenCounts(compiled, initial, initialCounts(compiled, start, aborted ? compiled.cancel : undefined), segment, aborted);
+  if (resume !== undefined || restart !== undefined) {
     let work = 0;
     for (const [p, tokens] of initial) {
       if (p === compiled.cancel || p === compiled.budget?.permits) continue;
       work += tokens.length;
     }
-    if (work !== 1 || initial.get(resume.site.place)?.length !== 1) {
+    if (work !== 1 || initial.get(start)?.length !== 1) {
+      const what = resume !== undefined ? 'a resumed segment must start from exactly one token at its site' : 'a restarted segment must start from exactly one token at its boundary';
       throw new Error(
-        `compiled workflow '${compiled.net.name}': a resumed segment must start from exactly one token at its site '${resume.site.place.name}', found ${work} outside the permits and the cancel signal`,
+        `compiled workflow '${compiled.net.name}': ${what} '${start.name}', found ${work} outside the permits and the cancel signal`,
       );
     }
+  }
+  if (restart !== undefined) {
+    // A boundary's gate is entry `index`'s own start, which reads `data` off the token — as an entry
+    // resume site's. The verifier is value-blind, so the kernel checks the colour.
+    const value: unknown = restart.value;
+    if (typeof value !== 'object' || value === null || !('data' in value)) {
+      throw new Error(
+        `compiled workflow '${compiled.net.name}': the seed at restart boundary ${restart.site.index} ('${restart.site.place.name}') is not a FlowToken: a non-null object with \`data\``,
+      );
+    }
+  }
+  if (resume !== undefined) {
     const misfit = seedMisfit(resume.site, resume.value);
     if (misfit !== undefined) {
       throw new Error(
@@ -429,7 +484,7 @@ function assertProvenCounts(
   compiled: CompiledWorkflow,
   initial: ReadonlyMap<Place<unknown>, readonly Token<unknown>[]>,
   expected: ReadonlyMap<Place<unknown>, number>,
-  resume: ResumeSeed | undefined,
+  segment: string,
   aborted: boolean,
 ): void {
   const differences: string[] = [];
@@ -439,7 +494,6 @@ function assertProvenCounts(
     if (want !== have) differences.push(`${p.name}: ${have}, proven from ${want}`);
   }
   if (differences.length === 0) return;
-  const segment = resume === undefined ? 'closed' : `resume@${resume.site.path.join('.')}`;
   throw new Error(
     `compiled workflow '${compiled.net.name}': the initial marking is not the one segment ${segment} is proven from` +
       `${aborted ? ' plus the cancel signal' : ''} (${differences.join('; ')})`,

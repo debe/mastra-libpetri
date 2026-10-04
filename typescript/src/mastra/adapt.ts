@@ -91,10 +91,146 @@ export function adaptStepFlow(
   entries: readonly StepFlowEntry[],
   options: AdaptOptions,
 ): WorkflowDescription {
+  const adapted = entries.map((entry, index) => adaptEntry(entry, index, options));
+  const checkpoints = checkpointsOf(entries, adapted);
   return {
     id: options.workflowId,
-    entries: entries.map((entry, index) => adaptEntry(entry, index, options)),
+    entries: adapted,
+    // Absent rather than empty when nothing is marked: the engine keys its compile cache on the
+    // description's JSON, and an unmarked workflow must key exactly as it did before checkpoints.
+    ...(checkpoints.length > 0 ? { checkpoints } : {}),
   };
+}
+
+/**
+ * The author's checkpoint marks ([ADR 0010]): `metadata: { checkpoint: true }` on a top-level entry
+ * means *checkpoint once this entry succeeds*. The mark is Mastra's own `metadata`, so a marked
+ * workflow runs unchanged on `DefaultExecutionEngine`, which reads metadata only for span attributes.
+ *
+ * Where the mark is read, per entry type, exactly where Mastra's builders put it:
+ * - `.then(step)` — the step's own `createStep({ metadata })`, as `entry.step.metadata`;
+ * - `.agent()` / `.tool()` and a step made from an agent or a tool — `entry.options.metadata`;
+ * - `.map(…, { metadata })`, `.sleep`, `.sleepUntil`, `.parallel`, `.branch`, `.dowhile`, `.dountil`,
+ *   `.foreach` — the entry's own `metadata`, from the builder's options (`toEntryOptionFields`,
+ *   `workflow.ts:647-653`).
+ *
+ * **Only `true` marks.** `false` and an absent key are no mark. Any other value — `'true'`, `1`,
+ * an object — is refused by name: a durability point is not something to guess at, and reading a
+ * truthy string as a mark (or as none) would silently disagree with what its author meant.
+ *
+ * **Only at a top-level boundary.** A mark on a `.parallel()`/`.branch()` arm, a loop body or a
+ * `.foreach()` body is refused (`checkpoint-position`): between those and what follows there is no
+ * single flow token to seed from. The refusal names the enclosing entry's options as the place for
+ * the mark, and `cloneStep` for a Step object shared with a top-level position, since the mark lives
+ * on the object and goes wherever it is used.
+ *
+ * A mark on the **last** entry is accepted and omitted: the run's terminal row already records it.
+ * The result is ascending, as the compiler requires.
+ */
+function checkpointsOf(entries: readonly StepFlowEntry[], adapted: readonly EntryDescription[]): number[] {
+  const last = entries.length - 1;
+  const out: number[] = [];
+  entries.forEach((entry, index) => {
+    const enclosing = adapted[index]!;
+    for (const { inner, role } of innerSteps(entry)) {
+      const mark = checkpointMark(metadataOfSingle(inner), inner.type, entryId(inner));
+      if (mark) {
+        refuse(
+          entry.type,
+          enclosing.id,
+          `checkpoint-position: step '${entryId(inner)}' is marked metadata.checkpoint as ${role}, but a ` +
+            'checkpoint is only taken between top-level entries. Mark the enclosing entry instead, through ' +
+            `its own options (\`{ metadata: { checkpoint: true } }\` on the .${builderOf(entry)}() call), to ` +
+            "checkpoint once the whole block succeeds. If this Step object is also used at the top level, " +
+            "give that use its own copy with cloneStep(), since the mark travels with the object.",
+        );
+      }
+    }
+    const own = checkpointMark(metadataOfEntry(entry), entry.type, enclosing.id);
+    if (own && index < last) out.push(index);
+  });
+  return out;
+}
+
+/** The single steps an entry nests, and how a refusal names their position. */
+function innerSteps(entry: StepFlowEntry): { inner: SingleStepEntry; role: string }[] {
+  switch (entry.type) {
+    case 'parallel':
+      return entry.steps.map((inner) => ({ inner, role: 'a .parallel() arm' }));
+    case MASTRA_BRANCH_ENTRY_TYPE:
+      return entry.steps.map((inner) => ({ inner, role: 'a .branch() arm' }));
+    case 'loop':
+      return [{ inner: entry.step, role: `the body of a .${entry.loopType}()` }];
+    case 'foreach':
+      return [{ inner: entry.step, role: 'the body of a .foreach()' }];
+    default:
+      return [];
+  }
+}
+
+function builderOf(entry: StepFlowEntry): string {
+  switch (entry.type) {
+    case MASTRA_BRANCH_ENTRY_TYPE:
+      return 'branch';
+    case 'loop':
+      return entry.loopType;
+    default:
+      return entry.type;
+  }
+}
+
+/** Where a top-level entry's metadata lives: a single step's own, or the builder's options. */
+function metadataOfEntry(entry: StepFlowEntry): unknown {
+  switch (entry.type) {
+    case 'step':
+    case 'agent':
+    case 'tool':
+    case 'mapping':
+      return metadataOfSingle(entry);
+    default:
+      return (entry as { metadata?: unknown }).metadata;
+  }
+}
+
+/**
+ * A single step's metadata. `host.ts` mirrors no `metadata` field — Mastra types it
+ * `Record<string, any>` on the step, the declarative options and the mapping entry alike
+ * (`types.d.ts:537-539`, `workflow.ts:144-157`) — so it is read structurally here.
+ */
+function metadataOfSingle(entry: SingleStepEntry): unknown {
+  switch (entry.type) {
+    case 'step':
+      return (entry.step as { metadata?: unknown }).metadata;
+    case 'agent':
+    case 'tool':
+      return (entry.options as { metadata?: unknown } | undefined)?.metadata;
+    case 'mapping':
+      return (entry as { metadata?: unknown }).metadata;
+    default:
+      return undefined;
+  }
+}
+
+/** `true` marks; absent and `false` do not; anything else is refused by name. */
+function checkpointMark(metadata: unknown, type: string, id: string): boolean {
+  if (metadata === null || typeof metadata !== 'object') return false;
+  if (!Object.prototype.hasOwnProperty.call(metadata, 'checkpoint')) return false;
+  const value: unknown = (metadata as { checkpoint?: unknown }).checkpoint;
+  if (value === true) return true;
+  if (value === false || value === undefined) return false;
+  return refuse(
+    type,
+    id,
+    `checkpoint-value: metadata.checkpoint is ${describeValue(value)}; only \`true\` marks a checkpoint ` +
+      '(and `false` or no key marks none). Anything else is refused rather than read one way or the other.',
+  );
+}
+
+function describeValue(value: unknown): string {
+  if (typeof value === 'string') return `the string '${value}'`;
+  if (typeof value === 'number' || typeof value === 'bigint') return `the ${typeof value} ${String(value)}`;
+  if (value === null) return 'null';
+  return `a value of type ${typeof value}`;
 }
 
 /**
