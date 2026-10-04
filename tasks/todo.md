@@ -353,8 +353,14 @@
       `restartAllActiveWorkflowRuns` without the gate, `restartActiveRuns(mastra)`
 - [x] Existing tests: fresh/resume-only proofs pass `restart: 'none'`; default lists include the
       restart segments
-- [ ] W5 conformance — crash at every recorded row, then `restart()`: petri>petri vs petri>default
-      (same row, both engines agree) and default>default vs default>petri (attributed to rows 91-99)
+- [x] W5 conformance — `src/conformance/restart.ts`, `tests/conformance/restart-differential.test.ts`:
+      a crash at every `running`/`waiting` row, then `restart()` on a fresh store. 8 fixtures at
+      k = 1, 2, 4, unbounded: petri>petri 0 differences (a petri checkpoint restarts identically on
+      Mastra's engine); default>petri 71 pass, 3 divergent-and-attributed (rows 92, 93), 0 fail at
+      every k. It found a branch reusing stored arms under restart; fixed (`RunScope.restarted`)
+- [ ] Open after M4b, none blocking: rows 39, 96, 99 unexercised; row 94's resumed-foreach crash;
+      restarting past a `.sleep()` in a new process fails the next step on both engines (Mastra
+      mints sleep ids with `randomUUID()` per build) — an upstream issue for M9
 - [ ] M9 PR 2 (capability predicate) retires the seam and `restartActiveRuns`
 
 ## M5 — Streaming and watch ([ADR 0008])

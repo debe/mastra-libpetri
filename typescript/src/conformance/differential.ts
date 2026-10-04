@@ -237,7 +237,7 @@ export const EXCLUDED_PATHS: readonly string[] = [
  * An exclusion list split for {@link normalise}: its clock-stamp positions (a last segment in
  * {@link CLOCK}) masked — value dropped, presence and kind compared — and the rest excluded.
  */
-function clockMasked(paths: readonly string[]): [excluded: string[], masked: string[]] {
+export function clockMasked(paths: readonly string[]): [excluded: string[], masked: string[]] {
   const isClock = (p: string) => (CLOCK as readonly string[]).includes(p.slice(p.lastIndexOf('.') + 1));
   return [paths.filter((p) => !isClock(p)), paths.filter(isClock)];
 }
@@ -711,7 +711,7 @@ type RawDifference = { path: string; oracle: unknown; candidate: unknown };
  * may attribute on this run. Every difference is gated: there is no mode that lists event
  * differences without counting them.
  */
-function settle(
+export function settle(
   raw: readonly RawDifference[],
   attributions: readonly Attribution[],
   applies: (at: Attribution) => boolean,
@@ -1369,7 +1369,7 @@ function norm(
  * Leaf differences between two normalised values. Strict: an absent key and a key holding
  * `undefined` differ, because a caller can tell them apart.
  */
-function diff(a: unknown, b: unknown, path: string[], out: { path: string; oracle: unknown; candidate: unknown }[]): void {
+export function diff(a: unknown, b: unknown, path: string[], out: { path: string; oracle: unknown; candidate: unknown }[]): void {
   if (Object.is(a, b)) return;
   const at = path.join('.');
   if (Array.isArray(a) && Array.isArray(b)) {
@@ -1449,7 +1449,7 @@ function declaredIndependent(independent: readonly IndependentPair[], a: string,
   );
 }
 
-function compareOrder(
+export function compareOrder(
   oracleTrace: readonly TraceEvent[],
   candidateTrace: readonly TraceEvent[],
   independent: readonly IndependentPair[],

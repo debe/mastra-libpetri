@@ -294,7 +294,7 @@ export const branchGadget: Gadget = (entry, next, ctx): GadgetResult => {
       let error: unknown;
       try {
         const selected = await selectArms(entry.id, n, scope, incoming.data, viewPath);
-        verdicts = arms.map((arm, i) => gateVerdict(selected.has(i), scope.getStepResult(arm.id), incoming.data));
+        verdicts = arms.map((arm, i) => gateVerdict(selected.has(i), scope.restarted === true ? undefined : scope.getStepResult(arm.id), incoming.data));
       } catch (e) {
         threw = true;
         error = e;
@@ -467,7 +467,9 @@ async function selectArms(
  * (`handlers/control-flow.ts:552-553`). A stored `failed` cannot be reached on a start or a
  * resume — any earlier failure has already ended the run — so only `success` is reproduced
  * (`docs/divergences.md`). A stored `canceled` (a loop or foreach body canceled earlier, carried
- * in on a resume) is neither, so Mastra runs the arm again, and so do we.
+ * in on a resume) is neither, so Mastra runs the arm again, and so do we. Under restart nothing is
+ * reused: Mastra's `isRestartStep` is then never `undefined`, so every truthy arm re-runs
+ * (`:544-551`) — the caller passes no earlier record for a restarted segment ([ADR 0010]).
  */
 function gateVerdict(truthy: boolean, earlier: StepRecord | undefined, data: unknown): GateToken {
   if (!truthy) return { decision: 'skip' };

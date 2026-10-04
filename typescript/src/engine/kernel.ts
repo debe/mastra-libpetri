@@ -205,6 +205,7 @@ export async function runWorkflowDetailed(
     ...(options.clock ? { clock: options.clock } : {}),
     ...(signal ? { signal } : {}),
     ...(options.stepResults ? { stepResults: options.stepResults } : {}),
+    ...(options.restart ? { restarted: true } : {}),
   });
 
   const initial = initialMarking(compiled, input, options);

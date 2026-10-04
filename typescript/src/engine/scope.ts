@@ -10,6 +10,8 @@ export interface RunScopeOptions {
   readonly signal?: AbortSignal;
   /** Step records carried in from an earlier segment — a resume, or a Mastra snapshot. */
   readonly stepResults?: ReadonlyMap<string, StepRecord>;
+  /** The segment is a restart ([ADR 0010]); see `RunScope.restarted`. */
+  readonly restarted?: boolean;
 }
 
 /**
@@ -24,6 +26,7 @@ export class KernelRunScope implements RunScope {
   readonly runner: StepRunner;
   readonly initData: unknown;
   readonly signal: AbortSignal;
+  readonly restarted: boolean;
   readonly #results: Map<string, StepRecord>;
   readonly #clock: Clock;
 
@@ -31,6 +34,7 @@ export class KernelRunScope implements RunScope {
     this.runner = this.#keepingCheckpointErrors(options.runner);
     this.initData = options.initData;
     this.signal = options.signal ?? new AbortController().signal;
+    this.restarted = options.restarted === true;
     this.#results = new Map(options.stepResults ?? []);
     this.#clock = options.clock ?? systemClock();
   }
