@@ -19,7 +19,9 @@ import {
   exclusions,
   livenessTargets,
   retryCeilingViolations,
+  unclaimedTargets,
   type UnclaimedPlace,
+  type UnclaimedTarget,
 } from './claims.js';
 import {
   ENUMERATION_MAX_CLASSES,
@@ -117,6 +119,16 @@ export interface ClaimReport {
   readonly note?: string;
 }
 
+/**
+ * The note on a liveness claim the verifier settled `violated` — live, with a witness — on a net
+ * with a counted decision ([ADR 0014]): its witness is a run of the untimed, value-blind model, which may take an arm's `preempted` branch
+ * before any decision — no host run can. An execution witness never does (`witness.ts`), so only a
+ * claim on another route carries it.
+ */
+export const OVER_APPROXIMATION_NOTE =
+  "witness from the verifier's untimed over-approximation, which may take an arm's preempted branch before any decision: " +
+  'a run of the model, not shown to be a run of the host';
+
 /** The claim is `unknown` under in-flight firing and `proven` assuming atomic firing. */
 export function provenOnlyAssumingAtomic(claim: ClaimReport): boolean {
   return claim.result.verdict.type === 'unknown' && claim.assumingAtomic?.verdict.type === 'proven';
@@ -132,6 +144,12 @@ export interface VerificationReport {
   readonly claims: readonly ClaimReport[];
   /** Places no bound is claimed for, each with its reason ([ADR 0009]). */
   readonly unclaimed: readonly UnclaimedPlace[];
+  /**
+   * Transitions no liveness is claimed for, each with its reason — a deciding arm's
+   * `collect-preempted-i` ([ADR 0014], `unclaimedTargets`). Listed whatever `families` asks, as
+   * `unclaimed` is: what is not claimed is said, never silently left out.
+   */
+  readonly unclaimedTargets: readonly UnclaimedTarget[];
   /** Every claim holds. */
   readonly holds: boolean;
 }
@@ -155,7 +173,10 @@ export interface VerificationReport {
  * deterministic branch policies, a manual clock. A run that starts the attempt settles its claim
  * `violated` on the `execution` route, its witness the run's firing sequence as starts and
  * completions; one no run reaches is asked of the verifier as before. Nothing else is ever settled
- * from a run.
+ * from a run. A stub never takes a deciding arm's `preempted` branch ([ADR 0014]); a liveness claim
+ * the verifier settles live, with a witness, on a net with one carries `OVER_APPROXIMATION_NOTE`
+ * (a target it proves dead does not), and the liveness not
+ * claimed at all (each `collect-preempted-i`) is listed in `unclaimedTargets` with its reason.
  *
  * **A bound on a place of the segment's initially empty siphon is proven from the arcs**
  * (`siphon.ts`) — `neverCanceled` where no cancel arrives, and any `bound(p<=n)` on a place only a
@@ -315,10 +336,17 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
     job.family === 'liveness' && job.kind === 'witness' && segmentLabel(job.segment) === 'closed' ? witnessed.get(job.transition ?? '') : undefined;
   const results = await pool(jobs, width, async (job): Promise<ClaimResult> =>
     (job.kind === 'proof' ? structural(job.segment, job.smt) : witnessOf(job)) ?? query(job.segment, job.smt, 'plain'));
+  // A witness the verifier found on a net with a decision is in the model's over-approximation: it may
+  // preempt an arm before any decision ([ADR 0014]). Said on a claim that has such a witness — a
+  // liveness claim the verifier settled `violated` — and on no other: a target proven dead has no
+  // witness, and the over-approximation only strengthens that proof.
+  const preempting = compiled.decisions.some((d) => d.preempted.length > 0);
   jobs.forEach((job, i) => {
     const result = results[i]!;
     const holds = settles(job.kind, result);
-    claims.push({ family: job.family, kind: job.kind, property: job.property, segment: job.segment, marking: markingOf(job.segment), result, holds, ...(job.note === undefined ? {} : { note: job.note }) });
+    const overApproximated = job.kind === 'witness' && preempting && result.route !== 'execution' && result.verdict.type === 'violated';
+    const note = overApproximated ? OVER_APPROXIMATION_NOTE : job.note;
+    claims.push({ family: job.family, kind: job.kind, property: job.property, segment: job.segment, marking: markingOf(job.segment), result, holds, ...(note === undefined ? {} : { note }) });
   });
 
   // The labelled fallback: a proof the split net could not decide, asked again assuming atomic
@@ -366,6 +394,7 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
     families,
     claims: all,
     unclaimed,
+    unclaimedTargets: unclaimedTargets(compiled),
     holds: all.every((c) => c.holds),
   };
 }
@@ -394,4 +423,9 @@ export function describeClaim(claim: ClaimReport): string {
     : ` [assuming atomic firing: ${claim.assumingAtomic.verdict.type} via ${claim.assumingAtomic.route} in ${wholeMs(claim.assumingAtomic.elapsedMs)}ms]`;
   const note = claim.note === undefined ? '' : ` (${claim.note})`;
   return `${claim.holds ? 'holds' : 'FAILS'} ${claim.family}: ${line}${reading}${note}${atomic}`;
+}
+
+/** One line per transition no liveness is claimed for, with its reason. For a CLI or a test. */
+export function describeUnclaimedTarget(target: UnclaimedTarget): string {
+  return `live(${target.transition}) not claimed — ${target.why}`;
 }

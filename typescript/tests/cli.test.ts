@@ -96,6 +96,7 @@ function report(claims: readonly ClaimReport[], over: Partial<VerificationReport
       families: ['completion', 'liveness'],
       claims,
       unclaimed: [{ place: 's.1.f.acc', why: 'a foreach accumulates one token per item' }],
+      unclaimedTargets: [],
       holds: claims.every((c) => c.holds),
       ...over,
     },

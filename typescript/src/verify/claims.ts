@@ -1,5 +1,6 @@
 import type { Place, Transition } from 'libpetri';
 import type { CompiledWorkflow } from '../compiler/types.js';
+import { settledBound } from '../compiler/blueprints/first-k.js';
 
 /**
  * What M6 claims about a compiled workflow beyond completion ([ADR 0009]), derived from the
@@ -27,8 +28,12 @@ export interface UnclaimedPlace {
 export interface Exclusion {
   readonly a: Place<unknown>;
   readonly b: Place<unknown>;
-  /** `barrier` — Mastra's `for` loop, derived from the entries; `gadget` — declared by one. */
-  readonly source: 'barrier' | 'gadget';
+  /**
+   * `barrier` — Mastra's `for` loop, derived from the entries; `gadget` — declared by one;
+   * `decision` — a counted decision's `won` against its `short` ([ADR 0014]), derived from
+   * `CompiledWorkflow.decisions` (the gadget's own declaration of the same pair is not repeated).
+   */
+  readonly source: 'barrier' | 'gadget' | 'decision';
   readonly why: string;
 }
 
@@ -36,13 +41,29 @@ export interface Exclusion {
  * A step attempt, or a timeout funnel ([ADR 0013]), that must be shown live: a confirmed run in which
  * every input is marked. A funnel's only input is its attempt's `timedOut_j`, so its witness is a run
  * that times attempt `j` out.
+ *
+ * A counted decision ([ADR 0014]) adds one kind, from `CompiledWorkflow.decisions`:
+ * - `decision` — the block's `met` or its `short` (`outcome`). `met`'s inputs are a count arc
+ *   (`exactly(k, okSeen)`) no place set states, so `inputs` is the transition's **output**, `{won}` or
+ *   `{short}`, which nothing else produces: `unreachable({won})` refuted is `met` fired. `stepId` is
+ *   the block's id and `attempt` is 0.
+ *
+ * An arm's `collect-preempted-i` is **not** a target: the leaf's `preempted` branch is an xor output
+ * the net does not condition on the decision (the signal is host data), so the verifier can take it
+ * before any decision and its liveness is vacuous — it would say nothing about losing to a decision.
  */
 export interface LivenessTarget {
   readonly transition: string;
   readonly stepId: string;
+  /** The attempt index; 0 for a `decision`. */
   readonly attempt: number;
-  /** `attempt` — a step attempt; `timeout` — attempt `attempt`'s timeout funnel. */
-  readonly kind: 'attempt' | 'timeout';
+  /**
+   * `attempt` — a step attempt; `timeout` — attempt `attempt`'s timeout funnel; `decision` — a
+   * block's `met` / `short` ([ADR 0014]).
+   */
+  readonly kind: 'attempt' | 'timeout' | 'decision';
+  /** Which decision a `decision` target is; absent on every other kind. */
+  readonly outcome?: 'met' | 'short';
   /** The transition's input places — `unreachable` of this set is refuted by the witness. */
   readonly inputs: ReadonlySet<Place<unknown>>;
 }
@@ -62,6 +83,11 @@ function placeByName(compiled: CompiledWorkflow): ReadonlyMap<string, Place<unkn
  * per using attempt waiting, and each attempt's own link holds at most one — unless a gadget claimed
  * the demand itself. A holder other than `spent` (a block's `active`) is the gadget's to claim.
  *
+ * **A counted decision brings its own** ([ADR 0014]), derived from `CompiledWorkflow.decisions`
+ * and replacing a gadget's claim on the same place: `permit`, `won`, `short` and each arm's
+ * `preempted` at 1, `okSeen` and `miss` at `n`, and `settled` at `max(n − k, k − 1)` (`settledBound`)
+ * where it is emitted (`n ≥ 2`). `decisionStructureViolations` is what ties them to the arcs.
+ *
  * **A bucket's rate is listed, not claimed.** *At most `burst` per `perMs` window* is a timed
  * property the untimed verifier cannot state: it is tested under a ManualClock, not proven, and
  * `unclaimed` says so under the bucket's name.
@@ -70,7 +96,7 @@ export function boundClaims(compiled: CompiledWorkflow): { readonly claimed: rea
   const claimed: BoundClaim[] = [];
   const unclaimed: UnclaimedPlace[] = [];
   const permits = compiled.budget?.permits.name;
-  const derived = poolBounds(compiled);
+  const derived = new Map([...poolBounds(compiled), ...decisionBounds(compiled)]);
   for (const place of [...compiled.net.places].sort((a, b) => a.name.localeCompare(b.name))) {
     if (place.name === permits) continue;
     const pooled = derived.get(place.name);
@@ -112,6 +138,29 @@ function poolBounds(compiled: CompiledWorkflow): ReadonlyMap<string, { readonly 
 }
 
 /**
+ * The bounds a counted decision implies ([ADR 0014]), by place name, each replacing a gadget's claim.
+ * After `met` the `n − k` surplus arrivals are absorbed into `settled`, after `short` the `k − 1`;
+ * `met` and `short` share one permit, so at most one of the two counts applies.
+ */
+function decisionBounds(compiled: CompiledWorkflow): ReadonlyMap<string, { readonly bound: number; readonly why: string; readonly over: boolean }> {
+  const out = new Map<string, { readonly bound: number; readonly why: string; readonly over: boolean }>();
+  for (const d of compiled.decisions) {
+    const block = `block '${d.blockId}' (k = ${d.k} of n = ${d.n})`;
+    out.set(d.permit, { bound: 1, why: `${block}: one decision right, seeded once by the fork`, over: true });
+    out.set(d.won, { bound: 1, why: `${block}: met fires at most once, on the one decision right`, over: true });
+    out.set(d.short, { bound: 1, why: `${block}: short fires at most once, on the one decision right`, over: true });
+    out.set(d.okSeen, { bound: d.n, why: `${block}: one arrival per arm`, over: true });
+    out.set(d.miss, { bound: d.n, why: `${block}: one arrival per arm`, over: true });
+    if (d.settled !== undefined) {
+      const bound = settledBound({ k: d.k }, d.n);
+      out.set(d.settled, { bound, why: `${block}: the surplus after met (n − k = ${d.n - d.k}) or after short (k − 1 = ${d.k - 1})`, over: true });
+    }
+    d.preempted.forEach((p, i) => out.set(p, { bound: 1, why: `${block}: arm ${i} leaves once`, over: true }));
+  }
+  return out;
+}
+
+/**
  * The places an outcome waits in on its way out of the run: the settle places and `wf.canceled`.
  * Every one is fed only once the entry that produced it has returned, so no entry holds work
  * while one is marked.
@@ -134,6 +183,10 @@ function outcomePlaces(compiled: CompiledWorkflow, byName: ReadonlyMap<string, P
  * firing of entry `i` (the vocabulary names nothing else there) or by entry `i - 1`'s success, so
  * if every place of entry `i` is empty at the moment `next(i)` is marked, none is filled again
  * afterwards — the argument is written out in [ADR 0009].
+ *
+ * **A counted decision** ([ADR 0014]): `mutualExclusion(won, short)` per block, derived from
+ * `CompiledWorkflow.decisions` — `met` and `short` consume the one decision right. The gadget declares
+ * the same pair; it is listed once, as `decision`.
  */
 export function exclusions(compiled: CompiledWorkflow): readonly Exclusion[] {
   const byName = placeByName(compiled);
@@ -153,13 +206,22 @@ export function exclusions(compiled: CompiledWorkflow): readonly Exclusion[] {
       }
     }
   }
-  for (const claim of compiled.exclusions) out.push({ a: at(claim.a), b: at(claim.b), source: 'gadget', why: claim.why });
+  const decided = new Set<string>();
+  for (const d of compiled.decisions) {
+    out.push({ a: at(d.won), b: at(d.short), source: 'decision', why: `block '${d.blockId}': met and short consume the one decision right` });
+    decided.add(`${d.won}|${d.short}`).add(`${d.short}|${d.won}`);
+  }
+  for (const claim of compiled.exclusions) {
+    if (decided.has(`${claim.a}|${claim.b}`)) continue;
+    out.push({ a: at(claim.a), b: at(claim.b), source: 'gadget', why: claim.why });
+  }
   return out;
 }
 
 /**
  * Every step attempt, retries included, as a target to witness — and, for a step with a timeout
- * ([ADR 0013]), every attempt's funnel, so each `timedOut_j` is shown reachable.
+ * ([ADR 0013]), every attempt's funnel, so each `timedOut_j` is shown reachable — then every
+ * counted decision's `met` and `short` ({@link decisionTargets}, [ADR 0014]).
  */
 export function livenessTargets(compiled: CompiledWorkflow): readonly LivenessTarget[] {
   const byTransition = new Map([...compiled.net.transitions].map((t) => [t.name, t]));
@@ -168,10 +230,73 @@ export function livenessTargets(compiled: CompiledWorkflow): readonly LivenessTa
     if (t === undefined) throw new Error(`step '${chain.stepId}' names ${kind === 'attempt' ? 'attempt' : 'timeout funnel'} '${name}', which is not a transition`);
     return { transition: name, stepId: chain.stepId, attempt, kind, inputs: new Set(t.inputSpecs.map((spec) => spec.place as Place<unknown>)) };
   };
-  return compiled.steps.flatMap((chain) => [
-    ...chain.attempts.map((name, attempt) => target(chain, name, attempt, 'attempt')),
-    ...chain.timeouts.map((name, attempt) => target(chain, name, attempt, 'timeout')),
-  ]);
+  return [
+    ...compiled.steps.flatMap((chain) => [
+      ...chain.attempts.map((name, attempt) => target(chain, name, attempt, 'attempt')),
+      ...chain.timeouts.map((name, attempt) => target(chain, name, attempt, 'timeout')),
+    ]),
+    ...decisionTargets(compiled),
+  ];
+}
+
+/**
+ * Every counted decision's liveness targets ([ADR 0014]): per block, `met` then `short` (kind
+ * `decision`), for every `n` and `k` including `n = 1` — both are emitted on every block. `met` is
+ * live when `k` arms can succeed together, `short` when `n − k + 1` can miss; each arm's untimed
+ * abstraction can do either (a step attempt may succeed or fail), so both are claimed. A fixture
+ * whose arm cannot succeed (or cannot miss) is a description the claim would rightly refute.
+ * `livenessTargets` appends them; empty for a net with no decisions.
+ *
+ * **What witnesses them.** On an untimed net, an executor run whose stubs never take an arm's
+ * `preempted` branch, nor an attempt's `paused` one, which only a nested-workflow step has
+ * (`witness.ts`, `avoidingPreemption`): `short` is reached by failures, bails or suspensions, as a
+ * host run of plain steps reaches it. A claim the verifier settles instead (a timed net, or no run reached it) is a
+ * run of the untimed model, which may preempt an arm before any decision; `verify` says so on the
+ * claim (`OVER_APPROXIMATION_NOTE`).
+ *
+ * **Unclaimed, with the reason:** each arm's `collect-preempted-i`. The leaf's `preempted` branch is
+ * an xor output the net does not condition on the decision, so the verifier reaches it before any
+ * `met` / `short` fires — a liveness proof of it would be vacuous. That an arm *is* preempted after a
+ * decision is tested (`tests/engine/race.test.ts`), not proven. For `n = 1` there is no such collect.
+ */
+export function decisionTargets(compiled: CompiledWorkflow): readonly LivenessTarget[] {
+  if (compiled.decisions.length === 0) return [];
+  const byName = placeByName(compiled);
+  const transitions = new Set([...compiled.net.transitions].map((t) => t.name));
+  return compiled.decisions.flatMap((d) =>
+    ([['met', d.met, d.won], ['short', d.shortTransition, d.short]] as const).map(([outcome, transition, decided]): LivenessTarget => {
+      const output = byName.get(decided);
+      if (!transitions.has(transition) || output === undefined) {
+        throw new Error(`block '${d.blockId}' names ${outcome} '${transition}' -> '${decided}', which is not in the net`);
+      }
+      return { transition, stepId: d.blockId, attempt: 0, kind: 'decision', outcome, inputs: new Set([output]) };
+    }),
+  );
+}
+
+/** A transition whose liveness is not claimed, and why — listed, never silently skipped. */
+export interface UnclaimedTarget {
+  readonly transition: string;
+  readonly why: string;
+}
+
+/**
+ * The liveness targets deliberately not claimed ([ADR 0014]): each arm's `collect-preempted-i`, arm
+ * order, block by block. The reason is the one in {@link decisionTargets}: the `preempted` branch is
+ * not conditioned on the decision in the arcs, so a witness could take it before any `met` / `short`
+ * and would say nothing about losing to a decision. Empty for a net with no decisions, and for a
+ * block of one arm (no preempted collect).
+ */
+export function unclaimedTargets(compiled: CompiledWorkflow): readonly UnclaimedTarget[] {
+  return compiled.decisions.flatMap((d) =>
+    d.collectPreempted.map((transition, i) => ({
+      transition,
+      why:
+        `block '${d.blockId}', arm ${i}: the preempted branch is an xor output the net does not condition on the decision, ` +
+        'so its liveness would be witnessed before any decision and say nothing about losing one; that a loser is ' +
+        'preempted after a decision is tested, not proven ([ADR 0014])',
+    })),
+  );
 }
 
 /**

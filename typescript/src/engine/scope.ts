@@ -1,6 +1,8 @@
 import { systemClock, type Clock } from 'libpetri';
 import type { RunScope } from '../compiler/scope.js';
 import type { AttemptDeadline } from '../compiler/timeout.js';
+import type { EntryPath } from '../compiler/names.js';
+import type { StepPreemptedError } from '../compiler/preempt.js';
 import type { CheckpointEvent, LifecycleEvent, StepRecord, StepRunner } from '../compiler/types.js';
 
 export interface RunScopeOptions {
@@ -145,6 +147,43 @@ export class KernelRunScope implements RunScope {
     } finally {
       this.signal.removeEventListener('abort', onAbort);
     }
+  }
+
+  /**
+   * The deciding blocks' preemption controllers, by naming path ([ADR 0014]) — one per block for the
+   * scope's life, which is one segment: a resume or a restart builds a new scope, so a block re-run
+   * there starts undecided.
+   */
+  readonly #preemptions = new Map<string, AbortController>();
+
+  #preemptionController(path: EntryPath): AbortController {
+    const key = path.join('.');
+    let controller = this.#preemptions.get(key);
+    if (controller === undefined) {
+      controller = new AbortController();
+      this.#preemptions.set(key, controller);
+    }
+    return controller;
+  }
+
+  /**
+   * See `RunScope.preempt` ([ADR 0014]). Aborts the block's controller with `reason`, creating it if
+   * no arm has asked yet, so an arm that asks afterwards gets a signal already fired. A second call
+   * changes nothing: the first reason stands. The run's own signal is never touched.
+   */
+  preempt(path: EntryPath, reason: StepPreemptedError): void {
+    const controller = this.#preemptionController(path);
+    if (!controller.signal.aborted) controller.abort(reason);
+  }
+
+  /** See `RunScope.preemption` ([ADR 0014]): the same signal for every arm and attempt of the block. */
+  preemption(path: EntryPath): AbortSignal {
+    return this.#preemptionController(path).signal;
+  }
+
+  /** See `RunScope.forgetSuspension` ([ADR 0014]): forwarded to the runner, a no-op without its hook. */
+  forgetSuspension(stepId: string): void {
+    this.runner.forgetSuspension?.(stepId);
   }
 
   /**

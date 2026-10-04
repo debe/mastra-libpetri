@@ -3,10 +3,12 @@ import { PetriNet, Transition, one, outPlace, place, type Place } from 'libpetri
 import { compile } from '../../src/compiler/index.js';
 import {
   cancelStructureViolations,
+  decidingArmAttempts,
   describeReport,
   resumeGateViolations,
   segmentLabel,
   segmentsFor,
+  suspensionCoverageViolations,
   verifyWorkflow,
 } from '../../src/verify/index.js';
 import type { CompiledWorkflow, EntryDescription, FlowToken, WorkflowDescription } from '../../src/compiler/types.js';
@@ -340,4 +342,37 @@ describe('verifyWorkflow runs the structural check first', () => {
     const reports = await verifyWorkflow(compile(description));
     for (const r of reports) expect(r.result.verdict.type, describeReport(r)).toBe('proven');
   }, 60_000);
+});
+
+describe('suspension coverage: the arms of a counted decision are exempt (ADR 0014)', () => {
+  const quorum = (k: number, ids: readonly string[]): EntryDescription => ({
+    kind: 'parallel',
+    id: 'q',
+    arms: ids.map((id) => ({ kind: 'step', id, retries: 1 })),
+    decision: { k },
+  });
+
+  // Breaks if: the exemption is dropped from `suspensionCoverageViolations` (a deciding arm has no
+  // resume site and would be reported), or widened past the block (the later step, also without a
+  // site, would no longer be reported).
+  it('exempts every attempt under the block, retries included, and nothing else', () => {
+    const c = compile(wf(quorum(1, ['a', 'b']), step('next')));
+    const exempt = decidingArmAttempts(c);
+    const armAttempts = c.steps.filter((chain) => chain.path[0] === 0).flatMap((chain) => chain.attempts);
+    expect(armAttempts).toHaveLength(4);
+    expect([...exempt].sort()).toEqual([...armAttempts].sort());
+    const next = c.steps.find((chain) => chain.stepId === 'next')!;
+    for (const name of next.attempts) expect(exempt.has(name), name).toBe(false);
+    // No resume sites at all: only the later step is reported.
+    const bare: CompiledWorkflow = { ...c, resumeSites: new Map() };
+    expect(suspensionCoverageViolations(bare)).toEqual([`step 'next' at [1] ('${next.attempts[0]}') can suspend, and no resume site covers it`]);
+  });
+
+  // Breaks if: the exemption applies on a net with no decision (an uncovered parallel arm must still
+  // be reported).
+  it('exempts nothing on a net with no decision', () => {
+    const c = compile(wf({ kind: 'parallel', id: 'p', arms: [{ kind: 'step', id: 'a' }] }));
+    expect(decidingArmAttempts(c).size).toBe(0);
+    expect(suspensionCoverageViolations({ ...c, resumeSites: new Map() })).toHaveLength(1);
+  });
 });

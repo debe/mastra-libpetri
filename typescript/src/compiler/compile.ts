@@ -27,6 +27,7 @@ import type {
   BoundarySite,
   CanceledToken,
   CompiledWorkflow,
+  DecisionSite,
   EntryDescription,
   EntrySite,
   ExclusionClaim,
@@ -122,6 +123,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
   const exclusions: ExclusionClaim[] = [];
   // Pools the gadgets own ([ADR 0011]); the permits and the quota pools are added at the end.
   const gadgetPools: Pool[] = [];
+  // Counted decisions ([ADR 0014]): one per race / quorum block, in emission order.
+  const decisions: DecisionSite[] = [];
   // Resume sites ([ADR 0007]), keyed by path; a gadget registers its own through GadgetResult.
   const resumeSites = new Map<string, ResumeSite>();
   const pathToEntry = new Map<string, { entryId: string; kind: EntryDescription['kind'] }>();
@@ -224,6 +227,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
       path,
       viewPath: nested.viewPath ?? path,
       cancel: nested.cancel,
+      // [ADR 0014]: only a deciding block's arms carry one; every other entry emits as before.
+      preempt: nested.preempt,
       permits,
       stepAttempt: (transitionName) => {
         stepAttempts.push(transitionName);
@@ -270,6 +275,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
     }
     exclusions.push(...(result.exclusions ?? []));
     gadgetPools.push(...(result.pools ?? []));
+    decisions.push(...(result.decisions ?? []));
     return result;
   };
 
@@ -450,6 +456,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
     resumeSites,
     boundaries,
     checkpoints,
+    decisions,
     structuralHash: structuralHash(description, checkpoints, names.names()),
   };
 }
@@ -630,6 +637,16 @@ function structuralHash(description: WorkflowDescription, checkpoints: readonly 
       case 'sleep': return [entry.kind, entry.id, entry.duration];
       case 'sleepUntil': return [entry.kind, entry.id, entry.until];
       case 'parallel':
+        // M7b ([ADR 0014]): a counted decision's `k` joins the shape only when present, so an
+        // unannotated `.parallel()` hashes exactly as before — the names alone do not separate two
+        // quorums of one block (`k` changes only arc weights, never a name).
+        return [
+          entry.kind,
+          entry.id,
+          entry.arms.map(step),
+          ...block(entry.arms, entry.concurrency),
+          ...(entry.decision !== undefined ? [{ decision: { k: entry.decision.k } }] : []),
+        ];
       case 'branch': return [entry.kind, entry.id, entry.arms.map(step), ...block(entry.arms, entry.concurrency)];
       case 'loop': return [entry.kind, entry.id, entry.loopType, entry.iterationBound, step(entry.body)];
       case 'foreach': return [entry.kind, entry.id, entry.concurrency, step(entry.body)];
