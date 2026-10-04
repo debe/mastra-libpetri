@@ -185,7 +185,7 @@ function mutated(m: Mutation): Gadget {
 // ===========================================================================================
 
 /** Per-test budget: a test asks up to a few dozen queries of at most 30 s each. */
-const T = { timeout: 600_000 } as const;
+const T = { timeout: 60_000 } as const;
 
 /**
  * Every query spawns its own solver or enumerates in-process and no test shares state, so the

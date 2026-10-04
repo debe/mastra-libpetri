@@ -201,7 +201,7 @@ describe('verify: every family holds on real shapes', () => {
     // Every family is present, and liveness covers every attempt exactly once.
     for (const family of report.families) expect(report.claims.some((c) => c.family === family), family).toBe(true);
     expect(report.claims.filter((c) => c.family === 'liveness').map((c) => c.property).sort()).toEqual(compiled.stepAttempts.map((t) => `live(${t})`).sort());
-  }, 300_000);
+  });
 });
 
 describe('a witness of zero firings', () => {
@@ -219,7 +219,7 @@ describe('a witness of zero firings', () => {
       expect(first.result.counterexampleTrace).toHaveLength(1);
       expect(first.holds).toBe(true);
     }
-  }, 120_000);
+  });
 });
 
 describe('non-vacuity: one mutant per family, which every completion proof passes', () => {
@@ -234,7 +234,7 @@ describe('non-vacuity: one mutant per family, which every completion proof passe
     const over = ['arm-bail', 'arm-err', 'arm-pause', 'arm-susp', 'arrived', 'err-seen', 'susp-seen'];
     expect(failing(report)).toEqual(['cancel', 'closed'].flatMap((s) => over.map((r) => `${s}/bound(s.0.fan.${r}<=1)`)));
     expect(report.claims.filter((c) => c.family === 'completion').every((c) => c.holds), why(report)).toBe(true);
-  }, 300_000);
+  });
 
   it('exclusion: a step whose success leaves a token behind that drains later breaks the barrier and nothing else', async () => {
     // The lag drains to nothing, so every quiescent marking is clean and every completion proof
@@ -266,7 +266,7 @@ describe('non-vacuity: one mutant per family, which every completion proof passe
     expect(refuted).toContain('resume@0/exclusive(s.0.a.lag,s.1.b.in)');
     expect(refuted.every((k) => k.includes('(s.0.a.lag,'))).toBe(true);
     expect(refuted.some((k) => k.startsWith('resume@1'))).toBe(false);
-  }, 300_000);
+  });
 
   it('liveness: an attempt no failure can reach is dead — found with the structure check skipped', async () => {
     const compiled = compile(wf(step('a', 1), step('b')));
@@ -277,5 +277,5 @@ describe('non-vacuity: one mutant per family, which every completion proof passe
     expect(failing(report)).toEqual(['closed/live(t.0.a.run-1)']);
     // What the dead attempt's query says: proven unreachable — the opposite of a witness.
     expect(report.claims.find((c) => c.property === 'live(t.0.a.run-1)')!.result.verdict.type).toBe('proven');
-  }, 300_000);
+  });
 });

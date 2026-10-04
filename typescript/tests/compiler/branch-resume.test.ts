@@ -415,7 +415,7 @@ async function expectAllProven(name: string, compiled: CompiledWorkflow, sites: 
 describe('branch resume: every site is proven as its own segment, with and without a cancel', () => {
   it('route(email, sms) — sites 0.0, 0.1', async () => {
     await expectAllProven('route2', compile(wf(branch('route', step('email'), step('sms')))), ['0.0', '0.1']);
-  }, 600_000);
+  });
 
   it('s; route(email, sms, push); audit — sites 0, 1.0, 1.1, 1.2, 2', async () => {
     await expectAllProven(
@@ -423,12 +423,12 @@ describe('branch resume: every site is proven as its own segment, with and witho
       compile(wf(step('s'), branch('route', step('email'), step('sms'), step('push')), step('audit'))),
       ['0', '1.0', '1.1', '1.2', '2'],
     );
-  }, 600_000);
+  });
 
   for (const k of [1, 2]) {
     it(`route(email, sms); audit at k=${k} — permits bounded and returned in every segment`, async () => {
       await expectAllProven(`route2-audit-k${k}`, compile(wf(branch('route', step('email'), step('sms')), step('audit')), { concurrency: k }), ['0.0', '0.1', '1']);
-    }, 600_000);
+    });
   }
 
   it('non-vacuity: a replay whose suspension branch loses its arrival is caught at the resume segment only', async () => {
@@ -462,5 +462,5 @@ describe('branch resume: every site is proven as its own segment, with and witho
     expect(verdict('cancel/deadlockFree')).toBe('proven');
     expect(verdict('resume@0.0/deadlockFree')).toBe('proven');
     expect(verdict('resume@0.1/deadlockFree')).toBe('violated');
-  }, 600_000);
+  });
 });

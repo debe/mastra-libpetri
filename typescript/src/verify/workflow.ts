@@ -21,6 +21,7 @@ import {
   type UnclaimedPlace,
 } from './claims.js';
 import {
+  ENUMERATION_MAX_CLASSES,
   completionProperties,
   describeReport,
   markingKey,
@@ -181,7 +182,12 @@ export async function verify(compiled: CompiledWorkflow, options: WorkflowVerify
       .sinkPlaces(...sinks)
       .semiflowInvariants(true)
       .stateSpaceCache(cache)
+      .enumerationMaxClasses(ENUMERATION_MAX_CLASSES)
       .timeout(timeout)
+      // `timeout` bounds each z3 process; one query may start several, plus solver-free work no
+      // timeout covers ([VER-013]). The total budget caps the whole query, so 30 s is the limit it
+      // says, and an exhausted one names the phase it ran out in.
+      .totalBudget(timeout)
       .property(property);
     // [VER-016]'s firing counters: opt-in in libpetri because they slow a violated query's witness
     // search, so asked only of a completion proof that came back `unknown`.

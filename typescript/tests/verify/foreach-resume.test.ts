@@ -46,7 +46,7 @@ import type { CompiledWorkflow, EntryDescription, StepDescription } from '../../
  */
 
 const BUDGET_MS = 30_000;
-const T = { timeout: 600_000 } as const;
+const T = { timeout: 60_000 } as const;
 
 const body = (extra: Omit<StepDescription, 'kind' | 'id'> = {}): StepDescription => ({ kind: 'step', id: 'body', ...extra });
 const foreach = (concurrency: number, b: StepDescription = body()): EntryDescription => ({

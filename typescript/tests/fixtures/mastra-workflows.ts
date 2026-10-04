@@ -975,6 +975,7 @@ export const FIXTURES: readonly MastraFixture[] = [
     // stream/RunOutput.ts:84), and the stream's own start and finish.
     build: (cfg, rec) => writerWorkflow('writer-stream', cfg, rec),
   },
+  ...blockLimitFixtures(),
 ];
 
 /**
@@ -1646,6 +1647,7 @@ export const RESUME_FIXTURES: readonly ResumeFixture[] = [
     ],
   }),
   ...foreachResumeFixtures(),
+  ...blockLimitResumeFixtures(),
 ];
 
 /**
@@ -1757,6 +1759,131 @@ function foreachResumeFixtures(): ResumeFixture[] {
             "a .foreach() over a nested workflow: Mastra resumes the child named by the aggregate's __workflow_meta.runId, the lowest index, whatever forEachIndex says (step.ts:430; control-flow.ts:1442-1446); the petri engine refuses the resume by name",
         },
       ],
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Block concurrency ([ADR 0011], M7 W2)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The bound the fresh-run block-limited fixtures carry, in the block's own `metadata` (Layer 2). A
+ * function, so the corpus array above can read it while the module is still initialising.
+ */
+export function blockLimit(): number {
+  return 2;
+}
+
+/**
+ * `.parallel()` / `.branch()` with `metadata: { concurrency: c }`, `c` below the number of arms
+ * ([ADR 0011]). The default engine ignores the key and runs every arm at once (`width`); the petri
+ * engine admits at most `c` in arm order, so it serialises what Mastra overlapped — a strengthening,
+ * reported — and agrees on every datum. Every arm waits a timer, so Mastra's overlap is the width
+ * and not an accident of microtask order.
+ */
+function blockLimitFixtures(): MastraFixture[] {
+  const C = { metadata: { concurrency: blockLimit() } };
+  const arm = <const Id extends string>(rec: Recorder, id: Id, factor: number) => nStep(rec, id, async (n) => (await delay(3), n * factor));
+  const after = (rec: Recorder) =>
+    createStep({ id: 'after', inputSchema: z.any(), outputSchema: z.any(), execute: async ({ inputData }) => rec.around('after', () => inputData) });
+  return [
+    {
+      name: 'parallel-limited',
+      width: 4,
+      expected: 'success',
+      input: { n: 1 },
+      build: (cfg, rec) =>
+        wf('parallel-limited', cfg)
+          .then(nStep(rec, 'pre', (n) => n + 1))
+          .parallel([arm(rec, 'l1', 1), arm(rec, 'l2', 2), arm(rec, 'l3', 3), arm(rec, 'l4', 4)], C)
+          .then(
+            createStep({
+              id: 'join',
+              inputSchema: z.record(z.string(), N),
+              outputSchema: N,
+              execute: async ({ inputData }) => rec.around('join', () => ({ n: Object.values(inputData).reduce((sum, v) => sum + v.n, 0) })),
+            }),
+          )
+          .commit(),
+    },
+    {
+      name: 'branch-limited',
+      width: 3,
+      expected: 'success',
+      input: { n: 5 },
+      // Four arms, three truthy: the falsy one passes the cursor without a slot.
+      build: (cfg, rec) =>
+        wf('branch-limited', cfg)
+          .branch(
+            [
+              [async ({ inputData }: { inputData: N }) => inputData.n > 1, arm(rec, 'big', 100)],
+              [async () => false, arm(rec, 'never', 0)],
+              [async ({ inputData }: { inputData: N }) => inputData.n % 2 === 1, arm(rec, 'odd', 3)],
+              [async ({ inputData }: { inputData: N }) => inputData.n < 10, arm(rec, 'small', 7)],
+            ],
+            C,
+          )
+          .then(after(rec))
+          .commit(),
+    },
+    {
+      name: 'parallel-limited-failing',
+      width: 4,
+      expected: 'failed',
+      input: { n: 1 },
+      // The first arm fails while holding a slot: its slot comes back, and every later arm still
+      // runs — `.parallel()` semantics, no fail-fast — before the block fails the run.
+      build: (cfg, rec) =>
+        wf('parallel-limited-failing', cfg)
+          .parallel(
+            [
+              createStep({
+                id: 'bad',
+                inputSchema: N,
+                outputSchema: N,
+                execute: async (): Promise<N> =>
+                  rec.around('bad', async () => {
+                    await delay(1);
+                    throw new Error('bad failed');
+                  }),
+              }),
+              arm(rec, 'f1', 1),
+              arm(rec, 'f2', 2),
+              arm(rec, 'f3', 3),
+            ],
+            C,
+          )
+          .then(after(rec))
+          .commit(),
+    },
+  ];
+}
+
+/**
+ * Suspend and resume inside a block-limited `.parallel()` ([ADR 0011]): at `c = 1` the gates
+ * suspend one after the other and release their slot each time; the resumed arm is re-admitted
+ * after its seed check, the replayed siblings take none.
+ */
+function blockLimitResumeFixtures(): ResumeFixture[] {
+  return [
+    {
+      name: 'parallel-limited-suspend',
+      id: 'rs-par-lim',
+      width: 3,
+      input: { n: 1 },
+      resumes: [
+        { step: 'b', resumeData: { add: 2 } },
+        { step: 'a', resumeData: { add: 1 } },
+      ],
+      expected: ['suspended', 'suspended', 'success'],
+      sites: ['0', '1.0', '1.1', '1.2', '2'],
+      build: (cfg, rec) =>
+        wf('rs-par-lim', cfg)
+          .then(nStep(rec, 'pre', (n) => n + 1))
+          .parallel([gate(rec, 'a'), gate(rec, 'b'), nStep(rec, 't', async (n) => (await delay(2), n * 10))], { metadata: { concurrency: 1 } })
+          .then(sumArms(rec, 'sum'))
+          .commit(),
     },
   ];
 }

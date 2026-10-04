@@ -555,7 +555,7 @@ describe('every resume site of every shape, proven at k in {1, 2, unbounded}', (
     for (const k of KS) {
       it.concurrent(`${label}, ${kLabel(k)}`, async () => {
         await proveAll(`${label}, ${kLabel(k)}`, description, k, sites, 30_000);
-      }, 600_000);
+      });
     }
   }
 });
@@ -576,7 +576,7 @@ describe('larger shapes, every site, 30 s per query', () => {
     for (const k of [...KS, 4]) {
       it(`${label}, ${kLabel(k)}`, async () => {
         await proveAll(`${label}, ${kLabel(k)}`, description, k, sites, 30_000);
-      }, 3_600_000);
+      });
     }
   }
 });
@@ -613,7 +613,7 @@ describe('non-vacuity: the resume segments discriminate', () => {
     expect(resumeGateViolations(mutant)).toEqual([
       "resume site 0.1 ('s.0.fan.resume-1') has no sweep: nothing reads 'wf.cancel' and consumes it",
     ]);
-  }, 300_000);
+  });
 
   it('a replay that loses its arrival on the suspended branch strands the join at resume@[i,a]', async () => {
     // The proof story's "drop one replay-i xor branch" as a *weakening*: removing an alternative
@@ -637,7 +637,7 @@ describe('non-vacuity: the resume segments discriminate', () => {
     // The fresh segments never reach `replay-2`: only a resume segment can see this defect.
     const fresh = await verifyWorkflow(mutant, { resume: 'none', restart: 'none', timeoutMs: 30_000 });
     for (const r of fresh) expect(r.result.verdict.type, describeReport(r)).toBe('proven');
-  }, 300_000);
+  });
 
   it('a resume gate that ignores the signal is refused before any proof', async () => {
     const c = compile(wf(branch('br', ids('a', 'b'))));

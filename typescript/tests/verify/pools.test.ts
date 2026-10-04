@@ -371,7 +371,7 @@ describe.concurrent('every claim is proven on each sound net, in every segment',
     ['rateLimit burst=1 per 10 ms shared by 2 steps', bucketNet, ['closed/demandDrained(wf.quota.R.demand)', 'cancel/demandDrained(wf.quota.R.demand)', 'closed/bound(wf.quota.R<=1)', 'closed/bound(wf.quota.R.spent<=1)', 'closed/bound(wf.quota.R.demand<=2)']],
     ['a step retried once with a timeout', timeoutNet, ['closed/live(t.0.slow.timeout-0)', 'closed/live(t.0.slow.timeout-1)', 'closed/live(t.0.slow.run-1)']],
   ];
-  it.for(cases)('%s', { timeout: 300_000 }, async ([label, build, expected], { expect }) => {
+  it.for(cases)('%s', async ([label, build, expected], { expect }) => {
     const compiled = build();
     const started = performance.now();
     const report = await verify(compiled, { timeoutMs: 30_000 });

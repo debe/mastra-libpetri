@@ -1066,7 +1066,7 @@ describe('an adapted leaf-shaped workflow, proved', () => {
 
     expect([...compiled.resumeSites.keys()].sort()).toStrictEqual(SITES);
     expect(verdicts(reports), routes(reports)).toStrictEqual(allProven(compiled));
-  }, 180_000);
+  });
 
   it('is not proved vacuously: a step whose failure is routed nowhere breaks the properties that see it', async () => {
     // The safeguard the adapted flow relies on is the leaf routing each outcome to an exit. This
@@ -1090,7 +1090,7 @@ describe('an adapted leaf-shaped workflow, proved', () => {
       ...each('violated', ['closed', ...resumed], 'deadlockFree', 'terminatesAtSink', 'exactlyOneTerminal'),
       ...each('violated', ['cancel', ...resumed.map((r) => `${r}+cancel`)], 'deadlockFree', 'exactlyOneTerminal'),
     });
-  }, 180_000);
+  });
 
   it('is not proved vacuously under cancellation: without the sweeps, a cancel strands the run', async () => {
     // The cancel safeguard this flow relies on is the sweep on every place where work waits to
@@ -1124,7 +1124,7 @@ describe('an adapted leaf-shaped workflow, proved', () => {
       ...allProven(compiled),
       ...each('violated', ['cancel', ...SITES.map((site) => `resume@${site}+cancel`)], 'deadlockFree', 'exactlyOneTerminal'),
     });
-  }, 180_000);
+  });
 
   /**
    * No proof sees these: a start that lost its inhibitor still drains to exactly one terminal,

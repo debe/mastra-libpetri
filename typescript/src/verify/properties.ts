@@ -20,6 +20,15 @@ import { budgetStructureViolations } from './budget.js';
 import { poolSinks, poolStructureViolations } from './pools.js';
 import { initialCounts } from '../engine/kernel.js';
 
+
+/**
+ * The enumeration route's class budget ([VER-017]). libpetri's default, 50,000, truncates symmetric
+ * fan-outs — a limited block under a limit and the run budget — and drops them to SMT; the cost of
+ * more is memory, roughly linear in classes. A query that still does not close in its total budget
+ * is a net to redesign.
+ */
+export const ENUMERATION_MAX_CLASSES = 500_000;
+
 /**
  * Which runs a proof covers.
  *
@@ -335,7 +344,10 @@ export async function verifyWorkflow(
       // P-invariants are what make these queries converge; without them a chain of xor
       // branches is where a proof stops landing.
       .semiflowInvariants(true)
-      .timeout(timeout);
+      .enumerationMaxClasses(ENUMERATION_MAX_CLASSES)
+      .timeout(timeout)
+      // Caps the whole query, not each z3 process ([VER-013]); see `verify`.
+      .totalBudget(timeout);
 
   // Two segments with the same initial marking are the same query: asked once, cited under both.
   const reports: PropertyReport[] = [];

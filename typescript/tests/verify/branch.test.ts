@@ -111,7 +111,7 @@ describe('compiled branch, proved', () => {
   for (const [label, description] of shapes) {
     it(`every property, both segments: ${label}`, async () => {
       await expectProvenBoth(compile(description));
-    }, 600_000);
+    });
   }
 
   it('takes the SMT route for the timed shape in both segments, and enumerates the untimed one', async () => {
@@ -120,7 +120,7 @@ describe('compiled branch, proved', () => {
     // The cancel segment of an untimed block is a closed net too, so it enumerates.
     const untimed = await expectProvenBoth(compile(shapes[1]![1]));
     for (const report of untimed) expect(report.result.route, describeReport(report)).toBe('enumeration');
-  }, 600_000);
+  });
 });
 
 // ===================== scaling in the number of arms =====================
@@ -168,7 +168,7 @@ describe('compiled branch, scaling in the number of arms', () => {
         closed: cell('closed'),
         cancel: cell('cancel'),
       });
-    }, 1_800_000);
+    });
   }
 
   afterAll(() => {
@@ -246,7 +246,7 @@ async function verifyMutant(gadget: Gadget): Promise<readonly PropertyReport[]> 
 describe('compiled branch, non-vacuity', () => {
   it('the unmutated two-arm block is the baseline: every property of both segments proven', async () => {
     await expectProvenBoth(compile(twoArms));
-  }, 300_000);
+  });
 
   it("join-ok's inhibitor on the failure marker: without it a failed block can succeed and strand the marker", async () => {
     const reports = await verifyMutant(mutating('join-ok', (t) => [rebuilt(t, { dropInhibitor: 'err-seen' })]));
@@ -473,7 +473,7 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
       const swept = run(compile(prepThen(blockAfterPrep), { gadgets: { branch: dropping('cancel') } }));
       await expect(swept.done).rejects.toThrow();
       expect(swept.runner.calls).toEqual(['prep']);
-    }, 300_000);
+    });
   }
 
   for (const [label, description, role, expectedCalls] of [
@@ -514,7 +514,7 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
       // `not.toMatchObject`, not `not.toEqual` with the new `started` key: an extra or missing key
       // must not make this negative pass on its own — the claim is the block's own check never fired.
       expect(flipped.outcome).not.toMatchObject({ status: 'canceled', origin: { stepId: 'route', path: [1] } });
-    }, 600_000);
+    });
   }
 
   it('every cancel inhibitor the block adds is structurally load-bearing: stripped, each is named', () => {
@@ -642,7 +642,7 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
         });
         for (const r of reports) expect(r.result.route, describeReport(r)).toBe('enumeration');
       }
-    }, 300_000);
+    });
   });
 });
 
@@ -654,5 +654,5 @@ describe('compiled branch, a compiled net serves any runner', () => {
     const runner = new RecordingRunner({ branches: { route: () => [0, 2] } });
     const outcome = await runWorkflow(compiled, 'in', { runner });
     expect(outcome).toStrictEqual({ status: 'success', output: { arm0: 'in', arm1: undefined, arm2: 'in' } });
-  }, 300_000);
+  });
 });

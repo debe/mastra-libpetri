@@ -1104,21 +1104,21 @@ describe('leaf chains, proved', () => {
   it('proves a plain chain', async () => {
     // Every step can suspend, so every step is a resume site; a sleep is not.
     await expectProvenBothSegments(wf(step('a'), step('b'), step('c')), ['0', '1', '2']);
-  }, 90_000);
+  });
 
   it('proves a chain with unrolled retries and a retry delay', async () => {
     await expectProvenBothSegments(
       wf(step('a', { retries: 2, retryDelayMs: 100 }), step('b'), step('c', { retries: 1 })),
       ['0', '1', '2'],
     );
-  }, 90_000);
+  });
 
   it('proves a chain with a fixed sleep', async () => {
     await expectProvenBothSegments(
       wf(step('a'), { kind: 'sleep', id: 'nap', duration: { fixed: 60_000 } }, step('b')),
       ['0', '2'],
     );
-  }, 90_000);
+  });
 
   it('proves a chain with a per-run sleep and a per-run sleepUntil', async () => {
     await expectProvenBothSegments(
@@ -1130,7 +1130,7 @@ describe('leaf chains, proved', () => {
       ),
       ['0', '3'],
     );
-  }, 90_000);
+  });
 });
 
 describe('non-vacuity of the leaf', () => {
@@ -1206,7 +1206,7 @@ describe('non-vacuity of the leaf', () => {
     ]);
     await expect(verifyWorkflow(mutant)).rejects.toThrow(/resume gate structure is unsound/);
     expectAllProven(mutant, await verifyWorkflow(mutant, { ...SEGMENTS, structure: 'skip' }), ['0', '1']);
-  }, 90_000);
+  });
 
   it('routing one exit to a place that is not a terminal flips deadlockFree to violated', async () => {
     const lost = place<SuspendToken>('lost.suspended');
@@ -1222,7 +1222,7 @@ describe('non-vacuity of the leaf', () => {
     expect(verdictOf(reports, 'deadlockFree'), reports.map(describeReport).join('; ')).toBe('violated');
     expect(verdictOf(reports, 'terminatesAtSink'), reports.map(describeReport).join('; ')).toBe('violated');
     expect(outcome).toEqual({ status: 'stranded', places: ['lost.suspended'] });
-  }, 90_000);
+  });
 });
 
 describe('a rejection carrying no reason is still a rejection', () => {
@@ -1996,7 +1996,7 @@ describe('sleeps proven with the begin/waiting/wake split', () => {
       ),
       ['1'],
     );
-  }, 180_000);
+  });
 
   it('the structural check is clean for every sleep form in every position', () => {
     for (const entries of [

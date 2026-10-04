@@ -38,12 +38,27 @@ New capability never costs compatibility, because each layer states its own cont
 | Layer | What it is | Runs on Mastra's engine? |
 |---|---|---|
 | **1 — parity** | existing workflows, compiled | yes, identically |
-| **2 — annotations** | options Mastra has a word for but does not enforce (a `concurrency` on `.parallel()`) | yes — **degrades**; unenforced, same meaning |
+| **2 — annotations** | Mastra words carried in its own `metadata`, which its engine ignores (`metadata: { concurrency }` on `.parallel()`, `checkpoint`) | yes — **degrades**; unenforced, same meaning |
 | **3 — blueprints** | capability the IR cannot express | **no**, and the type system says so |
 
 Layer 3 is gated by a phantom engine-type brand on the `init()` factory's re-branded
 `createWorkflow` / `createStep` — the mechanism `@mastra/inngest` already uses. Reaching for a
 blueprint is a typed, visible decision, never a silent incompatibility.
+
+## Resources
+
+- **Block concurrency** (Layer 2, [ADR 0011](docs/adr/0011-block-concurrency.md)):
+  `.parallel(steps, { metadata: { concurrency: 2 } })` runs at most two arms at once, in arm order.
+  On Mastra's engine the annotation is ignored and every arm runs, with the same result.
+- **Shared quotas** (Layer 3, [ADR 0012](docs/adr/0012-limiter-blueprints.md)):
+  `const { limit, rateLimit, createStep } = init()`; `createStep({ ..., uses: [limit(4, { id: 'db' })] })`.
+  A quota is shared by every step that uses it, within one run.
+- **Step timeout** (Layer 3, [ADR 0013](docs/adr/0013-step-timeout.md)): `createStep({ ..., timeout: 5_000 })`.
+  The attempt's signal aborts on the run's clock, the run waits for the step to return, and the
+  attempt fails as a thrown error would — retried under the step's `retries`.
+
+Each pool — the run budget, block slots, limits, rate buckets — is conserved by construction and
+its bound is proven; a rate over time is tested, not proven.
 
 ## Blueprints
 

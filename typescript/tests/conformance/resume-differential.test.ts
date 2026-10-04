@@ -104,7 +104,7 @@ for (const k of BUDGETS) {
           v.unusedAttributions.filter((at) => at.routes !== undefined).map((at) => `row ${at.row} unused on ${routeLabel(v.route)}: ${at.reason}`),
         );
         expect(scopedUnused).toEqual([]);
-      }, 120_000);
+      });
     }
   });
 }

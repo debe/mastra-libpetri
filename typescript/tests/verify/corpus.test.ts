@@ -87,7 +87,7 @@ describe.each([
   ['k=1', 1],
 ] as const)('the corpus, %s', (label, k) => {
   for (const fixture of corpus) {
-    it(fixture.name, { timeout: 600_000 }, async () => {
+    it(fixture.name, async () => {
       const workflow = fixture.build(engineConfig('petri', k), new Recorder());
       const started = Date.now();
       const result: MastraVerification = await verifyMastraWorkflow(workflow as never, { timeoutMs: TIMEOUT_MS });

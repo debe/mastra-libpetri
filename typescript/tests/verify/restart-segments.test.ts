@@ -147,7 +147,7 @@ describe('restart@p and restart@p+cancel are proven at every boundary', () => {
       it(`${label}, k=${k ?? 'unbounded'}`, async () => {
         const c = compile(wf(entries), k === undefined ? {} : { concurrency: k });
         await expectRestartsProven(`${label} k=${k ?? 'unbounded'}`, c);
-      }, 120_000);
+      });
     }
   }
 });
@@ -163,7 +163,7 @@ describe.skipIf(!checkpointsCompile)('marked workflows (needs M4b W1: compile({c
         for (const r of reports) proofLog(`marked ${label} k=${k ?? 'unbounded'} ${describeReport(r)}`);
         expect(reports.map((r) => segmentLabel(r.segment))).toEqual(expect.arrayContaining(c.boundaries.map((b) => `restart@${b.index}+cancel`)));
         for (const r of reports) expect(r.result.verdict.type, describeReport(r)).toBe('proven');
-      }, 120_000);
+      });
     }
   }
 
@@ -174,7 +174,7 @@ describe.skipIf(!checkpointsCompile)('marked workflows (needs M4b W1: compile({c
     for (const claim of report.claims) expect(claim.holds, describeClaim(claim)).toBe(true);
     expect(report.claims.filter((x) => x.kind === 'proof').every((x) => x.result.verdict.type === 'proven')).toBe(true);
     expect(report.segments.map(segmentLabel)).toContain('restart@2+cancel');
-  }, 120_000);
+  });
 });
 
 // =============================================================================================
@@ -203,7 +203,7 @@ describe('a marking shared by two segments is proven once and cited under both',
     }
     expect(at('restart@1', 'deadlockFree').sameProofAs).toBeUndefined();
     expect(at('restart@1', 'deadlockFree').marking).toBe('{s.1.fan.in: 1, wf.permits: 2}');
-  }, 120_000);
+  });
 
   it('verify: every family cites the same result; liveness stays closed-only', async () => {
     const report = await verify(c, { families: ['completion', 'bounds', 'exclusion', 'liveness'], timeoutMs: 30_000 });
@@ -228,7 +228,7 @@ describe('a marking shared by two segments is proven once and cited under both',
     expect([...citing].sort()).toEqual([
       'restart@0+cancel>cancel', 'restart@0>closed', 'restart@2+cancel>resume@2+cancel', 'restart@2>resume@2', 'resume@0+cancel>cancel', 'resume@0>closed',
     ]);
-  }, 120_000);
+  });
 });
 
 // =============================================================================================

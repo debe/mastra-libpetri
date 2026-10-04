@@ -196,7 +196,7 @@ describe('main, without a solver', () => {
 
 describe('the CLI, end to end', () => {
   const run = (args: readonly string[]) =>
-    spawnSync('npx', ['tsx', 'src/cli.ts', ...args], { cwd: ROOT, encoding: 'utf8', timeout: 180_000 });
+    spawnSync('npx', ['tsx', 'src/cli.ts', ...args], { cwd: ROOT, encoding: 'utf8', timeout: 60_000 });
 
   it('verifies every workflow of a module and exits 0 when every claim holds', () => {
     const r = run(['verify', 'tests/fixtures/cli-workflow.ts']);
@@ -209,7 +209,7 @@ describe('the CLI, end to end', () => {
     expect(r.stdout).toContain('  k: 2;');
     expect(r.stdout).not.toMatch(/^FAILS/m);
     expect(r.stdout.trim().split('\n').at(-1)).toBe('every claim of 2 workflow(s) holds');
-  }, 180_000);
+  });
 
   it('exits 2 on a usage error', () => {
     const r = run(['verify', 'tests/fixtures/cli-workflow.ts', '--concurrency', 'many']);

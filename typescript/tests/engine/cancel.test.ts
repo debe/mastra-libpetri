@@ -1057,7 +1057,7 @@ describe('linear chains, proved in both segments', () => {
 
   it.each(shapes)('%s', async (label, description) => {
     await expectProven(label, compile(description));
-  }, 300_000);
+  });
 });
 
 describe('refusals', () => {
@@ -1088,7 +1088,7 @@ describe('non-vacuity of each cancellation safeguard', () => {
     const ac = new AbortController();
     const r = new RecordingRunner({ c: (x) => (ac.abort(), { status: 'success', output: x }) });
     expect(await runWorkflow(same, 1, { runner: r, signal: ac.signal })).toEqual({ status: 'canceled', started: true });
-  }, 120_000);
+  });
 
   it('leaf sweep (step): structurally silent, but the cancel segment sees the stranded input', async () => {
     const mutant = compile(chain, { gadgets: { step: withoutSweep(stepGadget) } });
@@ -1114,7 +1114,7 @@ describe('non-vacuity of each cancellation safeguard', () => {
     const ac = new AbortController();
     const r = new RecordingRunner({ a: (x) => (ac.abort(), { status: 'success', output: x }) });
     await expect(runWorkflow(mutant, 1, { runner: r, signal: ac.signal, timeoutMs: 300 })).rejects.toThrow(/timed out/);
-  }, 120_000);
+  });
 
   it('leaf sweep (sleep): without it a cancel during a fixed sleep strands the sleeping token', async () => {
     const mutant = compile(chain, { gadgets: { sleep: withoutSweep(sleepGadget) } });
@@ -1125,7 +1125,7 @@ describe('non-vacuity of each cancellation safeguard', () => {
       ...allProven(mutant),
       ...violated(['cancel', 'resume@0+cancel', 'resume@1+cancel'], 'deadlockFree', 'exactlyOneTerminal'),
     });
-  }, 120_000);
+  });
 
   it('action-side sleep, cancel-waited removed: the cancel segment sees the waited token stranded', async () => {
     const wf: WorkflowDescription = { id: 'cw', entries: [{ kind: 'sleep', id: 'nap', duration: { perRun: true } }, { kind: 'step', id: 'z' }] };
@@ -1141,7 +1141,7 @@ describe('non-vacuity of each cancellation safeguard', () => {
     const ac = new AbortController();
     const r = new RecordingRunner({ waits: { nap: () => (setTimeout(() => ac.abort(), 30), 60_000) } });
     await expect(runWorkflow(mutant, 1, { runner: r, signal: ac.signal, timeoutMs: 500 })).rejects.toThrow(/timed out/);
-  }, 120_000);
+  });
 
   it('leaf first-attempt inhibitor: flagged by the structural check, refused by verifyWorkflow, and the run flips', async () => {
     const mutant = compile(steps3, { gadgets: { step: withoutFirstInhibitor } });
@@ -1161,7 +1161,7 @@ describe('non-vacuity of each cancellation safeguard', () => {
     };
     expect(await run(compile(steps3))).toEqual({ outcome: { status: 'canceled', origin: { stepId: 'b', path: [1] }, started: false }, calls: ['a'] });
     expect(await run(mutant)).toEqual({ outcome: { status: 'canceled', started: true }, calls: ['a', 'b', 'c'] });
-  }, 120_000);
+  });
 
   it("action-side sleep's resume inhibitor: flagged, and the run records a sleep the abort cut short", async () => {
     const wf: WorkflowDescription = { id: 'rs', entries: [{ kind: 'sleep', id: 'nap', duration: { perRun: true } }, { kind: 'step', id: 'z' }] };
@@ -1180,7 +1180,7 @@ describe('non-vacuity of each cancellation safeguard', () => {
     expect(await run(compile(wf))).toEqual({ outcome: { status: 'canceled', origin: { stepId: 'nap', path: [0] }, started: true }, records: ['nap:waiting'], calls: [] });
     // Mutant: the cut-short sleep resumes as a success, overwriting its waiting record; `z`'s sweep cancels.
     expect(await run(mutant)).toEqual({ outcome: { status: 'canceled', origin: { stepId: 'z', path: [1] }, started: false }, records: ['nap:success'], calls: [] });
-  }, 120_000);
+  });
 
   it('settle stage, inhibited half: flagged by the structural check, and a canceled run reports its success', async () => {
     const intact = compile(steps3);
@@ -1206,7 +1206,7 @@ describe('non-vacuity of each cancellation safeguard', () => {
       started: true,
     });
     expect(await abortIn(mutant, { status: 'failed', error: 'e' })).toEqual({ status: 'failed', stepId: 'c', path: [2], error: 'e' });
-  }, 120_000);
+  });
 
   it.each(['done', 'failed'] as const)('settle stage, canceled half of %s removed: the cancel segment sees the settled token strand', async (outcome) => {
     const intact = compile(steps3);
@@ -1225,7 +1225,7 @@ describe('non-vacuity of each cancellation safeguard', () => {
       c: () => (ac.abort(), outcome === 'done' ? { status: 'success', output: 1 } : { status: 'failed', error: 'e' }),
     });
     await expect(runWorkflow(mutant, 1, { runner: r, signal: ac.signal, timeoutMs: 300 })).rejects.toThrow(/timed out/);
-  }, 120_000);
+  });
 
   it.each([
     {
@@ -1259,7 +1259,7 @@ describe('non-vacuity of each cancellation safeguard', () => {
     if (gate.length > 0) await expect(verifyWorkflow(mutant)).rejects.toThrow(/resume gate structure is unsound/);
     const v = await prove(`${name} without read`, mutant, gate.length > 0 ? { structure: 'skip' } : {});
     expect(v).toStrictEqual({ ...allProven(mutant), ...violated(reaches, 'neverCanceled') });
-  }, 120_000);
+  });
 
   it("the sweep's read arc, removed: the run flips too — canceled with no signal at all", async () => {
     const mutant = withTransitions(compile(steps3), (t) => (t.name === 't.1.b.cancel' ? withoutReads(t) : t));
@@ -1281,5 +1281,5 @@ describe('non-vacuity of each cancellation safeguard', () => {
       ...allProven(mutant),
       ...violated(['cancel', 'resume@0+cancel', 'resume@1+cancel', 'resume@2+cancel'], 'deadlockFree'),
     });
-  }, 120_000);
+  });
 });

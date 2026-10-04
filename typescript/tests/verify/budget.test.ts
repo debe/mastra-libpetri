@@ -106,7 +106,7 @@ const shapes: ReadonlyArray<readonly [string, readonly EntryDescription[], numbe
 
 describe.concurrent('every gadget shape is proven under a budget (both segments, all properties)', () => {
   for (const k of [1, 2]) {
-    it.for(shapes)(`k=${k}: %s`, { timeout: 360_000 }, async ([label, entries, attempts], { expect }) => {
+    it.for(shapes)(`k=${k}: %s`, async ([label, entries, attempts], { expect }) => {
       const compiled = build(entries, k);
       expect(compiled.budget?.k).toBe(k);
       // The only permit consumers are step attempts, one per attempt: no sleep, condition, join or
@@ -123,7 +123,7 @@ const foreach = (c: number, body: StepDescription = step('body')): EntryDescript
 
 describe.concurrent('foreach under a budget (both segments, all properties)', () => {
   for (const k of [1, 2]) {
-    it.for([1, 2])(`k=${k}: foreach c=%i`, { timeout: 1_800_000 }, async (c, { expect }) => {
+    it.for([1, 2])(`k=${k}: foreach c=%i`, async (c, { expect }) => {
       const compiled = build([foreach(c)], k);
       expect(permitConsumers(compiled)).toHaveLength(c);
       await prove(expect, `k=${k} foreach c=${c}`, compiled);
@@ -133,7 +133,7 @@ describe.concurrent('foreach under a budget (both segments, all properties)', ()
 
 describe.concurrent('foreach c=3 under a budget (every segment, all properties)', () => {
   for (const k of [1, 2]) {
-    it(`k=${k}: foreach c=3`, { timeout: 600_000 }, async ({ expect }) => {
+    it(`k=${k}: foreach c=3`, async ({ expect }) => {
       const compiled = build([foreach(3)], k);
       expect(permitConsumers(compiled)).toHaveLength(3);
       await prove(expect, `k=${k} foreach c=3`, compiled, 30_000);

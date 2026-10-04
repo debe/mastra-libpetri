@@ -116,7 +116,7 @@ describe('compiled parallel, proved', () => {
         expect(report.result.verdict.type, describeReport(report)).toBe('proven');
       }
       proofLog(`[proof] ${shape} (${ms.toFixed(0)}ms): ${reports.map(describeReport).join('; ')}`);
-    }, 360_000);
+    });
   }
 });
 
@@ -199,28 +199,28 @@ describe('compiled parallel, non-vacuity by mutation', () => {
   for (const exit of ['failed', 'suspended', 'bailed', 'paused'] as const) {
     it(`needs the '${exit}' arrival deposit: an arm ${exit} straight to the enclosing exit strands its sibling`, async () => {
       await expectDeadlockFreeViolated(bypass(exit));
-    }, 180_000);
+    });
   }
 
   it('needs join-ok inhibited by err-seen: without it a failed block can succeed and strand the marker', async () => {
     await expectDeadlockFreeViolated(
       mutate('join-ok', (t) => [rebuild(t, { inhibitors: t.inhibitors.map((a) => a.place).filter((p) => !p.name.endsWith('.err-seen')) })]),
     );
-  }, 180_000);
+  });
 
   it('needs join-ok inhibited by susp-seen: without it a suspended block can succeed and strand the marker', async () => {
     await expectDeadlockFreeViolated(
       mutate('join-ok', (t) => [rebuild(t, { inhibitors: t.inhibitors.map((a) => a.place).filter((p) => !p.name.endsWith('.susp-seen')) })]),
     );
-  }, 180_000);
+  });
 
   it('needs join-susp inhibited by err-seen: without it a suspension can outrank a failure', async () => {
     await expectDeadlockFreeViolated(mutate('join-susp', (t) => [rebuild(t, { inhibitors: [] })]));
-  }, 180_000);
+  });
 
   it('needs join-fail to reset susp-seen: without it a failure beside a suspension strands the marker', async () => {
     await expectDeadlockFreeViolated(mutate('join-fail', (t) => [rebuild(t, { resets: [] })]));
-  }, 180_000);
+  });
 
   it('needs join-fail to consume all of err-seen: one() leaves a second failure behind', async () => {
     await expectDeadlockFreeViolated(
@@ -229,7 +229,7 @@ describe('compiled parallel, non-vacuity by mutation', () => {
         return [rebuild(t, { inputs: t.inputSpecs.map((s) => (s.place === errSeen ? one(errSeen) : s)) })];
       }),
     );
-  }, 180_000);
+  });
 
   it('needs join-susp to consume all of susp-seen: one() leaves a second suspension behind', async () => {
     await expectDeadlockFreeViolated(
@@ -238,7 +238,7 @@ describe('compiled parallel, non-vacuity by mutation', () => {
         return [rebuild(t, { inputs: t.inputSpecs.map((s) => (s.place === suspSeen ? one(suspSeen) : s)) })];
       }),
     );
-  }, 180_000);
+  });
 
   it('needs the arrival and err-seen in one firing: split across two, join-ok races the marker', async () => {
     // The doc comment's race-freedom argument, removed: `collect-err` deposits the arrival now
@@ -269,7 +269,7 @@ describe('compiled parallel, non-vacuity by mutation', () => {
         return [split, relay];
       }),
     );
-  }, 180_000);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -346,7 +346,7 @@ describe('compiled parallel, cancellation non-vacuity', () => {
         expect(cited[`restart@2${suffix}/${property}`], all).toBe(`resume@2${suffix}`);
       }
       proofLog(`[mutant sweep ${label}] ${all}`);
-    }, 360_000);
+    });
   }
 
   // The lead's pattern: the same transition, rebuilt without its inhibitors, reads re-added.

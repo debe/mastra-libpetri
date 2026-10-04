@@ -230,7 +230,7 @@ describe('leaf resume: the resumed attempt is marked, and nothing after it is', 
 
   it('proves the chain fresh and resumed at [1], with and without a cancel', async () => {
     await expectAllProven('a;b;c', build('chain', chain), 1);
-  }, 120_000);
+  });
 
   it('hands the runner resumed on the site step only, fed the stored payload; the next step runs fresh', async () => {
     const runner = new ResumeRunner({ b: () => ({ status: 'success', output: 'approved' }) });
@@ -271,7 +271,7 @@ describe('leaf resume: the resumed attempt is marked, and nothing after it is', 
 
   it('proves the retrying chain resumed at [1] too (a timed retry hop behind the site)', async () => {
     await expectAllProven('a;b(retries 2, 10ms);c', build('retry', [step('a'), step('b', { retries: 2, retryDelayMs: 10 }), step('c')]), 1);
-  }, 120_000);
+  });
 
   it('a fresh run marks no call resumed', async () => {
     const runner = new ResumeRunner();
@@ -460,7 +460,7 @@ describe('leaf resume: cancellation and the budget', () => {
       ['b', true],
       ['c', false],
     ]);
-  }, 120_000);
+  });
 
   it('non-vacuity: the same queries see a doubled seed at the site (exactlyOneTerminal violated)', async () => {
     // Guards the segment helper, not the leaf: a proof that could not fail from a wrong marking

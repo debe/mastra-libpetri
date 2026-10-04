@@ -340,7 +340,7 @@ describe('block limit: proofs', () => {
           const compiled = compile(wf(block(steps(3), c)), k === undefined ? {} : { concurrency: k });
           const reports = await expectProven(name, compiled);
           expect(new Set(reports.map((r) => segmentLabel(r.segment)))).toContain('resume@0.2+cancel');
-        }, 120_000);
+        });
       }
     }
   }
@@ -360,7 +360,7 @@ describe('block limit: proofs', () => {
         expect(active.some((cl) => cl.family === 'bounds' && cl.property.includes(`<=${c}`))).toBe(true);
         expect(active.some((cl) => cl.family === 'exclusion')).toBe(true);
         timings.push(`${name}: ${report.claims.length} bound/exclusion claims in ${ms.toFixed(0)} ms`);
-      }, 120_000);
+      });
     }
   }
 });
