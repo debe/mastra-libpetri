@@ -22,6 +22,9 @@ import { FIXTURES, RESUME_FIXTURES, Recorder, engineConfig } from '../fixtures/m
  * The workflows run one at a time: each `verify` already runs its queries in a pool as wide as half
  * the cores, and two pools at once would starve the solver into timeouts, which read as `unknown`.
  *
+ * **Sharding.** `CORPUS_SHARD=i/n` splits the workflows across CI jobs (see `shardOf`); the
+ * claims and the 30 s budget are the same in every shard.
+ *
  * **One lane, 30 s a query.** Every workflow runs in `npm test`. Under libpetri 8.0.0's in-flight
  * firing the whole corpus — 132 cases, about 124,000 claims — takes about 13 minutes on ten cores;
  * a proof that does not close in 30 s is a net to redesign, not a budget to raise ([ADR 0009]).
@@ -59,10 +62,25 @@ function expectHolds(name: string, report: VerificationReport): void {
   for (const family of report.families) expect(report.claims.some((c) => c.family === family), `${name}: ${family}`).toBe(true);
 }
 
+/**
+ * `CORPUS_SHARD=i/n` keeps the workflows whose position is `i - 1` modulo `n`, so `n` CI jobs
+ * prove the corpus between them, every workflow exactly once. Unset, every workflow. A malformed
+ * value throws: a typo must not turn the gate into a quiet subset.
+ */
+function shardOf(value: string | undefined): { readonly i: number; readonly n: number } | undefined {
+  if (value === undefined || value === '') return undefined;
+  const m = /^(\d+)\/(\d+)$/.exec(value);
+  const i = Number(m?.[1]);
+  const n = Number(m?.[2]);
+  if (m === null || n < 1 || i < 1 || i > n) throw new Error(`CORPUS_SHARD must be i/n with 1 <= i <= n, got '${value}'`);
+  return { i, n };
+}
+
+const shard = shardOf(process.env['CORPUS_SHARD']);
 const corpus = [
   ...FIXTURES.map((f) => ({ name: f.name, build: f.build })),
   ...RESUME_FIXTURES.map((f) => ({ name: f.name, build: f.build })),
-];
+].filter((_, position) => shard === undefined || position % shard.n === shard.i - 1);
 
 describe.each([
   ['unbounded', undefined],
