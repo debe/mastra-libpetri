@@ -107,6 +107,14 @@ const shapes: ReadonlyArray<readonly [string, WorkflowDescription]> = [
   ],
 ];
 
+/**
+ * `neverCanceled` is asked only where no cancel arrives, so `wf.canceled` sits in an initially empty
+ * siphon and is proven without the solver (`src/verify/siphon.ts`); every other query keeps its route.
+ */
+function routeOr(report: { readonly result: { readonly route: string } }, route: string): string {
+  return /^[^ ]*\/neverCanceled\b/.test(describeReport(report as never)) ? 'structural' : route;
+}
+
 describe('compiled branch, proved', () => {
   for (const [label, description] of shapes) {
     it(`every property, both segments: ${label}`, async () => {
@@ -116,10 +124,10 @@ describe('compiled branch, proved', () => {
 
   it('takes the SMT route for the timed shape in both segments, and enumerates the untimed one', async () => {
     const timed = await expectProvenBoth(compile(shapes[shapes.length - 1]![1]));
-    for (const report of timed) expect(report.result.route, describeReport(report)).toBe('smt');
+    for (const report of timed) expect(report.result.route, describeReport(report)).toBe(routeOr(report, 'smt'));
     // The cancel segment of an untimed block is a closed net too, so it enumerates.
     const untimed = await expectProvenBoth(compile(shapes[1]![1]));
-    for (const report of untimed) expect(report.result.route, describeReport(report)).toBe('enumeration');
+    for (const report of untimed) expect(report.result.route, describeReport(report)).toBe(routeOr(report, 'enumeration'));
   });
 });
 
@@ -648,7 +656,7 @@ describe('compiled branch, cancellation safeguards are load-bearing', () => {
           'cancel/exactlyOneTerminal': 'violated',
           ...resumed,
         });
-        for (const r of reports) expect(r.result.route, describeReport(r)).toBe('enumeration');
+        for (const r of reports) expect(r.result.route, describeReport(r)).toBe(routeOr(r, 'enumeration'));
       }
     });
   });
