@@ -165,7 +165,10 @@ and the entry runs as `.foreach(nestedWorkflow, { concurrency: Σc_j })`, the tw
 - **Order.** Stage 0 admits in input order through the cursor (fluid, as fastq). Later stages
   admit unordered: whichever ready lane and free permit pair fires. The twin's children are
   independent, so there is no order to reproduce; FIFO would cost a token per boundary and
-  head-of-line blocking.
+  head-of-line blocking. *W1 review:* the tie between ready lanes is broken by a fixed lane
+  preference, not by chance, so with a fast stage 0 one item can wait at a hand-off until stage 0's
+  queue drains (bounds `[2,1,1]`, 12 items: stage 1 sees item 1 last). Recorded in row 115; a fair
+  hand-off is an open maintainer decision.
 - **Failure.** A stage failure (tripwire included, forwarded whole) settles at priority 1: it takes
   the queue, puts back `queue.closed` and `fault`. Nothing new starts; items already admitted run
   every remaining stage, because hand-offs read no flag — as the twin's children never see
@@ -312,7 +315,18 @@ independent agent re-ran all of them, reproducing the class counts exactly and t
   query over each transition's inputs and reads did. Each settle kind is emitted in three variants
   (open, closed, closed again), two transitions fewer per lane, class counts unchanged; one timed
   query moved 0.9 -> 5.1 s, measured three times each way, still under 30 s. Structure rule 8: no
-  pipeline transition is unreachable from the arcs (a W1 test, not a claim).
+  pipeline transition is unreachable from the arcs (a W1 test, not a claim) when Σc_j ≥ 2. *W1
+  review:* with Σc_j = 1 four transitions are dead: the lane's `fail.queue-closed.again` and
+  `suspend.queue-closed.again` (one lane cannot raise a flag while another item is in flight, as
+  in the one-lane foreach), and the finishers `fail.s` and `canceled.fs`, which need `fault` and
+  `susp` together (the first failure or suspension closes the queue, so no item is left to raise
+  the other). They are kept, so the site's shape does not depend on Σc_j, and the rule-8 test
+  expects exactly those four proven unreachable.
+- *W1 review:* a lane body is emitted without the cancel signal; hand-offs and starts are gated
+  when they fire. An item handed to a stage, or admitted, whose attempt waits for a run permit or a
+  quota when the cancel arrives still runs that stage, and its outcome is dropped as a hole (row
+  115). Gating the lane body would change the leaf subnets and the class counts, so it is left for
+  an amendment if parity is wanted.
 - Suspension coverage fails on every lane attempt, as expected: the `pipelineLaneAttempts`
   exemption and structure rule 7 are W1's.
 

@@ -79,6 +79,8 @@ export function resumeSeed(compiled: CompiledWorkflow, request: ResumeRequest): 
   const key = path.join('.');
   const site = path.length === 0 ? undefined : compiled.resumeSites.get(key);
   if (site === undefined) {
+    const piped = pipelineRefusal(compiled, path, request.steps);
+    if (piped !== undefined) throw piped;
     const top = path[0] === undefined ? undefined : compiled.netMap.pathToEntry.get(String(path[0]));
     const there = top === undefined ? 'no entry' : `the ${top.kind} '${top.entryId}'`;
     throw new UnresumablePositionError(
@@ -236,4 +238,33 @@ function foreachValue(site: ForeachSite, request: ResumeRequest): ForeachResume 
     );
   }
   return foreachSeed(site, aggregate, request.records, request.forEachIndex);
+}
+
+/**
+ * The `pipeline` refusal ([ADR 0015], maintainer decision 4), or `undefined`: a resume that names a
+ * `pipeline()` — its top-level path (`[i]`, or anything under it), or its body's id as the stored step
+ * (`steps[0]`, the key Mastra keeps the aggregate and its suspension under). A suspended stage ends
+ * the pipeline `suspended` with the foreach's aggregate shape, but no resume site is registered, so
+ * this is said instead of `no-site`, before anything runs or persists. Resumable at (item, stage) is
+ * wave 2.
+ *
+ * Exported for `mastra/engine.ts`, which asks the same question when the stored position cannot even
+ * be decoded.
+ */
+export function pipelineRefusal(
+  compiled: CompiledWorkflow,
+  path: EntryPath,
+  steps: readonly string[],
+): UnresumablePositionError | undefined {
+  const stepId = steps[0];
+  const site = compiled.pipelines.find(
+    (p) => (path.length > 0 && path[0] === p.path[0]) || (stepId !== undefined && stepId === p.bodyId),
+  );
+  if (site === undefined) return undefined;
+  return new UnresumablePositionError(
+    'pipeline',
+    path,
+    `the run suspended inside the pipeline '${site.bodyId}' at [${site.path.join(', ')}] (stages ` +
+      `${site.stages.map((s) => `'${s}'`).join(', ')}); a suspended pipeline stage cannot be resumed yet`,
+  );
 }

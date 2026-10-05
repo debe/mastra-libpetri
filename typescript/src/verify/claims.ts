@@ -1,6 +1,7 @@
 import type { Place, Transition } from 'libpetri';
 import type { CompiledWorkflow } from '../compiler/types.js';
 import { settledBound } from '../compiler/blueprints/first-k.js';
+import { sitePlaces } from './pipeline.js';
 
 /**
  * What M6 claims about a compiled workflow beyond completion ([ADR 0009]), derived from the
@@ -31,9 +32,11 @@ export interface Exclusion {
   /**
    * `barrier` — Mastra's `for` loop, derived from the entries; `gadget` — declared by one;
    * `decision` — a counted decision's `won` against its `short` ([ADR 0014]), derived from
-   * `CompiledWorkflow.decisions` (the gadget's own declaration of the same pair is not repeated).
+   * `CompiledWorkflow.decisions` (the gadget's own declaration of the same pair is not repeated);
+   * `pipeline` — a `pipeline()`'s lane and queue exclusions ([ADR 0015]), derived from
+   * `CompiledWorkflow.pipelines` (likewise not repeated from the gadget).
    */
-  readonly source: 'barrier' | 'gadget' | 'decision';
+  readonly source: 'barrier' | 'gadget' | 'decision' | 'pipeline';
   readonly why: string;
 }
 
@@ -88,6 +91,11 @@ function placeByName(compiled: CompiledWorkflow): ReadonlyMap<string, Place<unkn
  * `preempted` at 1, `okSeen` and `miss` at `n`, and `settled` at `max(n − k, k − 1)` (`settledBound`)
  * where it is emitted (`n ≥ 2`). `decisionStructureViolations` is what ties them to the arcs.
  *
+ * **A pipeline brings its own** ([ADR 0015]), derived from `CompiledWorkflow.pipelines` and replacing
+ * a gadget's claim on the same place: `placeBound(·, 1)` on every place the site names — the frame,
+ * the queue, both flag pairs, and per lane its permit, slot, body, `done` and exits.
+ * `pipelineStructureViolations` is what ties them to the arcs.
+ *
  * **A bucket's rate is listed, not claimed.** *At most `burst` per `perMs` window* is a timed
  * property the untimed verifier cannot state: it is tested under a ManualClock, not proven, and
  * `unclaimed` says so under the bucket's name.
@@ -96,7 +104,7 @@ export function boundClaims(compiled: CompiledWorkflow): { readonly claimed: rea
   const claimed: BoundClaim[] = [];
   const unclaimed: UnclaimedPlace[] = [];
   const permits = compiled.budget?.permits.name;
-  const derived = new Map([...poolBounds(compiled), ...decisionBounds(compiled)]);
+  const derived = new Map([...poolBounds(compiled), ...decisionBounds(compiled), ...pipelineBounds(compiled)]);
   for (const place of [...compiled.net.places].sort((a, b) => a.name.localeCompare(b.name))) {
     if (place.name === permits) continue;
     const pooled = derived.get(place.name);
@@ -161,6 +169,21 @@ function decisionBounds(compiled: CompiledWorkflow): ReadonlyMap<string, { reado
 }
 
 /**
+ * The bounds a pipeline implies ([ADR 0015]), by place name, each replacing a gadget's claim: every
+ * place the site names at 1. Per lane exactly one of `permit` / `slot` is marked from `split` to the
+ * finisher, and every arc on a pipeline place takes or gives one token (rules 1–6 of
+ * `pipelineStructureViolations`), so no place holds two.
+ */
+function pipelineBounds(compiled: CompiledWorkflow): ReadonlyMap<string, { readonly bound: number; readonly why: string; readonly over: boolean }> {
+  const out = new Map<string, { readonly bound: number; readonly why: string; readonly over: boolean }>();
+  for (const site of compiled.pipelines) {
+    const why = `pipeline '${site.foreachId}' (bounds [${site.bounds.join(', ')}]): every pipeline place is 1-bounded`;
+    for (const name of sitePlaces(site)) out.set(name, { bound: 1, why, over: true });
+  }
+  return out;
+}
+
+/**
  * The places an outcome waits in on its way out of the run: the settle places and `wf.canceled`.
  * Every one is fed only once the entry that produced it has returned, so no entry holds work
  * while one is marked.
@@ -187,6 +210,13 @@ function outcomePlaces(compiled: CompiledWorkflow, byName: ReadonlyMap<string, P
  * **A counted decision** ([ADR 0014]): `mutualExclusion(won, short)` per block, derived from
  * `CompiledWorkflow.decisions` — `met` and `short` consume the one decision right. The gadget declares
  * the same pair; it is listed once, as `decision`.
+ *
+ * **A pipeline** ([ADR 0015]), derived from `CompiledWorkflow.pipelines`, each listed once as
+ * `pipeline` (the gadget declares the same pairs): per lane `mutualExclusion(permit, slot)` — both
+ * 1-bounded and one always marked, so at most `c_j` items are at stage `j`; `(queue.open, fault)`
+ * (fail-fast: a recorded failure has closed the queue), `(queue.open, susp)`, `(queue.open,
+ * queue.closed)`, and each flag's complement pair. The overlap between adjacent stages is the
+ * opposite — a pair that **is** marked together — and is no claim here: {@link pipelineOverlaps}.
  */
 export function exclusions(compiled: CompiledWorkflow): readonly Exclusion[] {
   const byName = placeByName(compiled);
@@ -211,11 +241,64 @@ export function exclusions(compiled: CompiledWorkflow): readonly Exclusion[] {
     out.push({ a: at(d.won), b: at(d.short), source: 'decision', why: `block '${d.blockId}': met and short consume the one decision right` });
     decided.add(`${d.won}|${d.short}`).add(`${d.short}|${d.won}`);
   }
+  for (const site of compiled.pipelines) {
+    const pair = (a: string, b: string, why: string): void => {
+      out.push({ a: at(a), b: at(b), source: 'pipeline', why: `pipeline '${site.foreachId}': ${why}` });
+      decided.add(`${a}|${b}`).add(`${b}|${a}`);
+    };
+    pair(site.queueOpen, site.queueClosed, 'the queue is open or closed, never both');
+    pair(site.queueOpen, site.fault, 'fail-fast: a recorded failure has closed the queue');
+    pair(site.queueOpen, site.susp, 'a recorded suspension has closed the queue');
+    pair(site.noFault, site.fault, 'a failure is recorded or not, never both');
+    pair(site.noSusp, site.susp, 'a suspension is recorded or not, never both');
+    for (const lane of site.lanes) pair(lane.permit, lane.slot, `stage ${lane.stage} lane ${lane.lane} is idle or busy, never both: at most ${site.bounds[lane.stage]} item(s) at stage ${lane.stage}`);
+  }
   for (const claim of compiled.exclusions) {
     if (decided.has(`${claim.a}|${claim.b}`)) continue;
     out.push({ a: at(claim.a), b: at(claim.b), source: 'gadget', why: claim.why });
   }
   return out;
+}
+
+/**
+ * The overlap query of a pipeline ([ADR 0015], *proven reachable*): for each adjacent stage pair
+ * `j, j + 1`, `mutualExclusion(stage{j}.lane0.slot, stage{j+1}.lane0.slot)`, which must come back a
+ * **definitive `Violated`** with a confirmed counterexample — stage `j + 1` of one item runs while
+ * stage `j` of another does. The two slots hold different items because each item holds one slot
+ * (`pipelineStructureViolations` rule 3). Not a claim that must hold, so `verify` does not ask it;
+ * exposed for the tests that assert it violated, on immediate fixtures with at least two items
+ * reachable (untimed: not claimed on a timed net). Empty for a net with no pipelines, and for a
+ * one-stage pipeline.
+ */
+export interface OverlapQuery {
+  readonly foreachId: string;
+  /** The earlier stage `j`; the pair is `j`, `j + 1`. */
+  readonly stage: number;
+  readonly a: Place<unknown>;
+  readonly b: Place<unknown>;
+  readonly why: string;
+}
+
+export function pipelineOverlaps(compiled: CompiledWorkflow): readonly OverlapQuery[] {
+  if (compiled.pipelines.length === 0) return [];
+  const byName = placeByName(compiled);
+  const at = (name: string): Place<unknown> => {
+    const place = byName.get(name);
+    if (place === undefined) throw new Error(`overlap names '${name}', which is not a place of '${compiled.net.name}'`);
+    return place;
+  };
+  return compiled.pipelines.flatMap((site) =>
+    site.bounds.slice(0, -1).map((_, j): OverlapQuery => {
+      const first = (stage: number) => site.lanes.find((l) => l.stage === stage && l.lane === 0)!;
+      return {
+        foreachId: site.foreachId,
+        stage: j,
+        a: at(first(j).slot),
+        b: at(first(j + 1).slot),
+        why: `pipeline '${site.foreachId}': stage ${j + 1} of one item runs while stage ${j} of another does`,
+      };
+    }),
+  );
 }
 
 /**

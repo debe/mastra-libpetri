@@ -1,5 +1,6 @@
 import type { Place, Transition } from 'libpetri';
 import type { CompiledWorkflow } from '../compiler/types.js';
+import { pipelineLaneAttempts } from './pipeline.js';
 
 /**
  * Checks, from the arcs alone, the cancellation invariants no verified property can see.
@@ -181,11 +182,19 @@ export function resumeGateViolations(compiled: CompiledWorkflow): readonly strin
  * suspends (wave 1; `docs/divergences.md` row 106). No resume site covers them and none should.
  * They are not unchecked: `decisionStructureViolations` rule 7 holds every outcome of an arm attempt
  * to its own chain or a declared collect, so a suspended exit that escaped the block would fail there.
+ *
+ * **Exempt: the attempts inside a pipeline's lanes** ({@link pipelineLaneAttempts}, [ADR 0015],
+ * maintainer decision 4). A stage suspension ends the pipeline `suspended` at the lowest index, but
+ * no resume site is registered for it: `Run.resume` there is refused by name (`pipeline`) at seed
+ * time, so there is no resume segment to prove and none should be. They are not unchecked:
+ * `pipelineStructureViolations` rule 7 holds each lane's suspended exit to its own settle or drop,
+ * and every outcome of a lane attempt to its lane's exits or its own chain, so a suspension that
+ * escaped the pipeline would fail there.
  */
 export function suspensionCoverageViolations(compiled: CompiledWorkflow): readonly string[] {
   const out: string[] = [];
   const reported = new Set<string>();
-  const exempt = decidingArmAttempts(compiled);
+  const exempt = new Set([...decidingArmAttempts(compiled), ...pipelineLaneAttempts(compiled)]);
   for (const name of compiled.stepAttempts) {
     if (exempt.has(name)) continue;
     const entry = compiled.netMap.transitionToEntry.get(name);

@@ -172,6 +172,12 @@ export interface RunnerResumeOptions extends RunnerResume {
  * - conditions and sleep functions see `retryCount: -1` and a `bail` that does nothing
  *   (`handlers/control-flow.ts:419-427,836-850`, `handlers/sleep.ts:87-104`).
  *
+ * **A pipeline stage** ([ADR 0015]) — a call with `pipelineItem` — runs as a step of the twin's child
+ * run (`.foreach(nestedWorkflow)`): resolved by id within the pipeline's body, handed the call's input
+ * as it is (no `foreachIdx`), no fresh `nestedRunId`, no span, no start or result event, and stage 0
+ * validated against the body's input schema before its own, as the twin's foreach validates the
+ * nested step. Its state is the item's snapshot (see {@link openItem}).
+ *
  * **One store.** The runner keeps no step results of its own: `StepExecutor` is handed a view over
  * the kernel's run scope that translates each record to Mastra's `StepResult` shape on access. The
  * workflow **state** (`setState`) and the run's **resume labels** are the two data held here. Both
@@ -213,6 +219,20 @@ export class MastraStepRunner implements StepRunner {
   readonly #validated = new Map<string, ValidatedInput>();
   /** The steps named in the restart's `activeStepsPath` that have not yet been handed `restart: true`. */
   readonly #toRestart: Set<string>;
+  /**
+   * Each open pipeline item's state ([ADR 0015], maintainer decision 3), by `(path, k)`: a snapshot of
+   * the run's state taken when the item was admitted, which every stage of the item reads and
+   * `setState`s into, and which is merged into the run's state or dropped when the item leaves.
+   */
+  readonly #items = new Map<string, Record<string, unknown>>();
+  /** A pipeline stage call's `stepCallId`, by `(path, k, stepId)`: one per call, every retry sharing it. */
+  readonly #stageCalls = new Map<string, string>();
+  /**
+   * Each pipeline item's `initData` ([ADR 0015]), by `(path, k)`: the item as the body's input schema
+   * left it at stage 0 — the twin's child run's input — which every stage of the item reads as
+   * `getInitData()` and `stepResults.input`. The leaf's item view holds the raw item.
+   */
+  readonly #itemInit = new Map<string, { readonly value: unknown }>();
 
   constructor(options: MastraStepRunnerOptions) {
     this.#o = options;
@@ -256,6 +276,52 @@ export class MastraStepRunner implements StepRunner {
     }
   }
 
+  /**
+   * Pipeline item `k` at `path` was admitted ([ADR 0015]): its state is a copy of the run's state as
+   * it is now — the twin's child run validates the parent's state into a copy through the minted
+   * body's state schema (`workflow.ts:3006`, `_validateInitialState`), one level deep, as this is.
+   * A later update to the run's state is not seen by the item, nor the item's by the run, until
+   * {@link closeItem}.
+   */
+  openItem(path: EntryPath, k: number): void {
+    this.#items.set(itemKey(path, k), { ...this.#state });
+  }
+
+  /**
+   * Pipeline item `k` left ([ADR 0015]): `'merge'` `Object.assign`s its whole state into the run's,
+   * as the twin's `setState(res.state)` does on every non-throwing return (`workflow.ts:3054-3055`,
+   * `default.ts:709-713`) — the last item to leave wins each key, an update another item made
+   * meanwhile included (lost updates, as on the default engine); `'discard'` drops it (a failed
+   * item). The item's stage call ids, validated inputs and `initData` go with it.
+   */
+  closeItem(path: EntryPath, k: number, state: 'merge' | 'discard'): void {
+    const key = itemKey(path, k);
+    const item = this.#items.get(key);
+    this.#items.delete(key);
+    this.#itemInit.delete(key);
+    for (const call of [...this.#stageCalls.keys()]) if (call.startsWith(`${key}\u0000`)) this.#stageCalls.delete(call);
+    // Its stages' validated inputs, keyed `path\0stepId\0p<k>` by {@link #validatedInput}.
+    const at = `${path.join('.')}\u0000`;
+    for (const call of [...this.#validated.keys()]) if (call.startsWith(at) && call.endsWith(`\u0000p${k}`)) this.#validated.delete(call);
+    if (state === 'merge' && item !== undefined) Object.assign(this.#state, item);
+  }
+
+  /**
+   * The state a call runs against and `setState`s into: a pipeline stage's item snapshot, the run's
+   * state otherwise. A stage of an item never opened — a net that skipped `openItem` — snapshots on
+   * first use, so the stage still sees an item-scoped copy rather than the run's own object.
+   */
+  #stateOf(call: StepCall): Record<string, unknown> {
+    if (call.pipelineItem === undefined) return this.#state;
+    const key = itemKey(call.path, call.pipelineItem);
+    let item = this.#items.get(key);
+    if (item === undefined) {
+      item = { ...this.#state };
+      this.#items.set(key, item);
+    }
+    return item;
+  }
+
   /** A `.foreach()` item succeeded: its carried label goes (`handlers/control-flow.ts:1149-1152`). */
   #itemSucceeded(stepId: string, index: number): void {
     const labels = this.#carried.get(stepId);
@@ -287,14 +353,16 @@ export class MastraStepRunner implements StepRunner {
    * that metadata, so it is what is kept. Resume labels go to {@link resumeLabels}.
    */
   async run(stepId: string, input: unknown, call: StepCall): Promise<StepOutcome> {
-    const entry = this.#resolveStep(call.path, stepId);
+    const entry = call.pipelineItem === undefined ? this.#resolveStep(call.path, stepId) : this.#resolveStage(call.path, stepId).entry;
     const foreachIndex = call.foreachIndex;
     const step = this.#runnable(entry);
     const nested = step.component === NESTED_WORKFLOW;
     // A nested workflow started by a `.foreach()` runs under a fresh run id; anywhere else it
-    // shares the parent's (`handlers/step.ts:108-109,359`).
+    // shares the parent's (`handlers/step.ts:108-109,359`). A pipeline stage never has one.
     const nestedRunId = nested && foreachIndex !== undefined ? randomUUID() : undefined;
-    this.#lastView = call;
+    // A stage's view is its item's ([ADR 0015]), never the run's: it is not the one read for the
+    // run's resume labels or a published event's prior record.
+    if (call.pipelineItem === undefined) this.#lastView = call;
 
     // The attempt's gate ([ADR 0013], [ADR 0014]): transparent without a deadline or a preemption.
     // Released once the step settles.
@@ -338,11 +406,17 @@ export class MastraStepRunner implements StepRunner {
     gate: AttemptGate,
   ): Promise<StepOutcome> {
     const foreachIndex = call.foreachIndex;
+    // A pipeline stage ([ADR 0015]) is a step of the twin's child run: its events go to that run's
+    // own stream, which the parent's never sees, so it publishes no start and opens no span.
+    const stage = call.pipelineItem !== undefined;
+    const state = this.#stateOf(call);
 
     // Mastra's `stepCallId` (`handlers/step.ts:106`): one per step call, every retry sharing it — the
     // start event's, the result's and the writer's.
-    const stepCallId = this.#o.events?.callId(stepId, call.path, call.attempt, foreachIndex) ?? randomUUID();
-    const publishes = call.attempt === 0 && foreachIndex === undefined && this.#o.events?.enabled === true;
+    const stepCallId = stage
+      ? this.#stageCallId(stepId, call)
+      : (this.#o.events?.callId(stepId, call.path, call.attempt, foreachIndex) ?? randomUUID());
+    const publishes = !stage && call.attempt === 0 && foreachIndex === undefined && this.#o.events?.enabled === true;
     // `validateStepInput` (`handlers/step.ts:111-126`), **once per step call**: before the retry
     // loop in Mastra, so every attempt uses the one result. Its `inputData` is the span's input, the
     // start's payload, the record's and what the step sees; a schema with a transform or a
@@ -351,7 +425,7 @@ export class MastraStepRunner implements StepRunner {
     const { inputData, validationError } = await this.#validatedInput(stepId, input, call, step);
     // The step's span, before its start event and its first attempt (`handlers/step.ts:182-216`);
     // every retry shares it. Observation only: `StepSpans` keeps its own throws.
-    const stepSpan: AnySpan | undefined = await this.#o.spans?.step({ stepId, path: call.path, attempt: call.attempt, foreachIndex, iteration: call.iteration }, entry, inputData, input);
+    const stepSpan: AnySpan | undefined = stage ? undefined : await this.#o.spans?.step({ stepId, path: call.path, attempt: call.attempt, foreachIndex, iteration: call.iteration }, entry, inputData, input);
     if (publishes) {
       // Observation only: whatever building or publishing the start throws is kept, and the step runs.
       await this.#publishStart(stepId, inputData, call, feed, stepCallId).catch((error: unknown) => this.#o.events?.keep(error));
@@ -375,6 +449,13 @@ export class MastraStepRunner implements StepRunner {
     // a discarded attempt never touches the run's labels, so it can neither name a step whose record
     // is not `suspended` nor erase a label of the same name another step wrote.
     const pending: [string, ResumeLabel][] = [];
+    // What a label names. A pipeline stage's names what the twin's does ([ADR 0015]): the child run
+    // re-suspends the nested step under the same labels (`workflow.ts:3087`), which the parent's
+    // `suspend` records as the body at the item (`handlers/step.ts:399-411`) — so `Run.resume({ label
+    // })` resolves to the pipeline's id, which the engine refuses by name, never to a stage id.
+    const labelTarget: ResumeLabel = stage
+      ? { stepId: this.#resolveStage(call.path, stepId).body.id, foreachIndex: call.pipelineItem }
+      : { stepId: step.id, foreachIndex };
     // What `step.execute` returned — Mastra's `durableResult.output`, which scorers see (`handlers/step.ts:506`).
     let returned: { readonly value: unknown } | undefined;
     // The step's tracing context (`handlers/step.ts:352-356,382`): `mastra` wrapped with the step's
@@ -421,9 +502,8 @@ export class MastraStepRunner implements StepRunner {
             if (suspendError) throw suspendError;
             // Whether they stand is the verdict's, frozen when the step settles ([ADR 0014]).
             for (const label of labelsOf(options)) {
-              const target: ResumeLabel = { stepId: step.id, foreachIndex };
-              pending.push([label, target]);
-              if (!gate.decisive) this.#resumeLabels[label] = target;
+              pending.push([label, labelTarget]);
+              if (!gate.decisive) this.#resumeLabels[label] = labelTarget;
             }
             suspension = { data: suspendData };
             // Marks the attempt suspended; its stamped copy of the data is replaced below.
@@ -468,8 +548,8 @@ export class MastraStepRunner implements StepRunner {
       // The once-validated input: with the schemas hidden, the executor neither validates it again
       // nor the suspend data, which the step's `suspend` above validates (`handlers/step.ts:385-393`).
       input: foreachIndex === undefined ? inputData : itemAt(inputData, foreachIndex),
-      stepResults: this.#stepResults(call),
-      state: this.#state,
+      stepResults: this.#stepResults(stage ? this.#stageView(call) : call),
+      state,
       requestContext: this.#o.requestContext,
       retryCount: call.attempt,
       validateInputs: this.#o.validateInputs,
@@ -492,7 +572,8 @@ export class MastraStepRunner implements StepRunner {
     const frozen = gate.decisive ? { verdict: reportedVerdict(verdict, true) } : {};
     // Applied once the step has run without failing, suspended and bailed included, as the
     // default engine applies `contextMutations.stateUpdate` whenever the attempt returned.
-    if (raw['status'] !== 'failed' && stateUpdate !== undefined) Object.assign(this.#state, stateUpdate);
+    // A pipeline stage's update goes to its item's snapshot ([ADR 0015]), the run's at the item's merge.
+    if (raw['status'] !== 'failed' && stateUpdate !== undefined) Object.assign(state, stateUpdate);
     if (raw['status'] === 'success' && foreachIndex !== undefined) this.#itemSucceeded(stepId, foreachIndex);
     if (raw['status'] !== 'failed' && step.scorers) {
       // After the attempt that did not fail, before its record (`handlers/step.ts:501-514`). The hook
@@ -709,12 +790,52 @@ export class MastraStepRunner implements StepRunner {
    * expected — validates afresh.
    */
   async #validatedInput(stepId: string, input: unknown, call: StepCall, step: MastraStep): Promise<ValidatedInput> {
-    const key = `${call.path.join('.')}\u0000${stepId}\u0000${call.foreachIndex ?? ''}`;
+    const item = call.pipelineItem === undefined ? `${call.foreachIndex ?? ''}` : `p${call.pipelineItem}`;
+    const key = `${call.path.join('.')}\u0000${stepId}\u0000${item}`;
     const kept = this.#validated.get(key);
     if (call.attempt > 0 && kept !== undefined) return kept;
-    const validated: ValidatedInput = await validateStepInput({ prevOutput: input, step, validateInputs: this.#o.validateInputs });
+    let validated: ValidatedInput | undefined;
+    if (call.pipelineItem !== undefined) {
+      // Stage 0 of a pipeline ([ADR 0015]): the twin's foreach validates the item against the nested
+      // step — the body's input schema — before the child's first step validates it against its own
+      // (`handlers/step.ts:111-126`, then the child's). A body failure fails the item's stage 0 and
+      // every attempt of it, with the body's error, and the stage's own schema is never consulted.
+      // The child's `start` then validates it against the body's schema **again**
+      // (`workflow.ts:3761`, `_validateInput`), so a transform runs twice, as on the twin; that input
+      // is the child's `initData`, every stage's `getInitData()`. Both follow the run's
+      // `validateInputs`, which the parent hands the child (`handlers/step.ts:463`, `workflow.ts:2939`).
+      const { body, index } = this.#resolveStage(call.path, stepId);
+      if (index === 0) {
+        for (let pass = 0; pass < 2 && validated === undefined; pass++) {
+          const outer: ValidatedInput = await validateStepInput({ prevOutput: input, step: body, validateInputs: this.#o.validateInputs });
+          if (outer.validationError) validated = outer;
+          else input = outer.inputData;
+        }
+        if (validated === undefined) this.#itemInit.set(itemKey(call.path, call.pipelineItem), { value: input });
+      }
+    }
+    validated ??= await validateStepInput({ prevOutput: input, step, validateInputs: this.#o.validateInputs });
     this.#validated.set(key, validated);
     return validated;
+  }
+
+  /** A stage's view ([ADR 0015]) with its item's `initData` once stage 0 has validated it; see {@link #itemInit}. */
+  #stageView(call: StepCall): RunView {
+    const init = this.#itemInit.get(itemKey(call.path, call.pipelineItem!));
+    return init === undefined ? call : { ...call, initData: init.value };
+  }
+
+  /**
+   * A pipeline stage call's `stepCallId` ([ADR 0015]): new at the first attempt, the same for every
+   * retry — per item, since every item's stage runs at the foreach's one view path.
+   */
+  #stageCallId(stepId: string, call: StepCall): string {
+    const key = `${itemKey(call.path, call.pipelineItem!)}\u0000${stepId}`;
+    const known = this.#stageCalls.get(key);
+    if (call.attempt > 0 && known !== undefined) return known;
+    const id = randomUUID();
+    this.#stageCalls.set(key, id);
+    return id;
   }
 
   /**
@@ -959,6 +1080,24 @@ export class MastraStepRunner implements StepRunner {
     return candidate;
   }
 
+  /**
+   * A pipeline stage ([ADR 0015]): the `.foreach()` at the view path, whose body is the minted nested
+   * workflow, and the body's single-step entry with the stage's id — never the item, which is the
+   * call's input. `index` is the stage's position in the body.
+   */
+  #resolveStage(path: EntryPath, stepId: string): { readonly entry: SingleStepEntry; readonly body: MastraStep; readonly index: number } {
+    const top = this.#o.graph.steps[path[0]!];
+    const body = top?.type === 'foreach' && top.step.type === 'step' ? top.step.step : undefined;
+    const graph = (body as { readonly stepGraph?: unknown } | undefined)?.stepGraph;
+    const stages = Array.isArray(graph) ? (graph as StepFlowEntry[]) : [];
+    const index = stages.findIndex((e) => isSingle(e) && entryId(e) === stepId);
+    const entry = index < 0 ? undefined : stages[index];
+    if (body === undefined || entry === undefined || !isSingle(entry)) {
+      throw new Error(`no pipeline stage '${stepId}' at path ${path.join('-')} in workflow '${this.#o.workflowId}'`);
+    }
+    return { entry, body, index };
+  }
+
   #top<T extends StepFlowEntry['type']>(path: EntryPath, type: T, id: string): Extract<StepFlowEntry, { type: T }> {
     const top = this.#o.graph.steps[path[0]!];
     if (top === undefined || top.type !== type) {
@@ -1057,6 +1196,11 @@ function overlay(step: MastraStep, replaced: Record<string, unknown>): MastraSte
       return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
     },
   });
+}
+
+/** A pipeline item's key ([ADR 0015]): the foreach's view path and the item's index. */
+function itemKey(path: EntryPath, k: number): string {
+  return `${path.join('.')}\u0000${k}`;
 }
 
 /** A sparse array holding `item` at `index`, which `StepExecutor` indexes back to `item`. */
