@@ -702,7 +702,7 @@
   - [ ] Maintainer decision: a fair hand-off (row 115: with a fast stage 0 one item waits until
         stage 0's queue drains). FIFO was rejected for cost; rotating lane priority is the other
         option
-  - [ ] W2 integration, agents on disjoint files, each adversarially reviewed with mutants on `src/`
+  - [x] W2 integration, agents on disjoint files, each adversarially reviewed with mutants on `src/`
         (restored): `tests/engine/pipeline.test.ts` (W1 has success, failure, bail, cancel,
         suspend refusal, item state; still: overlap under ManualClock, failure drain, `limit(1)`
         peak, run budget 1, the entry `payload` as once-validated — row 112);
@@ -710,7 +710,22 @@
         differential on success / failure / cancel); `tests/verify/pipeline-blueprints.test.ts`
         (the W0 matrix, every family in every default segment, slowest query recorded, libpetri
         8.0.0 from npm, not linked)
+        Done: `tests/engine/pipeline.test.ts` (22, ManualClock and event gates, no timers, the
+        twin beside every precedence case), `tests/engine/pipeline-next.test.ts` (9: petri, a
+        forced clone and the pure-Mastra twin), `tests/verify/pipeline-blueprints.test.ts` (18:
+        11 shapes, slowest query 1.99 s, about 29 s alone, libpetri 8.0.0 from npm, not linked);
+        each reviewed twice with mutants in scratch copies. Open from review: a stranded run under
+        a Mastra signal hangs until the test timeout instead of failing as stranded (P2, P4, P6
+        die at 10 s); `verifyMastraWorkflow` has no total wall budget; no structure rule says
+        `split` gives `queue.closed` on one branch (the blueprint test pins it); row 117 could
+        also name the per-item entry's missing `__workflow_meta`
   - [ ] W3: ADR 0015 accepted with Evidence; rows 111–118 `fixed (M7b)`; CI green
+  - [ ] Maintainer decision: `verifyMastraWorkflow` also verifies the minted body as a nested
+        workflow (317–619 extra claims per shape), a petri net of a child this engine never runs;
+        skip pipeline bodies in `nestedWorkflows`, or keep them
+  - [ ] M8 note: a petri child under a default-engine parent does not write the parent's state in
+        place without a body `stateSchema`, where a default-engine child does (`workflow.ts:3646-3648`);
+        not reachable through `pipeline()` (the minted body carries the schema), a nested-workflow row
 - [ ] Second wave, after `pipeline()`: `supersede()`, `compensate()`, `circuitBreaker()`,
       `queue(depth)`, `correlate(key)`
 - [ ] Each blueprint ships with its property: `limit` with `placeBound`, `circuitBreaker` with
