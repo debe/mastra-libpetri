@@ -1,7 +1,7 @@
 # ADR 0015 — `pipeline()` compiles a `.foreach()` over a chain of stages into the parent net, one bound per stage, items handed lane to lane
 
 Status: proposed (2026-10-05, M7b second wave). Maintainer decisions taken (below, each the
-recommended option); the net to be measured by the W0 spike before W1.
+recommended option); amended by the W0 spike (below).
 
 ## Context
 
@@ -279,6 +279,60 @@ Taken 2026-10-05: 1 A, 2 A, 3 A, 4 A.
      every proof.
 
    **Recommended: A** — the twin's status, row 77's precedent, no resume segment. C is wave 2.
+
+## Amendment (W0 spike, 2026-10-05)
+
+Measured on a scratch gadget registered as `foreach` through `compile(..., { gadgets })`, each lane
+body the real leaf, the workflow `[pipeline 'per-doc', step 'report']`, `verify()` with every family
+in every default segment at 30 s a query; libpetri 8.0.0 from npm, not linked. 38 cases; every
+claim held, every result checked by verdict (`holds` from `proven` / a confirmed witness), and an
+independent agent re-ran all of them, reproducing the class counts exactly and the timings within 5%.
+
+| Fixture | Places / transitions | Classes closed / cancel | Slowest query | Workflow |
+|---|---|---|---|---|
+| (1,1) | 38–40 / 59 | 137 / 412 | 17 ms | 0.16 s |
+| (1,1,1), (2,1) | 46–48 / 76–78 | 971 / 2,914 | 170 ms | 0.37 s |
+| (1,2,1), (2,2) | 54–56 / 94–97 | 7,265 / 21,796 | 2.05 s | 3.9 s |
+| (1,1), (2,1), stage 1 retrying 2 × 5 ms, ± budget | 42–51 / 63–82 | timed (smt) | 3.2 s | 8.3 s |
+| foreach of 2 / 3 / 4 lanes, for comparison | 41–59 / 73–113 | 152 / 1,137 / 8,877 closed | 4.8 s | 14.5 s |
+
+- Classes depend on Σc_j alone, and run a little under a foreach of Σc_j lanes (no exit pair); the
+  workflow is about 3× cheaper (no resume segment). A run budget of 1 and a `limit(1)` on a stage
+  never change the count — a leaf takes and returns both in one firing — so the `limit` peak across
+  items stays *tested, not proven*, as above.
+- Under [VER-004] the only split is `t.cancel.arrive`; nothing opts out with `assumeAtomicFiring`.
+- The overlap is a definitive, confirmed `Violated` for every adjacent pair, by enumeration in at
+  most 555 ms; the trace holds item 1 at stage 1 while item 2 starts stage 0
+  (`split > stage0.lane0.start > fetch.run > stage0.lane0.to0 > stage0.lane0.start`).
+- **Fixed: two dead settles per lane.** `fail.again` and `suspend.again` with the queue open are
+  unreachable, since `exclusive(queue.open, fault)` and `exclusive(queue.open, susp)` are proven:
+  a raised flag means the queue is closed, and without the foreach's resume path nothing raises
+  `susp` beside an open queue. No family caught it (they are not step attempts); a reachability
+  query over each transition's inputs and reads did. Each settle kind is emitted in three variants
+  (open, closed, closed again), two transitions fewer per lane, class counts unchanged; one timed
+  query moved 0.9 -> 5.1 s, measured three times each way, still under 30 s. Structure rule 8: no
+  pipeline transition is unreachable from the arcs (a W1 test, not a claim).
+- Suspension coverage fails on every lane attempt, as expected: the `pipelineLaneAttempts`
+  exemption and structure rule 7 are W1's.
+
+Surface and twin facts, pinned in scratch (`tsc`) and on Mastra's default engine:
+
+- **The body is typed `PetriStep<TId, any, In<S[0]>, Out<Last<S>>>`**, not a petri `Workflow`: a
+  `Workflow` implements `Step<…, DefaultEngineType, …>` (`workflow.ts:1740`) and does not spread
+  into a petri `.foreach`; the factory re-brands it, as `createStep(workflow)` does. `const S` and a
+  tuple are required; `Chained<S>` puts the error on the offending stage; a default-engine stage, a
+  bound vector of the wrong length and an empty tuple are type errors. Checked to 60 stages.
+- **The twin's state depends on the body's `stateSchema`.** Without one, `_validateInitialState`
+  returns the parent's very object (`workflow.ts:3646-3648`), and the child mutates it in place
+  (`default.ts:710`, `:917`): a failed item's earlier-stage `setState` reaches the parent. With one,
+  the state is validated into a copy and a failed item merges nothing. **The minted body therefore
+  carries a copying state schema and `validateInputs: true`**, so the twin is the snapshot that
+  decision 3 describes, by construction rather than by the parent's options.
+- **A canceled, suspended or bailed item merges its state on the twin** (`setState(res.state)` on
+  every non-throwing path, `workflow.ts:3054`); only failed and tripwire items do not. A `drop`
+  therefore merges the item's state as a settle does — it still writes no frame entry.
+- Nothing validates the body's `outputSchema` at the child's end, nor any step's output
+  (`utils.ts:49-185`): a mismatching output is the item's, on both engines.
 
 ## Consequences
 

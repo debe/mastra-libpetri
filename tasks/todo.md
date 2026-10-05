@@ -643,7 +643,9 @@
         refused on resume. Defaults taken: c_j = 1, W = Σc_j (no window pool); unordered
         later-stage admission; rendezvous hand-off; nested-workflow stages refused; cancel drops
         every unsettled item (a hole)
-  - [ ] W0 spike (libpetri 8.0.0 from npm, `scripts/link-libpetri.sh --check` "not linked"): the
+  - [x] W0 spike (2026-10-05; ADR 0015 Amendment: 38 cases hold, slowest query 5.1 s, classes by
+        Σc_j alone; two dead settles per lane removed; body typed `PetriStep`, minted with a copying
+        state schema; a dropped item merges its state). Plan as it was: the
         drafted net with a leaf wrapper, c ∈ {(1,1), (1,1,1), (2,1), (1,2,1), (2,2)} × ± run budget 1
         × `limit(1)` on the widest stage, plus `limit(1)` shared by stages 0 and 2, plus one stage
         retrying 2 × 5 ms (SMT). Report classes closed / cancel, route, slowest query, and the same
