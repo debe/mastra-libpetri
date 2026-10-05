@@ -135,7 +135,10 @@ describe('agent and tool arms match by ref and options identity', () => {
 
 describe('the refusals', () => {
   it('are named in BLUEPRINT_REFUSALS', () => {
-    expect([...BLUEPRINT_REFUSALS].sort()).toEqual(['blueprint-arms', 'blueprint-position', 'blueprint-reused', 'quorum-value', 'race-empty']);
+    // The decision's five; ADR 0015 adds the pipeline's two (pinned in tests/compiler/pipeline-contract.test.ts).
+    expect([...BLUEPRINT_REFUSALS]).toEqual(
+      expect.arrayContaining(['blueprint-arms', 'blueprint-position', 'blueprint-reused', 'quorum-value', 'race-empty']),
+    );
   });
 
   it('blueprint-arms: the options spread onto other arms, reordered arms, fewer arms', () => {

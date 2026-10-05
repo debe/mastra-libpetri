@@ -1,5 +1,5 @@
 import { systemClock, type Clock } from 'libpetri';
-import type { RunScope } from '../compiler/scope.js';
+import type { ItemRecords, RunScope } from '../compiler/scope.js';
 import type { AttemptDeadline } from '../compiler/timeout.js';
 import type { EntryPath } from '../compiler/names.js';
 import type { StepPreemptedError } from '../compiler/preempt.js';
@@ -184,6 +184,14 @@ export class KernelRunScope implements RunScope {
   /** See `RunScope.forgetSuspension` ([ADR 0014]): forwarded to the runner, a no-op without its hook. */
   forgetSuspension(stepId: string): void {
     this.runner.forgetSuspension?.(stepId);
+  }
+
+  /**
+   * See `RunScope.itemRecords` ([ADR 0015]). Contract stub (M7b W0): W1 B builds the store. Reached
+   * only by a pipeline's actions, which nothing can compile yet.
+   */
+  itemRecords(path: EntryPath, k: number): ItemRecords {
+    throw new Error(`itemRecords([${path.join(', ')}], ${k}): not implemented (M7b W1)`);
   }
 
   /**

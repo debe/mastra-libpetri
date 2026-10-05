@@ -7,6 +7,7 @@ import type {
   Exits,
   FlowToken,
   PlaceClaim,
+  PipelineSite,
   Pool,
   PreemptedToken,
   QuotaRef,
@@ -48,6 +49,12 @@ export interface GadgetResult {
    * the builder into `CompiledWorkflow.decisions`; every name must be a place or transition of the net.
    */
   readonly decisions?: readonly DecisionSite[];
+  /**
+   * The pipelines this gadget owns ([ADR 0015]) — one per `.foreach()` carrying a `pipeline`. Collected
+   * by the builder into `CompiledWorkflow.pipelines`; every name must be a place or transition of the
+   * net.
+   */
+  readonly pipelines?: readonly PipelineSite[];
 }
 
 /**
@@ -114,6 +121,12 @@ export interface GadgetContext {
    */
   readonly preempt: ArmPreemption | undefined;
   /**
+   * `true` when this entry is a pipeline stage's lane body ([ADR 0015]): the leaf reads and records
+   * through the item's store (see `NestedOptions.item`). `undefined` everywhere else, and then the
+   * leaf emits exactly today's attempts. Only the leaf reads it.
+   */
+  readonly item: true | undefined;
+  /**
    * One step occurrence's member of a quota place ([ADR 0012]) — the leaf calls it for each
    * `StepDescription.quotas` entry: `role: 'pool'` for every quota (a `limit`'s pool, a `rateLimit`'s
    * bucket), and `'spent'` / `'demand'` for a `rateLimit` only (asking either of a `limit` throws).
@@ -178,6 +191,17 @@ export interface NestedOptions {
   readonly cancel?: Place<null>;
   /** The arm's preemption ([ADR 0014]); only `firstKGadget` passes one. Defaults to none. */
   readonly preempt?: ArmPreemption;
+  /**
+   * The step is a pipeline stage's lane body ([ADR 0015], maintainer decision 3: item scope at twin
+   * parity); only `pipelineGadget` passes it. The leaf then reads and writes through the item's store,
+   * `RunScope.itemRecords(viewPath, k)` with `k` the token's `foreachIndex`: the view's `initData` is
+   * the item and its `getStepResult` the item's own records, and every record the attempt writes goes
+   * there instead of `recordStepResult` — as a stage of the twin's child run sees only that child.
+   * The runner call carries `StepCall.pipelineItem = k` and no `foreachIndex`; the token outputs keep
+   * `foreachIndex = k`, so the hand-offs and settles know the item.
+   * Absent (every other step), the leaf emits and acts exactly as before.
+   */
+  readonly item?: true;
 }
 
 /**

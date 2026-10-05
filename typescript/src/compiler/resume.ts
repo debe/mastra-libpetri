@@ -39,12 +39,16 @@ export interface ResumeSeed {
  *   changed between suspend and resume. Mastra resumes blindly; this engine refuses by name
  *   (`docs/divergences.md`);
  * - `foreach-nested` — a nested workflow inside a `.foreach()`, refused until a fixture exists;
+ * - `pipeline` — a suspended `pipeline()` stage ([ADR 0015], maintainer decision 4): the pipeline
+ *   ends `suspended` with the foreach's aggregate shape, but registers no resume site; resolved from
+ *   `CompiledWorkflow.pipelines` (by the foreach's path, or the body's id) before `no-site` is said.
+ *   Resumable at (item, stage) is wave 2;
  * - `unsupported` — a stored shape the design does not resume (e.g. a parallel arm with no record).
  */
 export class UnresumablePositionError extends Error {
   override readonly name = 'UnresumablePositionError';
   constructor(
-    readonly reason: 'no-site' | 'id-mismatch' | 'foreach-nested' | 'unsupported',
+    readonly reason: 'no-site' | 'id-mismatch' | 'foreach-nested' | 'pipeline' | 'unsupported',
     readonly path: EntryPath,
     message: string,
   ) {

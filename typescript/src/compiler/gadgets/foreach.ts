@@ -1,5 +1,6 @@
 import { Transition, and, one, outPlace, place, xor, type Out, type Place, type TransitionContext } from 'libpetri';
 import { scopeOf, type RunScope } from '../scope.js';
+import { pipelineGadget } from '../blueprints/pipeline.js';
 import type {
   BailToken,
   CanceledToken,
@@ -337,6 +338,8 @@ const MAX_ITEMS = 2 ** 32 - 1;
  */
 export const foreachGadget: Gadget = (entry, next, ctx) => {
   if (entry.kind !== 'foreach') throw new Error(`foreachGadget received a '${entry.kind}' entry`);
+  // A pipeline ([ADR 0015]) is its own gadget; without one this is exactly today's foreach.
+  if (entry.pipeline !== undefined) return pipelineGadget(entry, next, ctx);
   // The IR narrows the body to a single step, as Mastra's `SingleStepEntry` does. Checked at run
   // time too, because a caller outside the type system could still hand us a combinator.
   if ((entry.body as { kind: string }).kind !== 'step') {

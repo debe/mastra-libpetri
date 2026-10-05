@@ -48,9 +48,9 @@ export const LAYER2_METADATA_KEYS = ['checkpoint', 'concurrency'] as const;
 export type Layer2MetadataKey = (typeof LAYER2_METADATA_KEYS)[number];
 
 /**
- * The refusals of a counted decision ([ADR 0014]) — Layer 3, so not a {@link LAYER2_METADATA_KEYS}
- * entry: the decision rides in `metadata` under a symbol (`BLOCK_DECISION`), which no string key
- * names and the default engine never reads. Each is a prefix of `UnsupportedWorkflowError.reason`,
+ * The refusals of a blueprint — a counted decision ([ADR 0014]) and a pipeline ([ADR 0015]) — Layer 3,
+ * so not a {@link LAYER2_METADATA_KEYS} entry: each rides in `metadata` under a symbol
+ * (`BLOCK_DECISION`, `FOREACH_PIPELINE`), which no string key names and the default engine never reads. Each is a prefix of `UnsupportedWorkflowError.reason`,
  * as every refusal's name is, and recorded in `docs/divergences.md`.
  *
  * - `quorum-value` — `k` is not a whole number in [1, n] (a forged or altered `Decision`).
@@ -65,8 +65,29 @@ export type Layer2MetadataKey = (typeof LAYER2_METADATA_KEYS)[number];
  *   catches it: neither Mastra nor this adapter refuses two entries with one id (names are by path),
  *   so a decision is one block, and a second block needs its own `race` / `quorum` call. Scoped to
  *   this workflow's description, as `quota-id-collision` is: a nested workflow is adapted on its own.
+ *
+ * A pipeline ([ADR 0015]) adds two names and reuses the three above, thrown at mint by
+ * `init().pipeline` and repeated here against a forged or altered entry:
+ *
+ * - `pipeline-empty` — no stages.
+ * - `pipeline-value` — a bound not a whole number ≥ 1; a bound vector whose length is not the stage
+ *   count; Σc_j above `MAX_FOREACH_LANES`; the entry's `opts.concurrency` not Σc_j (a hand-altered
+ *   entry, or a resolver function).
+ * - `blueprint-arms` — a stage listed twice, two stages sharing an id, a nested-workflow stage; the
+ *   entry's step not the minted body; the body's step graph not exactly the minted stages, by kind.
+ * - `blueprint-position` — the pipeline marker on any entry but a `.foreach()`, or any blueprint
+ *   marker on a stage's own metadata.
+ * - `blueprint-reused` — one minted `Pipeline` on two `.foreach()` entries.
  */
-export const BLUEPRINT_REFUSALS = ['quorum-value', 'race-empty', 'blueprint-arms', 'blueprint-position', 'blueprint-reused'] as const;
+export const BLUEPRINT_REFUSALS = [
+  'quorum-value',
+  'race-empty',
+  'blueprint-arms',
+  'blueprint-position',
+  'blueprint-reused',
+  'pipeline-empty',
+  'pipeline-value',
+] as const;
 
 /** One of {@link BLUEPRINT_REFUSALS}. */
 export type BlueprintRefusal = (typeof BLUEPRINT_REFUSALS)[number];

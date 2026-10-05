@@ -8,6 +8,7 @@ export { foreachGadget, MAX_FOREACH_LANES } from './gadgets/foreach.js';
 export type { ArmPreemption, Gadget, GadgetContext, GadgetResult, NestedOptions } from './gadgets/types.js';
 export { firstKGadget, QuorumNotMetError, settledBound } from './blueprints/first-k.js';
 export type { ArmStatus } from './blueprints/first-k.js';
+export { pipelineGadget } from './blueprints/pipeline.js';
 export {
   NameVocabulary,
   pathSegment,
@@ -28,7 +29,7 @@ export type { EntryPath, QuotaRole } from './names.js';
 export { StepTimeoutError } from './timeout.js';
 export type { AttemptDeadline } from './timeout.js';
 export { RUN_SCOPE_KEY, scopeOf, viewOf } from './scope.js';
-export type { RunScope } from './scope.js';
+export type { ItemRecords, RunScope } from './scope.js';
 export type {
   BailToken,
   BuildOrRun,
@@ -73,6 +74,9 @@ export type {
   BlockDecision,
   DecisionSite,
   PreemptedToken,
+  ForeachPipeline,
+  PipelineSite,
+  PipelineLaneSite,
 } from './types.js';
 export { resumeSeed, UnresumablePositionError } from './resume.js';
 export { HostPreconditionError } from './gadgets/leaf.js';

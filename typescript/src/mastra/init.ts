@@ -30,6 +30,14 @@ import {
   type QuotaOptions,
   type StepResources,
 } from './resources.js';
+import {
+  bindPipeline,
+  type Chained,
+  type PipelineBody,
+  type PipelineEntryOptions,
+  type PipelineOptions,
+  type PipelineStages,
+} from './pipeline.js';
 
 declare const petriEngine: unique symbol;
 
@@ -281,6 +289,28 @@ export type PetriQuorum = <const TArms extends readonly PetriStep<string, any, a
   options?: DecisionOptions,
 ) => [arms: TArms, options: DecisionEntryOptions];
 
+/**
+ * `init().pipeline` ([ADR 0015]): a `.foreach()` over a chain of stages, compiled into the parent net
+ * with `c_j` lanes per stage, each item handed lane to lane — stage 2 of item 1 runs while stage 1 of
+ * item 2 does. Spread into Mastra's own `.foreach()`:
+ *
+ * ```ts
+ * wf.foreach(...pipeline([fetchDoc, embed, store], { id: 'per-doc', concurrency: [2, 1, 1] }))
+ * ```
+ *
+ * `S` is a `const` tuple of petri steps: the brand gates every stage ([ADR 0002]), and
+ * {@link Chained} makes a stage whose input does not accept the previous stage's output a type error
+ * on that stage. The body is a petri step from stage 0's input to the last stage's output; on
+ * `DefaultExecutionEngine` the entry runs as `.foreach(nestedWorkflow, { concurrency: Σc_j })`, the
+ * twin. Stages run in the parent's run — retries per stage under the parent's `retryConfig`, a stage
+ * `limit` one quota across items, records and `getInitData()` per item, no child runs; a suspended
+ * stage ends the run `suspended` and its resume is refused (`pipeline`).
+ */
+export type PetriPipeline = <const S extends PipelineStages, const TId extends string>(
+  stages: S & Chained<S>,
+  options: PipelineOptions<TId, S>,
+) => [body: PipelineBody<TId, S>, options: PipelineEntryOptions];
+
 /** What {@link init} returns. */
 export interface PetriFactories {
   readonly createWorkflow: PetriCreateWorkflow;
@@ -294,6 +324,8 @@ export interface PetriFactories {
   readonly race: PetriRace;
   /** Layer 3 ([ADR 0014]): `k` successes of a `.parallel()` decide it. */
   readonly quorum: PetriQuorum;
+  /** Layer 3 ([ADR 0015]): a `.foreach()` over a chain of stages, one bound per stage. */
+  readonly pipeline: PetriPipeline;
 }
 
 /**
@@ -368,7 +400,16 @@ export function init(options: PetriInitOptions = {}): PetriFactories {
     return clone;
   }) as unknown as PetriCloneStep;
 
-  return { createWorkflow, createStep, cloneStep, limit, rateLimit, race: race as PetriRace, quorum: quorum as PetriQuorum };
+  return {
+    createWorkflow,
+    createStep,
+    cloneStep,
+    limit,
+    rateLimit,
+    race: race as PetriRace,
+    quorum: quorum as PetriQuorum,
+    pipeline: bindPipeline(createWorkflow),
+  };
 }
 
 /**

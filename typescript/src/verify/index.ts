@@ -21,6 +21,7 @@ export {
 export { budgetStructureViolations } from './budget.js';
 export { poolSinks, poolStructureViolations } from './pools.js';
 export { decisionStructureViolations } from './decision.js';
+export { pipelineLaneAttempts, pipelineStructureViolations } from './pipeline.js';
 export { verify, describeClaim, describeUnclaimedTarget, provenOnlyAssumingAtomic, FAMILIES, OVER_APPROXIMATION_NOTE } from './workflow.js';
 export type { ClaimReport, Family, VerificationReport, WorkflowVerifyOptions } from './workflow.js';
 export { boundClaims, decisionTargets, exclusions, livenessTargets, retryCeilingViolations, unclaimedTargets } from './claims.js';

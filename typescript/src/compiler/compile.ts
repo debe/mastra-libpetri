@@ -35,6 +35,7 @@ import type {
   FailureToken,
   FlowToken,
   PauseToken,
+  PipelineSite,
   PlaceClaim,
   Pool,
   QuotaRef,
@@ -125,6 +126,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
   const gadgetPools: Pool[] = [];
   // Counted decisions ([ADR 0014]): one per race / quorum block, in emission order.
   const decisions: DecisionSite[] = [];
+  // Pipelines ([ADR 0015]): one per `.foreach()` carrying a `pipeline`, in emission order.
+  const pipelines: PipelineSite[] = [];
   // Resume sites ([ADR 0007]), keyed by path; a gadget registers its own through GadgetResult.
   const resumeSites = new Map<string, ResumeSite>();
   const pathToEntry = new Map<string, { entryId: string; kind: EntryDescription['kind'] }>();
@@ -229,6 +232,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
       cancel: nested.cancel,
       // [ADR 0014]: only a deciding block's arms carry one; every other entry emits as before.
       preempt: nested.preempt,
+      // [ADR 0015]: only a pipeline stage's lane body carries it; every other entry emits as before.
+      item: nested.item,
       permits,
       stepAttempt: (transitionName) => {
         stepAttempts.push(transitionName);
@@ -276,6 +281,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
     exclusions.push(...(result.exclusions ?? []));
     gadgetPools.push(...(result.pools ?? []));
     decisions.push(...(result.decisions ?? []));
+    pipelines.push(...(result.pipelines ?? []));
     return result;
   };
 
@@ -457,6 +463,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
     boundaries,
     checkpoints,
     decisions,
+    pipelines,
     structuralHash: structuralHash(description, checkpoints, names.names()),
   };
 }
@@ -530,7 +537,7 @@ function registerQuota(quotas: Map<string, QuotaPlaces>, names: NameVocabulary, 
 
 /**
  * Every step's quota refs, read left to right through the description — arms, loop and foreach
- * bodies included — with where each was seen. A step naming one id twice is refused: one attempt
+ * bodies and pipeline stages ([ADR 0015]) included — with where each was seen. A step naming one id twice is refused: one attempt
  * would take two tokens of one quota in one firing, which no author means.
  */
 function quotaRefsOf(description: WorkflowDescription): readonly (readonly [QuotaRef, string])[] {
@@ -548,8 +555,13 @@ function quotaRefsOf(description: WorkflowDescription): readonly (readonly [Quot
       case 'step': step(entry, String(i)); break;
       case 'parallel':
       case 'branch': entry.arms.forEach((arm, a) => step(arm, `${i}-${a}`)); break;
-      case 'loop':
-      case 'foreach': step(entry.body, String(i)); break;
+      case 'loop': step(entry.body, String(i)); break;
+      case 'foreach':
+        step(entry.body, String(i));
+        // [ADR 0015]: a pipeline's stages draw on quotas at the parent's run scope; its body is the
+        // minted nested workflow and carries none. Stage order, after the body.
+        entry.pipeline?.stages.forEach((stage, j) => step(stage, `${i} stage ${j}`));
+        break;
       case 'sleep':
       case 'sleepUntil': break;
     }
@@ -649,7 +661,19 @@ function structuralHash(description: WorkflowDescription, checkpoints: readonly 
         ];
       case 'branch': return [entry.kind, entry.id, entry.arms.map(step), ...block(entry.arms, entry.concurrency)];
       case 'loop': return [entry.kind, entry.id, entry.loopType, entry.iterationBound, step(entry.body)];
-      case 'foreach': return [entry.kind, entry.id, entry.concurrency, step(entry.body)];
+      case 'foreach':
+        // M7b ([ADR 0015]): a pipeline's stages and bounds join the shape only when present, so an
+        // unannotated `.foreach()` hashes exactly as before — the names alone do not separate two
+        // bound vectors of one Σc_j split differently, nor two stages' retries or quotas.
+        return [
+          entry.kind,
+          entry.id,
+          entry.concurrency,
+          step(entry.body),
+          ...(entry.pipeline !== undefined
+            ? [{ pipeline: { stages: entry.pipeline.stages.map(step), bounds: [...entry.pipeline.bounds] } }]
+            : []),
+        ];
     }
   };
   // Checkpoints join the key only when there are any, so an unmarked description hashes byte for

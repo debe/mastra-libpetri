@@ -82,12 +82,53 @@ export interface RunScope {
    */
   forgetSuspension(stepId: string): void;
   /**
+   * Item `k`'s store in the pipeline at `path` ([ADR 0015], maintainer decision 3: item scope at twin
+   * parity) — created on first ask, one per (pipeline, item) per segment. `path` is the foreach's
+   * top-level path, which every lane body sees as its view path; `k` is the item's index, the lane
+   * token's `foreachIndex`. A stage's leaf (`NestedOptions.item`) reads the item as its `initData` and
+   * its own records through it, and records there instead of {@link recordStepResult}, so a stage's
+   * `getStepResult('fetch')` reads **this item's** `fetch`, as a stage of the twin's child run does,
+   * and the run's step map gains no stage keys. The pipeline opens it at stage 0's `start` and forgets
+   * it at the item's collect, bail, pause, settle or drop.
+   */
+  itemRecords(path: EntryPath, k: number): ItemRecords;
+  /**
    * Hands a lifecycle event to the runner's `observe` ([ADR 0008]). `undefined` when the runner has
    * none, so an action awaits nothing and a run without an observer fires exactly as before. The
    * promise never rejects: an observer's throw or rejection is kept for the run's report, never
    * turned into a failed firing that would strand the tokens it consumed ([EXEC-031]).
    */
   observe(event: LifecycleEvent): Promise<void> | undefined;
+}
+
+/**
+ * One pipeline item's own scope ([ADR 0015]): what a twin child run would hold for it — its input
+ * and the records of the stages it has run. State is not here: the runner holds the item's state
+ * snapshot (`StepRunner.openItem` / `closeItem`), and this store is how the pipeline's transitions
+ * reach it — {@link open} snapshots, {@link forget} merges or discards.
+ *
+ * Item `k` travels the lanes as `FlowToken.foreachIndex = k` (stage 0's `start` sets it, each
+ * hand-off carries it), so a stage's leaf and every lane exit token name their item.
+ */
+export interface ItemRecords {
+  /** The item, as stage 0 received it — what a stage's `getInitData()` returns. Set by {@link open}. */
+  readonly initData: unknown;
+  /**
+   * Opens the store for a newly admitted item, at stage 0's `start`: sets {@link initData}; records
+   * start empty; and the runner snapshots the run's state for the item (`StepRunner.openItem`), as
+   * the twin's child run takes it at item start (`workflow.ts:3006`).
+   */
+  open(initData: unknown): void;
+  getStepResult(stepId: string): StepRecord | undefined;
+  recordStepResult(stepId: string, record: StepRecord): void;
+  /**
+   * Drops the store: the item has left the pipeline. A later {@link RunScope.itemRecords} starts
+   * fresh. `state` is what becomes of the item's state snapshot (`StepRunner.closeItem`), as the twin
+   * merges a child's state on every non-throwing return (`workflow.ts:3054-3055`, the ADR's
+   * amendment): `'merge'` at a collect, a bail, a pause, a suspend settle and **every drop**;
+   * `'discard'` at a fail settle (failed and tripwire alike).
+   */
+  forget(state: 'merge' | 'discard'): void;
 }
 
 /** The run scope of the firing in progress. Throws if the kernel did not supply one. */

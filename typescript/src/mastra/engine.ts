@@ -816,6 +816,8 @@ const REASONS: Record<UnresumablePositionError['reason'], (e: UnresumablePositio
   'no-site': (e) => `nothing at that position can be resumed (${e.message})`,
   'id-mismatch': () => 'the workflow changed since the run suspended',
   'foreach-nested': () => 'a nested workflow inside a .foreach() cannot be resumed yet',
+  // [ADR 0015]: never thrown until W1 C resolves it in `resumeSeed`.
+  pipeline: () => 'a suspended pipeline() stage cannot be resumed yet',
   unsupported: (e) => e.message,
 };
 

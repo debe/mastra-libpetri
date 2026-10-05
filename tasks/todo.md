@@ -654,10 +654,16 @@
         table. Also pin: spread inference of `pipeline(...)` into `.foreach` and `Chained<S>` under
         `npm run check`; whether the twin merges state for a failed item; whether the child
         validates the body's output schema at its end
-  - [ ] W0 contract (lead): `ForeachPipeline` on the foreach description, `PipelineSite` and
+  - [x] W0 contract (2026-10-05), reviewed: 240 unannotated workflows compile identically to HEAD
+        (net, arcs, `netMap`; `structuralHash` identical bar Mastra's random sleep ids). Review fixes:
+        `ItemRecords.forget('merge' | 'discard')` with `StepRunner.openItem` / `closeItem`;
+        `StepCall.pipelineItem` (the runner sees `[i]`, never `[i, L]`); settles and drops on the
+        lane site by kind, so rules 4 and 7 read names, not arcs; rule 4 reworded. Every drop merges
+        the item's state (W2's cancel differential tests `drop.failed`). Plan as it was:
+        `ForeachPipeline` on the foreach description, `PipelineSite` and
         `CompiledWorkflow.pipelines` / `GadgetResult.pipelines`, `NestedOptions.item`,
         `RunScope.itemRecords`, `ResumeRefusal.reason 'pipeline'`, `FOREACH_PIPELINE` / `Pipeline` /
-        `pipelineOf`, `PetriPipeline` on `init()`, the three new `BLUEPRINT_REFUSALS`,
+        `pipelineOf`, `PetriPipeline` on `init()`, the two new `BLUEPRINT_REFUSALS` (`pipeline-empty`, `pipeline-value`),
         `pipelineStructureViolations`, `pipelineLaneAttempts`; `structuralHash` carries the
         pipeline only when present; rows 111–118 `planned (M7b)`. Stubs throw
         `not implemented (M7b W<n>)`; an unannotated workflow compiles and hashes as before.

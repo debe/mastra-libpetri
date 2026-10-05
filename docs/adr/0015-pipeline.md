@@ -223,8 +223,9 @@ and the entry runs as `.foreach(nestedWorkflow, { concurrency: Σc_j })`, the tw
     `slot_{j,l}`, `permit_{j+1,m}`, inhibited by `wf.cancel`, and gives exactly `body_{j+1,m}`,
     `slot_{j+1,m}`, `permit_{j,l}`; (2) stage j+1's body has no producer but stage-j hand-offs,
     stage 0's none but `start`, and only `start` / `refuse` / settles take `queue.open`; (3) every
-    transition consuming a slot produces at most one slot; (4) every lane exit has exactly one
-    `¬cancel` consumer and one `drop` reading `cancel`; (5) every finisher takes every permit of
+    transition consuming a slot produces at most one slot; (4) every lane exit's consumers are
+    exactly the declared ones on the site — its settle variants, or for `done` its hand-offs or
+    collect — each `¬cancel`, plus one `drop` reading `cancel`; (5) every finisher takes every permit of
     every stage plus `queue.closed` and `frame`; (6) no pipeline place carries an inhibitor, reset
     or drain; (7) a suspended lane exit reaches only its own settle or drop. Mutants: a hand-off
     without the next permit; an inhibitor on `fault` added to a hand-off; a finisher missing a

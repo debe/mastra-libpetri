@@ -21,6 +21,7 @@ export type {
   PetriFactories,
   PetriInitOptions,
   PetriLimit,
+  PetriPipeline,
   PetriQuorum,
   PetriRace,
   PetriRateLimit,
@@ -34,6 +35,7 @@ export { StepPreemptedError } from '../compiler/preempt.js';
 export { QuorumNotMetError } from '../compiler/blueprints/first-k.js';
 export type { ArmStatus } from '../compiler/blueprints/first-k.js';
 export type { DecisionEntryOptions, DecisionOptions, QuotaOptions } from './resources.js';
+export type { Chained, PipelineBody, PipelineEntryOptions, PipelineOptions, PipelineStage, PipelineStages } from './pipeline.js';
 export { PetriExecutionEngine, UnsupportedRunModeError } from './engine.js';
 export type { PetriEngineOptions, RestartRefusalReason, UnsupportedRunMode } from './engine.js';
 export { restartActiveRuns } from './recovery.js';

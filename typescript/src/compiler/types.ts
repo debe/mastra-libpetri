@@ -147,7 +147,33 @@ export type EntryDescription =
       readonly id: string;
       readonly body: StepDescription;
       readonly concurrency: number;
+      /**
+       * The stages the body is compiled from ([ADR 0015]) — Layer 3, from `init().pipeline`: the
+       * foreach's `body` stays the minted nested workflow (`source: 'workflow'`, what Mastra records the
+       * aggregate under), and the net runs these stages instead, item by item, lane to lane. Absent,
+       * the entry is today's foreach and compiles, and hashes, exactly as before M7b's second wave.
+       */
+      readonly pipeline?: ForeachPipeline;
     };
+
+/**
+ * A `.foreach()`'s stage chain ([ADR 0015]): `stages[0] -> … -> stages[s-1]`, each a single step
+ * (a step, an agent or a tool — a nested workflow is refused, M8 compiles those), adapted with the
+ * **parent's** options, so `retries`, `timeoutMs` and `quotas` are each stage's own at the parent's
+ * run scope (maintainer decision 2). `bounds[j]` is stage `j`'s lane count `c_j`, a whole number ≥ 1;
+ * `bounds.length === stages.length ≥ 1`, and Σ`bounds` — the item window W — equals the entry's
+ * `concurrency` and is at most `MAX_FOREACH_LANES`. The adapter refuses anything else
+ * (`pipeline-empty`, `pipeline-value`); the compiler throws on it, naming the foreach, in case a
+ * hand-built description slips past.
+ *
+ * Stage `j`, lane `l` is flattened to `L = Σ_{i<j} c_i + l`, and its attempts are named at `[i, L]`
+ * and viewed at the foreach's `[i]`, so the runner and suspension coverage keep a foreach's
+ * `[i, lane]` shape. One proof covers every item count: the item index is colour.
+ */
+export interface ForeachPipeline {
+  readonly stages: readonly StepDescription[];
+  readonly bounds: readonly number[];
+}
 
 /**
  * A block's own bound on its fan-out ([ADR 0011]) — Layer 2, from `metadata: { concurrency: c }` in
@@ -416,6 +442,16 @@ export interface StepCall extends RunView {
    * engine runs a retry under an aborted signal.
    */
   readonly preempt?: AbortSignal;
+  /**
+   * The pipeline item this attempt runs ([ADR 0015]): present exactly when the attempt is a pipeline
+   * stage's (the leaf's `GadgetContext.item`), and then {@link foreachIndex} is absent — a stage runs
+   * as a step of the twin's child run, so the runner does no `foreachIdx` lookup of the input (the
+   * input is the call's data), mints no `nestedRunId` and publishes no step start or result event.
+   * `path` is still the foreach's view path; the runner resolves the stage by `stepId` within the
+   * pipeline's body, and reads and writes the item's state snapshot (`openItem` / `closeItem`) by
+   * `(path, pipelineItem)`.
+   */
+  readonly pipelineItem?: number;
 }
 
 /**
@@ -532,6 +568,23 @@ export interface StepRunner {
    * child run's own snapshot suspended in storage — a residual ([ADR 0014], row 107).
    */
   forgetSuspension?(stepId: string): void;
+
+  /**
+   * A pipeline item was admitted ([ADR 0015], maintainer decision 3): snapshot the run's state for
+   * item `k` of the pipeline at `path`, as the twin's child run does at its start (`workflow.ts:3006`).
+   * Every stage attempt with `StepCall.pipelineItem === k` then runs against, and `setState`s into,
+   * that snapshot. Called through `ItemRecords.open` at stage 0's `start`. Optional: a runner that
+   * keeps no state needs none.
+   */
+  openItem?(path: EntryPath, k: number): void;
+
+  /**
+   * Item `k` left the pipeline at `path` ([ADR 0015]): `'merge'` `Object.assign`s its snapshot into
+   * the run's state (`workflow.ts:3055`, `default.ts:709-713` — last to settle wins each key, as on
+   * the default engine), `'discard'` drops it. Called through `ItemRecords.forget`; see there for
+   * which transition says which.
+   */
+  closeItem?(path: EntryPath, k: number, state: 'merge' | 'discard'): void;
 }
 
 /**
@@ -946,6 +999,129 @@ export interface DecisionSite {
 }
 
 /**
+ * One `pipeline()` as the verifier and the resume refusal see it ([ADR 0015], amended by the W0
+ * spike): its places and transitions, by name, as `compiler/blueprints/pipeline.ts` emitted them, so
+ * `verify/pipeline.ts` can check them on the arcs, `verify/claims.ts` can name its bounds, exclusions
+ * and overlap query, and `compiler/resume.ts` can refuse a resume at it by name (`pipeline`) —
+ * declared by the gadget, never derived from the arcs the check inspects.
+ *
+ * ```text
+ * cancel                      ?cancel   in -> exits.canceled                         (only with a signal)
+ * split                       ¬cancel   in -> xor(open(queue.open) | open(queue.closed) | exits.failed)
+ *                                       open(q) = frame + q + no-fault + no-susp + every permit
+ * stage0.lane{l}.start        ¬cancel   queue.open + permit_{0,l} -> body_{0,l} + slot_{0,l} + queue.{open|closed}
+ * stage0.lane{l}.refuse       ?cancel   queue.open + permit_{0,l} -> queue.closed + permit_{0,l}
+ * stage{j}.lane{l}.to{m}      ¬cancel   done_{j,l} + slot_{j,l} + permit_{j+1,m}
+ *                                       -> body_{j+1,m} + slot_{j+1,m} + permit_{j,l}          (j < s-1)
+ * stage{s-1}.lane{l}.collect  ¬cancel   done + slot + frame -> frame + permit
+ * stage{j}.lane{l}.bail       ¬cancel   bailed + slot + frame -> frame + permit
+ * stage{j}.lane{l}.pause      ¬cancel   paused + slot + frame -> frame + permit
+ * stage{j}.lane{l}.{fail|suspend}[.queue-closed[.again]]   ¬cancel, priority 1
+ *                                       exit + slot + frame + queue.{open|closed} + {no-K|K}
+ *                                       -> frame + permit + queue.closed + K   (three variants: the
+ *                                       open-queue `.again` is dead — `exclusive(queue.open, K)` — and
+ *                                       not emitted)
+ * stage{j}.lane{l}.drop.{done,failed,bailed,suspended,paused}  ?cancel   exit + slot -> permit
+ * join, fail.{clean,s}, suspend, canceled.{clean,f,s,fs}
+ *                                       queue.closed + frame + every permit + the flags -> next | exits.*
+ * ```
+ *
+ * Every pipeline place is 1-bounded and none carries an inhibitor, reset, `all()`, drain or
+ * `atLeast()`: the only non-monotone place stays `wf.cancel`, so under [VER-004] the only split is
+ * `t.cancel.arrive`. No exit pair, no resume place, no window pool.
+ */
+export interface PipelineSite {
+  /** The foreach's top-level path, `[i]` — every lane's view path, and the refused resume path. */
+  readonly path: EntryPath;
+  /** The foreach entry's id. */
+  readonly foreachId: string;
+  /** The minted body's id — what Mastra records the aggregate, and a suspension, under. */
+  readonly bodyId: string;
+  /** The stage step ids, stage order. */
+  readonly stages: readonly string[];
+  /** `c_j`, stage order; Σ is the item window. */
+  readonly bounds: readonly number[];
+  /** The one data token, `split` to finisher: input, results, recorded outcomes. */
+  readonly frame: string;
+  readonly queueOpen: string;
+  readonly queueClosed: string;
+  /** The complement pairs: exactly one of each marked from `split` to the finisher. */
+  readonly fault: string;
+  readonly noFault: string;
+  readonly susp: string;
+  readonly noSusp: string;
+  /** The cancel sweep on the input; `undefined` when the foreach was compiled without a signal. */
+  readonly cancelSweep: string | undefined;
+  readonly split: string;
+  /** Every lane, stage-major: `lanes[L]` is flattened lane `L`. */
+  readonly lanes: readonly PipelineLaneSite[];
+  /** `join`, `fail.clean`, `fail.s`, `suspend`, then `canceled.{clean,f,s,fs}` when a signal is given. */
+  readonly finishers: readonly string[];
+}
+
+/** One lane of a {@link PipelineSite}: stage `stage`, lane `lane`, flattened `flat`. */
+export interface PipelineLaneSite {
+  readonly stage: number;
+  readonly lane: number;
+  /** `L = Σ_{i<stage} c_i + lane`: the lane body's naming path is `[...site.path, L]`. */
+  readonly flat: number;
+  readonly permit: string;
+  /** `{item, k, startedAt, …}` while an item is at this lane. */
+  readonly slot: string;
+  /** The lane body's input place: produced only by `start` (stage 0) or stage-(j−1) hand-offs. */
+  readonly body: string;
+  /** The lane body's success place. */
+  readonly done: string;
+  /** The lane body's exits; `canceled` is unreachable (no step writes it), as in the foreach. */
+  readonly exits: {
+    readonly failed: string;
+    readonly bailed: string;
+    readonly suspended: string;
+    readonly paused: string;
+    readonly canceled: string;
+  };
+  /** Stage 0 only: `start`. */
+  readonly start: string | undefined;
+  /** Stage 0 only, and only with a signal: `refuse`, the worker's abort check closing the queue. */
+  readonly refuse: string | undefined;
+  /**
+   * `stage{j}.lane{l}.to{m}`, `m` order — `handoffs[m]` feeds the lane at `lanes[Σ_{i≤j} c_i + m]`;
+   * empty on the last stage.
+   */
+  readonly handoffs: readonly string[];
+  /** The last stage only: `stage{s-1}.lane{l}.collect`. */
+  readonly collect: string | undefined;
+  /**
+   * The `¬cancel` settles that write the frame, by the exit each consumes — so rules 4 and 7 check
+   * an exit's consumers against the declaration, never against what the arcs say:
+   * `bailed` -> `bail`, `paused` -> `pause`, `failed` -> `fail` (`[open, queue-closed,
+   * queue-closed.again]`), `suspended` -> `suspend` (likewise). The open-queue `.again` variant is
+   * dead (`exclusive(queue.open, K)`) and not emitted, hence three, not four. `done`'s `¬cancel`
+   * consumers are {@link handoffs} (stage < s−1) or {@link collect} (the last stage).
+   */
+  readonly settles: {
+    readonly bail: string;
+    readonly pause: string;
+    readonly fail: readonly [open: string, queueClosed: string, queueClosedAgain: string];
+    readonly suspend: readonly [open: string, queueClosed: string, queueClosedAgain: string];
+  };
+  /**
+   * `drop.{done,failed,bailed,suspended,paused}`, by the exit each consumes: read `cancel`, return the
+   * permit, write nothing (the item is a hole, as the twin's entry-end re-stamp makes it) and merge
+   * the item's state (`ItemRecords.forget('merge')`). `undefined` without a signal.
+   */
+  readonly drops:
+    | {
+        readonly done: string;
+        readonly failed: string;
+        readonly bailed: string;
+        readonly suspended: string;
+        readonly paused: string;
+      }
+    | undefined;
+}
+
+/**
  * A gadget's claim about how many tokens one of its places can hold ([ADR 0009]). A place nobody
  * claims for is claimed at 1 — so a gadget states only its exceptions, and a new place is held to
  * the strictest bound until someone says otherwise.
@@ -1060,6 +1236,12 @@ export interface CompiledWorkflow {
   readonly checkpoints: readonly number[];
   /** Every `race` / `quorum` block, in emission order ([ADR 0014]); empty when there is none. */
   readonly decisions: readonly DecisionSite[];
+  /**
+   * Every `pipeline()`, in emission order ([ADR 0015]); empty when there is none. A resume at one is
+   * refused by name (`pipeline`) — no resume site is registered for it — and its lane attempts are
+   * exempt from suspension coverage (`pipelineLaneAttempts`), held instead by its structure rule 7.
+   */
+  readonly pipelines: readonly PipelineSite[];
   /** Stable over structure alone, so it keys a compile cache across runs. */
   readonly structuralHash: string;
 }
