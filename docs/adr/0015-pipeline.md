@@ -1,7 +1,7 @@
 # ADR 0015 — `pipeline()` compiles a `.foreach()` over a chain of stages into the parent net, one bound per stage, items handed lane to lane
 
-Status: proposed (2026-10-05, M7b second wave). Maintainer decisions taken (below, each the
-recommended option); amended by the W0 spike (below).
+Status: accepted (2026-10-06, M7b second wave). Maintainer decisions taken (below, each the
+recommended option); amended by the W0 spike and the W1 review (below).
 
 ## Context
 
@@ -371,25 +371,39 @@ Surface and twin facts, pinned in scratch (`tsc`) and on Mastra's default engine
 
 ## Evidence
 
-Planned:
+Contract in W0 (`a627ec9`); built in W1 (`b950dab`, merged `c34f2cf`, CI green: run 37382237666)
+and integrated in W2 (`83b2ee7`, merged `cd9863b`); CI green on `cd9863b` (run 37386264346: `typescript`, 4 `proofs` shards, 8 `corpus` shards). libpetri
+8.0.0 from npm, not linked.
 
-- `tests/mastra/pipeline-surface.test.ts` — the factory; the brand and `Chained<S>` as
-  `@ts-expect-error` under `npm run check`; spread inference into `.foreach` pinned before W1.
-- `tests/mastra/adapt-pipeline.test.ts` — every refusal; agent and tool stages matched by ref and
-  options identity; an altered `opts.concurrency`; a marker on a stage.
-- `tests/compiler/pipeline.test.ts` — shape and names; `[i, L]` lane paths; s = 1 against the foreach
-  net; the hash moving with the bounds and unchanged without a pipeline; `foreach-frame.ts` leaving
-  the foreach byte-identical.
-- `tests/verify/pipeline.test.ts` — the seven structure rules, one mutant each; the claims; overlap
-  as a definitive `Violated`.
-- `tests/engine/pipeline.test.ts` — overlap under a ManualClock; failure drains in-flight items
-  through every stage; bail as item success; cancel holes; suspend and the `pipeline` refusal;
-  item-scoped `getStepResult` / `getInitData` / state; `limit(1)` peak across items; run budget 1.
-- `tests/engine/pipeline-next.test.ts` — `.then(next)` against a default-engine oracle; a forced
-  `cloneWorkflow` on `DefaultExecutionEngine` running as `.foreach(nestedWorkflow)`; the twin
-  differential on success, mid-pipeline failure, cancel at and between boundaries.
-- `tests/verify/pipeline-blueprints.test.ts` — the matrix through `init()`, every family in every
-  default segment; libpetri 8.0.0 from npm, not linked.
+- `tests/compiler/pipeline-contract.test.ts` — unannotated workflows compile to the nets and hashes
+  they had before the contract; the hash carries a pipeline only when present.
+- `tests/compiler/pipeline.test.ts` — the exact transition list for (1,2) and the site naming exactly
+  what was emitted; `[i, L]` lane paths; s = 1 against the foreach net, every difference named;
+  1-bounded from the arcs; `wf.cancel` the only inhibited place; `foreach-frame.ts` leaving every
+  foreach byte-identical (hash, digest, class counts).
+- `tests/verify/pipeline.test.ts` — rule 0 and the seven structure rules, a mutant per clause; the
+  lane-attempt exemption, not vacuous; the bounds and exclusion claims; `verify()` on (1,1),
+  (1,1,1), (2,2) and (2,1) with a `limit(1)` stage; the overlap a definitive, confirmed `Violated`
+  for every adjacent pair; rule 8 by reachability, with Σc_j = 1 pinning its four dead transitions.
+- `tests/engine/item-scope.test.ts`, `tests/mastra/runner-pipeline.test.ts` — the per-item store,
+  stage calls without `foreachIdx` or a child run, the body schema applied twice as the twin does,
+  per-item state opened, merged and discarded, resume labels naming the body and item.
+- `tests/mastra/pipeline-surface.test.ts`, `tests/mastra/adapt-pipeline.test.ts` — the factory and
+  the brand and `Chained<S>` as `@ts-expect-error`; every refusal; the copying state schema against
+  a pure-Mastra oracle; agent and tool stages matched by ref and options identity.
+- `tests/engine/pipeline.test.ts` — end to end on Mastra's `Run` under a ManualClock and event
+  gates, no timers: success, `getInitData()`, progress, a failure discarding the item's state, a
+  bail, cancels merging dropped items, overlap, the failure drain, precedence (canceled, first
+  failure, lowest suspension, a cancel over a suspension) with the twin beside each, `limit(1)`
+  and run budget 1 peaks, per-stage retries, an empty input, every resume refused by name, the
+  hand-off order of row 115 pinned.
+- `tests/engine/pipeline-next.test.ts` — petri, a forced `cloneWorkflow` on `DefaultExecutionEngine`
+  and the pure-Mastra twin side by side: admission peaks, success, failure, bail, cancel, suspend,
+  the item's state copy at admission, retries (row 113).
+- `tests/verify/pipeline-blueprints.test.ts` — 11 shapes through `init()` (bounds, run budget 1,
+  `limit(1)` shared with a parent step, retries, an inherited `retryConfig`, a timeout, a
+  `rateLimit`), every family in all eight default segments, quota claims, overlap per adjacent
+  pair; about 29 s alone, slowest query 1.99 s (`live(t.1.report.run-1)`, smt).
 
 [ADR 0002]: 0002-three-layer-surface.md
 [ADR 0004]: 0004-structural-cancellation.md

@@ -637,7 +637,7 @@
           linked
   - [x] W3: ADR 0014 accepted with Evidence; rows 103–110 `fixed (M7b)`; CI green on `3ebb1c8`
         (all jobs)
-- [ ] Second wave, first: `pipeline()` [ADR 0015]:
+- [x] Second wave, first: `pipeline()` [ADR 0015]:
   - [x] Maintainer decisions (2026-10-05): Layer 3 reason (A, stages in the parent's run); retries per stage
         inheriting the parent's `retryConfig`; item scope at twin parity; a suspended pipeline
         refused on resume. Defaults taken: c_j = 1, W = Σc_j (no window pool); unordered
@@ -719,7 +719,7 @@
         die at 10 s); `verifyMastraWorkflow` has no total wall budget; no structure rule says
         `split` gives `queue.closed` on one branch (the blueprint test pins it); row 117 could
         also name the per-item entry's missing `__workflow_meta`
-  - [ ] W3: ADR 0015 accepted with Evidence; rows 111–118 `fixed (M7b)`; CI green
+  - [x] W3: ADR 0015 accepted with Evidence; rows 111–118 `fixed (M7b)`; CI green (run 37386264346)
   - [ ] Maintainer decision: `verifyMastraWorkflow` also verifies the minted body as a nested
         workflow (317–619 extra claims per shape), a petri net of a child this engine never runs;
         skip pipeline bodies in `nestedWorkflows`, or keep them
