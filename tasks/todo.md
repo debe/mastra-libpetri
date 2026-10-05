@@ -615,15 +615,26 @@
         structure`). Tests: `tests/verify/decision.test.ts`
       - **F — docs**: `docs/divergences.md` rows 103–110 checked against what W1 built; README's
         Layer 3 list
-  - [ ] W2 integration (lead, after W1): `tests/engine/race.test.ts` (first success wins, all fail
-        reports the lowest index, `QuorumNotMetError` with `suspended` and `preempted` distinct,
-        suspended loser with its resume label gone, cancel mid-race, run abort / deadline / preempt
-        precedence, retrying loser, loser ignoring its signal, loser behind an exhausted limit,
-        `concurrency: 2`, `.then(next)` under `validateInputs` with arm keys optional — and failing
-        with them required); race and quorum in `tests/verify/blueprints.test.ts` — n=3 k=1/2/3 and
-        n=4 k=1/2, ± run budget 1, one arm retrying (retries 2, delay 5 ms), `limit` inside an arm;
-        a forced `cloneWorkflow` running it as a plain parallel. Every query under 30 s, figures
-        quoted with the libpetri provenance line
+  - [x] W2 integration (2026-10-05), three agents on disjoint files, each adversarially reviewed with
+        mutants on `src/` (restored), no `src/` defect found:
+        - `tests/engine/race.test.ts` (+11): all fail -> lowest index; `QuorumNotMetError` with
+          `suspended` / `preempted` distinct and labels forgotten; cancel mid-race (arms keep their own
+          `success` on both engines, only the run is `canceled` — the plan's "arms canceled" was
+          wrong); a retrying loser finishes its delay and runs once; a loser ignoring its signal is
+          awaited and discarded; a loser behind an exhausted `limit` waits for the quota, then leaves
+          without running (row 110); `concurrency: 2` admits FIFO and the queued never run; winners by
+          arrival, not index; `.then(next)` with arm keys optional and required
+        - `tests/engine/race-next.test.ts` (new, 4): `validateInputs` against a default-engine oracle
+          (optional keys run, required fail naming the losers); quorum then next; a forced
+          `cloneWorkflow` runs on `DefaultExecutionEngine` as a plain `.parallel()`, the mark carried
+          in metadata and ignored
+        - `tests/verify/race-blueprints.test.ts` (new, 26): n=3 k=1..3, n=4 k=1,2 × run budget 1 ×
+          `limit(1)` in two arms, untimed; timed (arm retrying 2 × 5 ms) under budget + limit per
+          (n, k) and alone at (3, 1). Every family in all 8 default segments (pinned), the decision's
+          claims by name, the limit's takers pinned. 61 s alone, slowest query 7.7 s (`deadlockFree
+          @closed`, smt). The full 40-shape cross product was measured once: all held, 161 s, slowest
+          7.6 s — the 15 other timed crossings were dropped for cost. libpetri 8.0.0 from npm, not
+          linked
   - [ ] W3: ADR 0014 accepted with Evidence; rows 103–110 `fixed (M7b)`; CI green on the `proofs`
         shards
 - [ ] Second wave: `pipeline()` — the one the IR structurally cannot express, since

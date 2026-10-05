@@ -469,3 +469,457 @@ describe('first fired wins: a preemption, then the run canceled before the loser
     expect(row.value).toEqual({});
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// M7b W2 integration: the remaining cases of the W2 plan (tasks/todo.md, M7b "W2 integration").
+// Same environment as above: real Mastra, InMemoryStore, the system clock in small real
+// milliseconds, libpetri 8.0.0 from the registry, not linked. Tested, not proven.
+// ---------------------------------------------------------------------------------------------
+
+/** A step that fails after `ms` with the message `<id>-err`. */
+function failingAfter(createStep: ReturnType<typeof init>['createStep'], id: string, ms: number) {
+  return createStep({
+    id,
+    inputSchema: N,
+    outputSchema: N,
+    execute: async () => {
+      await sleep(ms);
+      throw new Error(`${id}-err`);
+    },
+  });
+}
+
+describe('no winner: every arm fails', () => {
+  it('the block reports the lowest-index failure, not the first to arrive, as the default engine\'s parallel', async () => {
+    // Mutation: join-short forwarding the first miss in arrival order (`misses[0]`) instead of the
+    // lowest index -> the error is `b-err`, which failed first.
+    const petri = init();
+    const raced = petri
+      .createWorkflow({ id: 'allfail', inputSchema: N, outputSchema: ANY })
+      .parallel(...petri.race([failingAfter(petri.createStep, 'a', 30), failingAfter(petri.createStep, 'b', 2)], { id: 'pick' }))
+      .commit();
+    const { get } = host({ allfail: raced });
+    const result = await (await get('allfail').createRun()).start({ inputData: { n: 1 } });
+    expect(result.status).toBe('failed');
+    expect(message(result.error)).toBe('a-err');
+    expect(result.steps['a']!.status).toBe('failed');
+    expect(result.steps['b']!.status).toBe('failed');
+    // Neither arm was preempted: a race over n arms decides `short` only on the n-th miss.
+    expect(errorName(result.steps['a'])).not.toBe('StepPreemptedError');
+    expect(errorName(result.steps['b'])).not.toBe('StepPreemptedError');
+
+    // Oracle: Mastra's own `.parallel()` over the same arms reports the lowest index too
+    // (`handlers/control-flow.ts:267`, `results.find`).
+    const { createStep: mastraCreateStep } = await import('@mastra/core/workflows');
+    const plain = (mastraCreateWorkflow({ id: 'allfail-plain', inputSchema: N, outputSchema: ANY }) as unknown as {
+      parallel(steps: readonly unknown[]): { commit(): unknown };
+    })
+      .parallel([failingAfter(mastraCreateStep as never, 'a', 30), failingAfter(mastraCreateStep as never, 'b', 2)])
+      .commit();
+    const oracle = await (await host({ 'allfail-plain': plain }).get('allfail-plain').createRun()).start({ inputData: { n: 1 } });
+    expect(oracle.status).toBe(result.status);
+    expect(message(oracle.error)).toBe(message(result.error));
+  });
+});
+
+describe('no winner, no failure: QuorumNotMetError', () => {
+  it('statuses keep `suspended` and `preempted` distinct; suspended losers are rewritten canceled and their labels forgotten', async () => {
+    // Mutations: (1) `statuses` read from the records after the rewrite -> every entry `canceled`;
+    // (2) join-short skipping `rewriteSuspended` over `short`'s own misses -> `s1`/`s2` stay
+    // `suspended`, the labels `one`/`two` stay in the stored row; (3) the block suspending on a
+    // suspended arm as `.parallel()` does -> the run ends `suspended`.
+    const { createWorkflow, createStep, quorum } = init();
+    let slowReturned = false;
+    const suspender = (id: string, label: string, ms: number) =>
+      createStep({
+        id,
+        inputSchema: N,
+        outputSchema: N,
+        suspendSchema: ANY,
+        resumeSchema: ANY,
+        execute: async ({ suspend }) => {
+          await sleep(ms);
+          await suspend({ id }, { resumeLabel: label });
+          return undefined as never;
+        },
+      });
+    const slow = createStep({
+      id: 'slow',
+      inputSchema: N,
+      outputSchema: N,
+      execute: async ({ inputData, abortSignal }) => {
+        await aborted(abortSignal);
+        slowReturned = true;
+        return { n: inputData.n }; // a late success, discarded
+      },
+    });
+    const workflow = createWorkflow({ id: 'qnm', inputSchema: N, outputSchema: ANY })
+      .parallel(...quorum(2, [suspender('s1', 'one', 2), suspender('s2', 'two', 8), slow], { id: 'two' }))
+      .commit();
+    const { get, stored } = host({ qnm: workflow });
+    const result = await (await get('qnm').createRun({ runId: 'q1' })).start({ inputData: { n: 1 } });
+    expect(slowReturned).toBe(true);
+    expect(result.status).toBe('failed');
+    const error = result.error as { name?: unknown; need?: unknown; succeeded?: unknown; statuses?: unknown; blockId?: unknown };
+    expect(error.name).toBe('QuorumNotMetError');
+    expect(error.blockId).toBe('two');
+    expect(error.need).toBe(2);
+    expect(error.succeeded).toBe(0);
+    expect(error.statuses).toEqual([
+      { stepId: 's1', index: 0, status: 'suspended' },
+      { stepId: 's2', index: 1, status: 'suspended' },
+      { stepId: 'slow', index: 2, status: 'preempted' },
+    ]);
+    expect(message(result.error)).toMatch(/needed 2 of 3 arms to succeed, 0 did: s1=suspended, s2=suspended, slow=preempted/);
+    for (const id of ['s1', 's2', 'slow']) {
+      expect(result.steps[id]!.status, id).toBe('canceled');
+      expect(errorName(result.steps[id]), id).toBe('StepPreemptedError');
+      expect((result.steps[id]!.error as { outcome?: unknown }).outcome, id).toBe('short');
+    }
+    const row = await stored('qnm', 'q1');
+    expect(row.status).toBe('failed');
+    expect(row.resumeLabels ?? {}).toEqual({});
+    for (const id of ['s1', 's2']) expect((row.context[id] as { status?: unknown }).status, id).toBe('canceled');
+  });
+});
+
+describe('cancel mid-race', () => {
+  it('run.cancel() while every arm is in flight: canceled as the default engine\'s parallel, no arm preempted', async () => {
+    // Mutation: `fork` or the arms reading the run's abort as a preemption (the block's controller
+    // chained to the run signal) -> the arms are recorded `canceled` with a StepPreemptedError where
+    // the default engine keeps their own outcome.
+    const build = (petri: boolean) => {
+      const p = init();
+      let run: RunLike | undefined;
+      const seen: string[] = [];
+      const arm = (id: string, cancels: boolean) => {
+        const spec = {
+          id,
+          inputSchema: N,
+          outputSchema: N,
+          execute: async ({ inputData, abortSignal }: { inputData: { n: number }; abortSignal: AbortSignal }) => {
+            if (cancels) setTimeout(() => void run!.cancel(), 10);
+            await aborted(abortSignal);
+            seen.push(id);
+            return { n: inputData.n };
+          },
+        };
+        return p.createStep(spec as never);
+      };
+      const arms = [arm('a', true), arm('b', false), arm('c', false)];
+      const workflow = petri
+        ? p.createWorkflow({ id: 'cx', inputSchema: N, outputSchema: ANY }).parallel(...p.race(arms as never, { id: 'pick' })).commit()
+        : (mastraCreateWorkflow({ id: 'cx', inputSchema: N, outputSchema: ANY }) as unknown as {
+            parallel(steps: readonly unknown[], o: unknown): { commit(): unknown };
+          })
+            .parallel(arms, { id: 'pick' })
+            .commit();
+      return {
+        seen,
+        start: async () => {
+          const { get, stored } = host({ cx: workflow });
+          run = await get('cx').createRun({ runId: 'cx1' });
+          const result = await run.start({ inputData: { n: 1 } });
+          return { result, row: await stored('cx', 'cx1') };
+        },
+      };
+    };
+    const petri = build(true);
+    const p = await petri.start();
+    const oracleBuild = build(false);
+    const o = await oracleBuild.start();
+    expect(o.result.status).toBe('canceled');
+    expect(p.result.status).toBe(o.result.status);
+    expect(p.row.status).toBe('canceled');
+    expect([...petri.seen].sort()).toEqual(['a', 'b', 'c']); // every arm awaited
+    for (const id of ['a', 'b', 'c']) {
+      expect(errorName(p.result.steps[id]), id).not.toBe('StepPreemptedError');
+      expect(p.result.steps[id]?.status, id).toBe(o.result.steps[id]?.status);
+      // Both engines keep each arm's own outcome, and only the run is re-stamped `canceled`. No decision
+      // fires here, so this pins the block's preemption staying apart from the run signal; the
+      // precedence of a run abort over a later preemption is R3's.
+      expect(p.result.steps[id]?.status, id).toBe('success');
+    }
+  });
+});
+
+describe('a retrying loser', () => {
+  it('preempted during its retry delay: finishes the delay, then is not retried again (row 108)', async () => {
+    // Mutation: the leaf calling the runner without the fired preempt signal after the delay, or
+    // the runner starting a preempted attempt -> a second execution (calls 2) and the retry's
+    // success recorded.
+    const { createWorkflow, createStep, race } = init();
+    let calls = 0;
+    let firstFailedAt = 0;
+    let decidedBy = 0;
+    const retrier = createStep({
+      id: 'retrier',
+      inputSchema: N,
+      outputSchema: N,
+      retries: 2,
+      execute: async ({ inputData }) => {
+        calls += 1;
+        if (calls === 1) {
+          firstFailedAt = Date.now();
+          throw new Error('first attempt fails');
+        }
+        return { n: inputData.n + 1 };
+      },
+    });
+    const winner = createStep({
+      id: 'winner',
+      inputSchema: N,
+      outputSchema: N,
+      execute: async ({ inputData }) => {
+        await sleep(10); // wins inside the retrier's 50 ms delay
+        decidedBy = Date.now();
+        return { n: inputData.n + 2 };
+      },
+    });
+    const workflow = createWorkflow({ id: 'retry', inputSchema: N, outputSchema: ANY, retryConfig: { delay: 50 } })
+      .parallel(...race([retrier, winner], { id: 'pick' }))
+      .commit();
+    const { get } = host({ retry: workflow });
+    const startedAt = Date.now();
+    const result = await (await get('retry').createRun()).start({ inputData: { n: 1 } });
+    const elapsed = Date.now() - startedAt;
+    // The decision did land inside the delay; if a loaded runner pushes it past, this names why.
+    expect(firstFailedAt).toBeLessThan(decidedBy);
+    expect(decidedBy - firstFailedAt).toBeLessThan(50);
+    expect(calls).toBe(1);
+    expect(elapsed).toBeGreaterThanOrEqual(45); // the join waited for the delay to finish
+    expect(result.status).toBe('success');
+    expect(result.steps['winner']).toMatchObject({ status: 'success', output: { n: 3 } });
+    expect(result.steps['retrier']!.status).toBe('canceled');
+    expect(errorName(result.steps['retrier'])).toBe('StepPreemptedError');
+    expect(result.result).toEqual({ winner: { n: 3 } });
+  });
+});
+
+describe('a loser ignoring its abort signal', () => {
+  it('is awaited; its late success is discarded and its record canceled', async () => {
+    // Mutation: the join not waiting for every arm (abandoning the loser) -> `stubbornReturned` is
+    // false when the run returns; the runner applying a non-own verdict -> `success` and { a: 9 }.
+    const { createWorkflow, createStep, race } = init();
+    let stubbornReturned = false;
+    const stubborn = createStep({
+      id: 'stubborn',
+      inputSchema: N,
+      outputSchema: N,
+      stateSchema: STATE,
+      execute: async ({ inputData, setState }) => {
+        await sleep(60); // never looks at its signal
+        await setState({ a: 9 });
+        stubbornReturned = true;
+        return { n: inputData.n + 100 };
+      },
+    });
+    const fast = createStep({ id: 'fast', inputSchema: N, outputSchema: N, stateSchema: STATE, execute: async ({ inputData }) => ({ n: inputData.n + 1 }) });
+    const workflow = createWorkflow({ id: 'stubborn', inputSchema: N, outputSchema: ANY, stateSchema: STATE })
+      .parallel(...race([stubborn, fast], { id: 'pick' }))
+      .commit();
+    const { get, stored } = host({ stubborn: workflow });
+    const result = await (await get('stubborn').createRun({ runId: 'st1' })).start({ inputData: { n: 1 }, initialState: {} });
+    expect(stubbornReturned).toBe(true);
+    expect(result.status).toBe('success');
+    expect(result.steps['stubborn']!.status).toBe('canceled');
+    expect(errorName(result.steps['stubborn'])).toBe('StepPreemptedError');
+    expect('output' in result.steps['stubborn']!).toBe(false);
+    expect(result.result).toEqual({ fast: { n: 2 } });
+    expect((await stored('stubborn', 'st1')).value).toEqual({});
+  });
+});
+
+describe('a loser behind an exhausted limit (row 110)', () => {
+  it('waits for the quota, then leaves preempted without running its step; the block waits for it', async () => {
+    // Two arms share `limit(1)`: whichever is admitted first holds it until the decision preempts
+    // it; the other draws the quota only after the decision, and must not start.
+    // Mutation: the leaf calling the runner without `StepCall.preempt`, or the runner ignoring a
+    // fired preemption before start -> the queued arm executes (two `limited` starts).
+    const { createWorkflow, createStep, race, limit } = init();
+    const db = limit(1, { id: 'db' });
+    const started: string[] = [];
+    let holderReturnedAt = 0;
+    let decidedAt = 0;
+    const limited = (id: string) =>
+      createStep({
+        id,
+        inputSchema: N,
+        outputSchema: N,
+        uses: [db],
+        execute: async ({ inputData, abortSignal }) => {
+          started.push(id);
+          await aborted(abortSignal);
+          await sleep(20); // holds the quota past the decision
+          holderReturnedAt = Date.now();
+          return { n: inputData.n };
+        },
+      });
+    const fast = createStep({
+      id: 'fast',
+      inputSchema: N,
+      outputSchema: N,
+      execute: async ({ inputData }) => {
+        await sleep(5);
+        decidedAt = Date.now();
+        return { n: inputData.n + 1 };
+      },
+    });
+    const workflow = createWorkflow({ id: 'lim', inputSchema: N, outputSchema: ANY })
+      .parallel(...race([limited('x'), fast, limited('y')], { id: 'pick' }))
+      .commit();
+    const { get } = host({ lim: workflow });
+    const result = await (await get('lim').createRun()).start({ inputData: { n: 1 } });
+    const endedAt = Date.now();
+    expect(started).toHaveLength(1); // only the holder ever ran
+    const [holder] = started;
+    const queued = holder === 'x' ? 'y' : 'x';
+    // The holder gave the quota back well after the decision, and the queued arm left only then:
+    // it waited for the quota rather than being swept from the queue, and the block waited for both.
+    expect(holderReturnedAt).toBeGreaterThan(0);
+    expect(holderReturnedAt - decidedAt).toBeGreaterThanOrEqual(15);
+    expect(holderReturnedAt).toBeLessThanOrEqual(endedAt);
+    expect((result.steps[queued] as { endedAt?: number }).endedAt).toBeGreaterThanOrEqual(holderReturnedAt);
+    expect(result.status).toBe('success');
+    expect(result.steps['fast']).toMatchObject({ status: 'success', output: { n: 2 } });
+    for (const id of [holder!, queued]) {
+      expect(result.steps[id]!.status, id).toBe('canceled');
+      expect(errorName(result.steps[id]), id).toBe('StepPreemptedError');
+    }
+    expect(result.result).toEqual({ fast: { n: 2 } });
+  });
+});
+
+describe('a race under block concurrency 2', () => {
+  it('admission is bounded at 2, and the decision preempts the queued arms, which never execute', async () => {
+    // Mutation: the decision gadget dropping `concurrency` (no admission) -> all four arms start at
+    // once (`peak` 4, `c`/`d` executed); preempting only admitted arms -> the queued arms run.
+    const { createWorkflow, createStep, race } = init();
+    const started: string[] = [];
+    let inFlight = 0;
+    let peak = 0;
+    const arm = (id: string, wins: boolean) =>
+      createStep({
+        id,
+        inputSchema: N,
+        outputSchema: N,
+        execute: async ({ inputData, abortSignal }) => {
+          started.push(id);
+          inFlight += 1;
+          peak = Math.max(peak, inFlight);
+          try {
+            if (wins) await sleep(15);
+            else await aborted(abortSignal);
+            return { n: inputData.n + 1 };
+          } finally {
+            inFlight -= 1;
+          }
+        },
+      });
+    const workflow = createWorkflow({ id: 'cc', inputSchema: N, outputSchema: ANY })
+      .parallel(...race([arm('a', false), arm('b', true), arm('c', false), arm('d', false)], { id: 'pick', metadata: { concurrency: 2 } }))
+      .commit();
+    const { get } = host({ cc: workflow });
+    const result = await (await get('cc').createRun()).start({ inputData: { n: 1 } });
+    expect(peak).toBe(2);
+    expect(result.status).toBe('success');
+    expect(result.steps['b']).toMatchObject({ status: 'success', output: { n: 2 } });
+    expect(started.slice(0, 2).sort()).toEqual(['a', 'b']); // FIFO admission
+    for (const id of ['a', 'c', 'd']) {
+      expect(result.steps[id]!.status, id).toBe('canceled');
+      expect(errorName(result.steps[id]), id).toBe('StepPreemptedError');
+    }
+    expect(started).not.toContain('c');
+    expect(started).not.toContain('d');
+    expect(result.result).toEqual({ b: { n: 2 } });
+  });
+});
+
+describe('quorum(2) of 3, met, then a next entry', () => {
+  const build = (required: boolean) => {
+    const { createWorkflow, createStep, quorum } = init();
+    let nextInput: unknown;
+    const arm = (id: string, ms: number | 'loses', add: number) =>
+      createStep({
+        id,
+        inputSchema: N,
+        outputSchema: N,
+        execute: async ({ inputData, abortSignal }) => {
+          if (ms === 'loses') await aborted(abortSignal);
+          else await sleep(ms);
+          return { n: inputData.n + add };
+        },
+      });
+    const key = required ? N : N.optional();
+    const next = createStep({
+      id: 'next',
+      inputSchema: z.object({ slow: key, mid: key, fast: key }),
+      outputSchema: ANY,
+      execute: async ({ inputData }) => {
+        nextInput = inputData;
+        return { done: true };
+      },
+    });
+    // Arm 0 is the slowest: a lowest-index rule would wait for it; FIFO takes `fast` then `mid`.
+    const workflow = createWorkflow({ id: 'q2', inputSchema: N, outputSchema: ANY })
+      .parallel(...quorum(2, [arm('slow', 'loses', 100), arm('mid', 15, 10), arm('fast', 2, 1)], { id: 'two' }))
+      .then(next as never)
+      .commit();
+    return { workflow, nextInput: () => nextInput };
+  };
+
+  it('two winners FIFO, the third preempted; the next entry gets every declared arm key, the loser\'s undefined', async () => {
+    // Mutations: winners by lowest index -> `slow` is never preempted (the run hangs on it, or
+    // `mid` is the loser); join-met building the next input from the `won` token -> the `slow` key
+    // is absent rather than present and undefined.
+    const { workflow, nextInput } = build(false);
+    const { get } = host({ q2: workflow });
+    const result = await (await get('q2').createRun()).start({ inputData: { n: 1 } });
+    expect(result.status).toBe('success');
+    expect(result.steps['fast']).toMatchObject({ status: 'success', output: { n: 2 } });
+    expect(result.steps['mid']).toMatchObject({ status: 'success', output: { n: 11 } });
+    expect(result.steps['slow']!.status).toBe('canceled');
+    expect((result.steps['slow']!.error as { outcome?: unknown }).outcome).toBe('met');
+    const input = nextInput() as Record<string, unknown>;
+    expect(Object.keys(input).sort()).toEqual(['fast', 'mid', 'slow']);
+    expect(input).toEqual({ slow: undefined, mid: { n: 11 }, fast: { n: 2 } });
+    expect(result.result).toEqual({ done: true });
+  });
+
+  it('winners by arrival, not index: a lower-index arm that also succeeds, but later, is the loser', async () => {
+    // Every arm succeeds; arrival order is the reverse of index order. Mutation: winners taken by
+    // lowest index among successes -> `late` wins and `fast` is the loser.
+    const { createWorkflow, createStep, quorum } = init();
+    const arm = (id: string, ms: number, add: number) =>
+      createStep({
+        id,
+        inputSchema: N,
+        outputSchema: N,
+        execute: async ({ inputData }) => {
+          await sleep(ms); // ignores its signal: `late` succeeds after the decision
+          return { n: inputData.n + add };
+        },
+      });
+    const workflow = createWorkflow({ id: 'fifo', inputSchema: N, outputSchema: ANY })
+      .parallel(...quorum(2, [arm('late', 60, 100), arm('mid', 15, 10), arm('fast', 2, 1)], { id: 'two' }))
+      .commit();
+    const { get } = host({ fifo: workflow });
+    const result = await (await get('fifo').createRun()).start({ inputData: { n: 1 } });
+    expect(result.status).toBe('success');
+    expect(result.steps['fast']).toMatchObject({ status: 'success', output: { n: 2 } });
+    expect(result.steps['mid']).toMatchObject({ status: 'success', output: { n: 11 } });
+    expect(result.steps['late']!.status).toBe('canceled');
+    expect((result.steps['late']!.error as { outcome?: unknown }).outcome).toBe('met');
+    expect('output' in result.steps['late']!).toBe(false);
+  });
+
+  it('with the arm keys required, the next step fails input validation (row 103)', async () => {
+    // Mutation: the next input built from winners only, with validation skipped -> `next` runs.
+    const { workflow, nextInput } = build(true);
+    const { get } = host({ q2: workflow });
+    const result = await (await get('q2').createRun()).start({ inputData: { n: 1 } });
+    expect(result.status).toBe('failed');
+    expect(result.steps['next']!.status).toBe('failed');
+    expect(nextInput()).toBeUndefined();
+  });
+});
