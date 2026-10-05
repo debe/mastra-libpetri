@@ -637,9 +637,62 @@
           linked
   - [x] W3: ADR 0014 accepted with Evidence; rows 103–110 `fixed (M7b)`; CI green on `3ebb1c8`
         (all jobs)
-- [ ] Second wave: `pipeline()` — the one the IR structurally cannot express, since
-      join-before-next-index is its defining property — plus `supersede()`, `compensate()`,
-      `circuitBreaker()`, `queue(depth)`, `correlate(key)`
+- [ ] Second wave, first: `pipeline()` [ADR 0015]:
+  - [x] Maintainer decisions (2026-10-05): Layer 3 reason (A, stages in the parent's run); retries per stage
+        inheriting the parent's `retryConfig`; item scope at twin parity; a suspended pipeline
+        refused on resume. Defaults taken: c_j = 1, W = Σc_j (no window pool); unordered
+        later-stage admission; rendezvous hand-off; nested-workflow stages refused; cancel drops
+        every unsettled item (a hole)
+  - [ ] W0 spike (libpetri 8.0.0 from npm, `scripts/link-libpetri.sh --check` "not linked"): the
+        drafted net with a leaf wrapper, c ∈ {(1,1), (1,1,1), (2,1), (1,2,1), (2,2)} × ± run budget 1
+        × `limit(1)` on the widest stage, plus `limit(1)` shared by stages 0 and 2, plus one stage
+        retrying 2 × 5 ms (SMT). Report classes closed / cancel, route, slowest query, and the same
+        for a foreach of Σc_j lanes; the overlap `Violated` with its trace. Any query over 30 s:
+        redesign (relay per boundary, or fewer drops) before W1, recorded as an ADR amendment
+        table. Also pin: spread inference of `pipeline(...)` into `.foreach` and `Chained<S>` under
+        `npm run check`; whether the twin merges state for a failed item; whether the child
+        validates the body's output schema at its end
+  - [ ] W0 contract (lead): `ForeachPipeline` on the foreach description, `PipelineSite` and
+        `CompiledWorkflow.pipelines` / `GadgetResult.pipelines`, `NestedOptions.item`,
+        `RunScope.itemRecords`, `ResumeRefusal.reason 'pipeline'`, `FOREACH_PIPELINE` / `Pipeline` /
+        `pipelineOf`, `PetriPipeline` on `init()`, the three new `BLUEPRINT_REFUSALS`,
+        `pipelineStructureViolations`, `pipelineLaneAttempts`; `structuralHash` carries the
+        pipeline only when present; rows 111–118 `planned (M7b)`. Stubs throw
+        `not implemented (M7b W<n>)`; an unannotated workflow compiles and hashes as before.
+        Lead keeps: `src/compiler/types.ts`, `src/compiler/gadgets/types.ts`,
+        `src/compiler/compile.ts`, `src/compiler/index.ts`, `src/mastra/index.ts`,
+        `src/verify/index.ts`, ADR 0015, this file
+  - [ ] W1a (parallel; nothing in it reads another's work):
+    - **A — frame and gadget**: `src/compiler/gadgets/foreach-frame.ts` (extracted first, gated on
+      an unchanged `structuralHash`, a name-and-arc snapshot and `foreach.test.ts` class counts),
+      `src/compiler/gadgets/foreach.ts` (delegation only), `src/compiler/blueprints/pipeline.ts`
+      (the net, flattened lane paths `[i, L]`, the `PipelineSite`). Tests:
+      `tests/compiler/pipeline.test.ts`
+    - **B — item scope**: `src/engine/scope.ts` (`itemRecords`, forget), `src/compiler/gadgets/leaf.ts`
+      (`item` option: the view overlay, the record sink), `src/mastra/runner.ts` (`#resolveStep`
+      for pipeline lanes, stage calls without `foreachIdx` or `nestedRunId`, stage-0 body-schema
+      validation, per-item state snapshot and merge). Tests: `tests/engine/item-scope.test.ts`,
+      `tests/mastra/runner-pipeline.test.ts`; foreach and race suites unchanged
+    - **C — surface, adapter, resume refusal**: `src/mastra/pipeline.ts` (new),
+      `src/mastra/resources.ts`, `src/mastra/init.ts`, `src/mastra/adapt.ts` (`case 'foreach'`,
+      `matchMinted` factored out of `blockDecision`, `refuseMisplacedBlueprints`, `innerSteps`),
+      `src/compiler/resume.ts` and `src/mastra/engine.ts` (the `pipeline` refusal). Tests:
+      `tests/mastra/pipeline-surface.test.ts`, `tests/mastra/adapt-pipeline.test.ts`
+  - [ ] W1b (after A): **D — verify**: `src/verify/pipeline.ts` (seven rules, a mutant each),
+        `src/verify/structure.ts` (`pipelineLaneAttempts` exemption), `src/verify/properties.ts`
+        ("pipeline structure"), `src/verify/claims.ts` (bounds, exclusions, the overlap query).
+        Tests: `tests/verify/pipeline.test.ts`
+  - [ ] W1c: **E — docs**: rows 111–118 checked against what W1 built; README's Layer 3 list
+  - [ ] W2 integration, agents on disjoint files, each adversarially reviewed with mutants on `src/`
+        (restored): `tests/engine/pipeline.test.ts` (overlap under ManualClock, failure drain, bail,
+        cancel holes, suspend refusal, item scope, `limit(1)` peak, run budget 1);
+        `tests/engine/pipeline-next.test.ts` (default-engine oracle, forced `cloneWorkflow`, twin
+        differential on success / failure / cancel); `tests/verify/pipeline-blueprints.test.ts`
+        (the W0 matrix, every family in every default segment, slowest query recorded, libpetri
+        8.0.0 from npm, not linked)
+  - [ ] W3: ADR 0015 accepted with Evidence; rows 111–118 `fixed (M7b)`; CI green
+- [ ] Second wave, after `pipeline()`: `supersede()`, `compensate()`, `circuitBreaker()`,
+      `queue(depth)`, `correlate(key)`
 - [ ] Each blueprint ships with its property: `limit` with `placeBound`, `circuitBreaker` with
       reachability of the open state, `correlate` with `joinedOrDeadLettered`. A blueprint
       without a proven property is not done
