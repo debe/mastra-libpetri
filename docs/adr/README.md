@@ -15,7 +15,7 @@
 | [0011](0011-block-concurrency.md) | A block's `concurrency` is a seeded pool of slots, admitted in arm order, proven | accepted |
 | [0012](0012-limiter-blueprints.md) | `limit` and `rateLimit` are blueprints over fused quota places, one quota per run | accepted |
 | [0013](0013-step-timeout.md) | A step timeout is a timed-out output branch, raced inside the attempt on the run's clock | accepted |
-| [0014](0014-race-and-quorum.md) | `race` and `quorum(k)` are a counted decision on a `.parallel()`, and every loser is aborted and waited for | proposed (amended M7b W0) |
+| [0014](0014-race-and-quorum.md) | `race` and `quorum(k)` are a counted decision on a `.parallel()`, and every loser is aborted and waited for | accepted |
 
 Each ADR has Context / Decision / Consequences / Evidence; Evidence names the test that pins the
 behaviour it rests on. Amendments are recorded in the existing ADR, tagged with the milestone

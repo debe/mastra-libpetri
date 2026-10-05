@@ -635,8 +635,8 @@
           @closed`, smt). The full 40-shape cross product was measured once: all held, 161 s, slowest
           7.6 s — the 15 other timed crossings were dropped for cost. libpetri 8.0.0 from npm, not
           linked
-  - [ ] W3: ADR 0014 accepted with Evidence; rows 103–110 `fixed (M7b)`; CI green on the `proofs`
-        shards
+  - [x] W3: ADR 0014 accepted with Evidence; rows 103–110 `fixed (M7b)`; CI green on `3ebb1c8`
+        (all jobs)
 - [ ] Second wave: `pipeline()` — the one the IR structurally cannot express, since
       join-before-next-index is its defining property — plus `supersede()`, `compensate()`,
       `circuitBreaker()`, `queue(depth)`, `correlate(key)`

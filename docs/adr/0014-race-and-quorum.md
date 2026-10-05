@@ -1,8 +1,8 @@
 # ADR 0014 — `race` and `quorum(k)` are a counted decision on a `.parallel()`, and every loser is aborted and waited for
 
-Status: proposed (2026-10-04, M7b). Maintainer decisions taken; the net amended by the W0 spike
-(2026-10-04, below) and by the W0 contract review (marked *amended M7b W0 review*). The W0 contract
-is written; nothing is implemented.
+Status: accepted (2026-10-05, M7b). Maintainer decisions taken; the net amended by the W0 spike
+(2026-10-04, below) and by the W0 contract review (marked *amended M7b W0 review*); the precedence
+rewritten in the W1 review to one host-owned verdict, the first source fired.
 
 ## Context
 
@@ -239,26 +239,35 @@ sites; `restart@0` is the `closed` marking), execution witnesses, the sum `okSee
 
 ## Evidence
 
-The W0 spike above (libpetri 8.0.0 from npm, not linked); nothing implemented yet. Planned:
-`tests/mastra/race-surface.test.ts` (the factories, the brand gate as a `@ts-expect-error` checked by
-`npm run check`; `tests/types/*.test-d.ts` is not configured here);
-`tests/mastra/adapt-decision.test.ts` (the five refusals; agent and tool arms matched by ref and
-options identity);
-`tests/compiler/quorum.test.ts` (shape, names, an early-`preempted` firing, dead absorbs omitted at
-k = n and k = 1, n = 1 with no `settled` and no preemption, the structural hash moving with `k`);
-`tests/verify/decision.test.ts` (the seven rules; mutants: `inhibitor(won)` on `short`, a success
-collect producing `miss`, a reset on `okSeen`, a dead absorb pair emitted);
-`tests/mastra/runner-preempt.test.ts` (the verdict rule and its freeze, effects iff `own`,
-`forgetSuspension`); `tests/compiler/leaf-preempt.test.ts` (the leaf maps the verdict, reads no signal);
-`tests/mastra/step-result-roundtrip.test.ts` (a preempted `canceled` row's `error` round trip);
-`tests/engine/race.test.ts` (written in the W1 review: first success wins; the late-decision
-window with async scorers and with a suspending arm; run abort and preemption before a retry,
-against the default engine; a preempted loser past its deadline. Still planned there: all fail reports lowest index, `QuorumNotMetError`
-with `suspended` and `preempted` distinct, suspended loser with no resume label left, cancel
-mid-race, retrying loser, loser ignoring its signal,
-loser behind an exhausted limit, concurrency 2, `.then(next)` under `validateInputs` with optional
-arm keys); race and quorum cases in `tests/verify/blueprints.test.ts`, with `limit` inside an arm.
-Over 30 s per query means redesign; over 60 s, ask the libpetri sessions.
+Built in W1 (`3ab7ea6`, merged `7490364`) and integrated in W2 (`1fa69bd`, merged `3ebb1c8`); CI
+green on `3ebb1c8` (run 37360992111: `typescript`, 4 `proofs` shards, 8 `corpus` shards). libpetri 8.0.0 from npm, not linked.
+
+- `tests/mastra/race-surface.test.ts` — the factories; the brand gate as a `@ts-expect-error` under
+  `npm run check`; the Layer test: a race on the default engine runs as its plain `.parallel()` twin.
+- `tests/mastra/adapt-decision.test.ts` — the five refusals; agent and tool arms matched by ref and
+  options identity.
+- `tests/compiler/quorum.test.ts` — shape and names, an early-`preempted` firing, dead absorbs
+  omitted at k = n and k = 1, n = 1 with no `settled` and no preemption, the hash moving with `k`.
+- `tests/verify/decision.test.ts` — the seven structure rules, one mutant each; the decision claims;
+  the compiled race in all four families, with mutants proving the exclusion and `bound(won<=1)`
+  are not vacuous.
+- `tests/mastra/runner-preempt.test.ts`, `tests/compiler/leaf-preempt.test.ts`,
+  `tests/engine/preempt-scope.test.ts`, `tests/mastra/step-result-roundtrip.test.ts` — the verdict
+  frozen at settle, effects iff `own`, the leaf mapping the verdict without reading a signal (source
+  guard), `forgetSuspension`, the preempted row's round trip.
+- `tests/engine/race.test.ts` — end to end on Mastra's `Run`: first success wins; the late-decision
+  window; run abort and preemption before a retry, against the default engine; a preempted loser past
+  its deadline; resume labels as Mastra writes them; all fail -> lowest index; `QuorumNotMetError`
+  with `suspended` and `preempted` distinct; cancel mid-race (each arm keeps its own outcome, as on
+  the default engine); a retrying loser finishing its delay (row 108); a loser ignoring its signal; a
+  loser behind an exhausted `limit` (row 110); `concurrency: 2`; winners by arrival, not index; the
+  next entry's input with arm keys optional and required (row 103).
+- `tests/engine/race-next.test.ts` — `.then(next)` under `validateInputs` against a default-engine
+  oracle; a forced `cloneWorkflow` running on `DefaultExecutionEngine` as a plain `.parallel()`.
+- `tests/verify/race-blueprints.test.ts` — the composition matrix through `init()`: n = 3 (k = 1..3)
+  and n = 4 (k = 1, 2) × run budget 1 × `limit(1)` in two arms, and an arm retrying on a timed net;
+  every family in all eight default segments. 26 workflows in 61 s, slowest query 7.7 s
+  (`deadlockFree @closed`, smt).
 
 [ADR 0002]: 0002-three-layer-surface.md
 [ADR 0004]: 0004-structural-cancellation.md
