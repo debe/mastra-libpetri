@@ -670,7 +670,7 @@
         Lead keeps: `src/compiler/types.ts`, `src/compiler/gadgets/types.ts`,
         `src/compiler/compile.ts`, `src/compiler/index.ts`, `src/mastra/index.ts`,
         `src/verify/index.ts`, ADR 0015, this file
-  - [ ] W1a (parallel; nothing in it reads another's work):
+  - [x] W1a (parallel; nothing in it reads another's work):
     - **A — frame and gadget**: `src/compiler/gadgets/foreach-frame.ts` (extracted first, gated on
       an unchanged `structuralHash`, a name-and-arc snapshot and `foreach.test.ts` class counts),
       `src/compiler/gadgets/foreach.ts` (delegation only), `src/compiler/blueprints/pipeline.ts`
@@ -686,14 +686,26 @@
       `matchMinted` factored out of `blockDecision`, `refuseMisplacedBlueprints`, `innerSteps`),
       `src/compiler/resume.ts` and `src/mastra/engine.ts` (the `pipeline` refusal). Tests:
       `tests/mastra/pipeline-surface.test.ts`, `tests/mastra/adapt-pipeline.test.ts`
-  - [ ] W1b (after A): **D — verify**: `src/verify/pipeline.ts` (seven rules, a mutant each),
+  - [x] W1b (after A): **D — verify**: `src/verify/pipeline.ts` (seven rules, a mutant each),
         `src/verify/structure.ts` (`pipelineLaneAttempts` exemption), `src/verify/properties.ts`
         ("pipeline structure"), `src/verify/claims.ts` (bounds, exclusions, the overlap query).
         Tests: `tests/verify/pipeline.test.ts`
-  - [ ] W1c: **E — docs**: rows 111–118 checked against what W1 built; README's Layer 3 list
+  - [x] W1c: **E — docs**: rows 111–118 checked against what W1 built; README's Layer 3 list
+  - [x] W1 review (three lenses) and a fix round: stage resume labels name the body and item, as
+        the twin's; `getInitData()` is the body-validated item (the schema applied twice, as the
+        parent and the child each do, neither under `validateInputs: false`); per-clause mutants
+        for the structure rules; a `limit(1)` stage's quota claims proven; rule 8 on Σc_j = 1 pins
+        four dead transitions (ADR amended); `tests/engine/pipeline.test.ts` brought forward from
+        W2 with the gadget's runtime mutants G1–G7 and the decode-path refusal. Recorded, not
+        fixed: the fixed lane preference at a hand-off (row 115), a cancel not sweeping a stage
+        attempt waiting on a permit or quota (row 115), the raw item as the entry `payload` (row 112)
+  - [ ] Maintainer decision: a fair hand-off (row 115: with a fast stage 0 one item waits until
+        stage 0's queue drains). FIFO was rejected for cost; rotating lane priority is the other
+        option
   - [ ] W2 integration, agents on disjoint files, each adversarially reviewed with mutants on `src/`
-        (restored): `tests/engine/pipeline.test.ts` (overlap under ManualClock, failure drain, bail,
-        cancel holes, suspend refusal, item scope, `limit(1)` peak, run budget 1);
+        (restored): `tests/engine/pipeline.test.ts` (W1 has success, failure, bail, cancel,
+        suspend refusal, item state; still: overlap under ManualClock, failure drain, `limit(1)`
+        peak, run budget 1, the entry `payload` as once-validated — row 112);
         `tests/engine/pipeline-next.test.ts` (default-engine oracle, forced `cloneWorkflow`, twin
         differential on success / failure / cancel); `tests/verify/pipeline-blueprints.test.ts`
         (the W0 matrix, every family in every default segment, slowest query recorded, libpetri

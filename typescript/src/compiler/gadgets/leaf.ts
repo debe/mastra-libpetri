@@ -11,10 +11,10 @@ import {
   type TransitionAction,
 } from 'libpetri';
 import type { EntryPath } from '../names.js';
-import { scopeOf, viewOf, type RunScope } from '../scope.js';
+import { scopeOf, viewOf, type ItemRecords, type RunScope } from '../scope.js';
 import { StepTimeoutError } from '../timeout.js';
 import type { StepPreemptedError } from '../preempt.js';
-import type { Exits, FailureToken, FlowToken, PreemptedToken, StepOutcome, StepRecord, StepSource } from '../types.js';
+import type { Exits, FailureToken, FlowToken, PreemptedToken, RunView, StepOutcome, StepRecord, StepSource } from '../types.js';
 import type { ArmPreemption, Gadget, GadgetContext } from './types.js';
 
 /**
@@ -76,6 +76,16 @@ export const MAX_RETRIES = 100;
  * block slot enters only once it has drawn them, row 110) the record takes no start of its own. An
  * `own` verdict stands even when the block decides afterwards — a surplus success, a suspension the
  * join rewrites. Without `ctx.preempt` the leaf emits exactly what it did before M7b.
+ *
+ * **A pipeline stage's lane body** ([ADR 0015], maintainer decision 3) — `ctx.item` set, by
+ * `pipelineGadget` only — emits exactly the same transitions and arcs; only the action differs. It
+ * reads and writes through item `k`'s store, `RunScope.itemRecords(viewPath, k)` with `k` the
+ * token's `foreachIndex`: the view's `initData` is the item and `getStepResult` the item's own
+ * records, the step's record goes there instead of the run's, and the record carries no
+ * `metadata.foreachIndex` (the twin's child records carry none). The runner call has `pipelineItem:
+ * k` and no `foreachIndex`, and no `step-settled` event is raised — a stage is a step of the twin's
+ * child run, whose events the parent's stream never sees. The outcome tokens keep `foreachIndex = k`,
+ * so the hand-offs and settles know the item.
  */
 export const stepGadget: Gadget = (entry, next, ctx) => {
   if (entry.kind !== 'step') throw new Error(`stepGadget received a '${entry.kind}' entry`);
@@ -103,7 +113,7 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
   }
 
   const source = entry.source ?? 'step';
-  const { names, path, viewPath, exits, cancel, permits, preempt } = ctx;
+  const { names, path, viewPath, exits, cancel, permits, preempt, item } = ctx;
   const inPlace = place<FlowToken>(names.entryIn(path, entry.id));
   const transitions: Transition[] = [];
   if (cancel !== undefined) transitions.push(sweep(names.entryTransition(path, entry.id, 'cancel'), inPlace, cancel, exits, entry.id, viewPath));
@@ -200,6 +210,7 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
           ...(returned.length > 0 ? { returned } : {}),
           ...(timeoutMs !== undefined && timedOut !== undefined ? { timeout: { ms: timeoutMs, ...timedOut } } : {}),
           ...(preempt === undefined ? {} : { preempt }),
+          ...(item === true ? { item: true as const } : {}),
         }),
       );
     if (attempt === 0 && cancel !== undefined && demands.length === 0) run.inhibitor(cancel);
@@ -455,6 +466,12 @@ function sweep(
     .build();
 }
 
+/** A flow token without its foreach item index — a pipeline stage's view of its own token. */
+function withoutIndex(incoming: FlowToken): FlowToken {
+  const { foreachIndex: _foreachIndex, ...rest } = incoming;
+  return rest;
+}
+
 /** Carries a foreach item's index onto an origin, only when there is one. */
 function withIndex<T extends object>(origin: T, incoming: FlowToken): T & { foreachIndex?: number } {
   return incoming.foreachIndex === undefined ? origin : { ...origin, foreachIndex: incoming.foreachIndex };
@@ -564,6 +581,30 @@ interface StepActionSpec {
    * quotas back.
    */
   readonly preempt?: ArmPreemption;
+  /**
+   * A pipeline stage's lane body ([ADR 0015]): read and record through item `k`'s store, `k` the
+   * incoming token's `foreachIndex`; see {@link stepGadget}. Absent everywhere else.
+   */
+  readonly item?: true;
+}
+
+/**
+ * Where an attempt reads its prior record and writes its own: the run's store, or a pipeline item's
+ * ([ADR 0015]).
+ */
+type RecordStore = Pick<ItemRecords, 'getStepResult' | 'recordStepResult'>;
+
+/**
+ * The view a pipeline stage's attempt runs against ([ADR 0015]): the run's, with `initData` the item
+ * and `getStepResult` the item's own records — what a stage of the twin's child run sees. Read
+ * through the store on every access, so a stage reads the records of the stages before it.
+ */
+function itemViewOf(scope: RunScope, path: EntryPath, store: ItemRecords): RunView {
+  return {
+    ...viewOf(scope, path),
+    initData: store.initData,
+    getStepResult: (stepId) => store.getStepResult(stepId),
+  };
 }
 
 const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bailed', 'suspended', 'paused']);
@@ -577,7 +618,7 @@ const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bai
  * duplicate tokens and satisfy none of the `xor`'s branches.
  */
 export function stepAction(spec: StepActionSpec): TransitionAction {
-  const { stepId, path, source, attempt, from, next, exits, retry, permits, returned = [], timeout, preempt } = spec;
+  const { stepId, path, source, attempt, from, next, exits, retry, permits, returned = [], timeout, preempt, item } = spec;
   return async (tctx) => {
     const incoming = tctx.input(from) as RetryToken;
     // The permit — and every quota token ([ADR 0012]) — goes back with whichever branch is
@@ -588,8 +629,23 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     };
     const scope = scopeOf(tctx);
     const resumed = incoming.resumed === true;
+    // A pipeline stage ([ADR 0015]) reads and writes item `k`'s store; every other step the run's.
+    // A stage token without its item is the gadget's defect: thrown before anything is written.
+    const k = item === true ? incoming.foreachIndex : undefined;
+    if (item === true && k === undefined) {
+      throw new Error(`pipeline stage '${stepId}' at [${path.join(', ')}] received a token without its item index`);
+    }
+    const itemStore = k === undefined ? undefined : scope.itemRecords(path, k);
+    const store: RecordStore = itemStore ?? scope;
+    const view = itemStore === undefined ? viewOf(scope, path) : itemViewOf(scope, path, itemStore);
+    // A stage's record carries no `metadata.foreachIndex`, as the twin's child records carry none.
+    const stamped: FlowToken = k === undefined ? incoming : withoutIndex(incoming);
+    // The step's result event, raised for every step but a pipeline stage, whose events belong to
+    // the twin's child run and never reach the parent's stream.
+    const settledEvent = (record: StepRecord): Promise<void> | undefined =>
+      k === undefined ? scope.observe({ kind: 'step-settled', stepId, path, ...withIndex({}, incoming), record }) : undefined;
     // The record this step had before this call, if any — read before the runner can write one.
-    const prior = scope.getStepResult(stepId);
+    const prior = store.getStepResult(stepId);
     // Mastra stamps the step's start before its retry loop, `Date.now()` at `handlers/step.ts:166`,
     // so the first attempt reads the clock before the call and the stamp rides the retry token.
     const fresh = incoming.startedAt ?? scope.epochNow();
@@ -610,10 +666,10 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
         payload: 'stepPayload' in validated ? validated.stepPayload : incoming.data,
         ...(startedAt === undefined ? {} : { startedAt }),
         endedAt: scope.epochNow(),
-        ...metadataOf(prior, incoming),
+        ...metadataOf(prior, stamped),
       } as StepRecord;
-      scope.recordStepResult(stepId, record);
-      const observed = scope.observe({ kind: 'step-settled', stepId, path, ...withIndex({}, incoming), record });
+      store.recordStepResult(stepId, record);
+      const observed = settledEvent(record);
       if (observed !== undefined) await observed;
       const token: PreemptedToken = {
         ...origin,
@@ -632,10 +688,11 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     const deadline = timeout === undefined ? undefined : scope.armDeadline(timeout.ms, expiry);
     const call = async (): Promise<StepOutcome> => {
       const result = await scope.runner.run(stepId, incoming.data, {
-        ...viewOf(scope, path),
+        ...view,
         source,
         attempt,
-        ...(incoming.foreachIndex === undefined ? {} : { foreachIndex: incoming.foreachIndex }),
+        // A stage names its item by `pipelineItem`, never by `foreachIndex` ([ADR 0015]).
+        ...(k !== undefined ? { pipelineItem: k } : incoming.foreachIndex === undefined ? {} : { foreachIndex: incoming.foreachIndex }),
         // The attempt a resume feeds ([ADR 0007]); every retry of it too, as `executeStepWithRetry`
         // re-calls with the same params (`default.ts:455-511`).
         ...(resumed ? { resumed: true as const } : {}),
@@ -752,12 +809,12 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
       payload,
       ...(startedAt === undefined ? {} : { startedAt }),
       ...when,
-      ...metadataOf(prior, incoming),
+      ...metadataOf(prior, stamped),
     } as StepRecord;
-    scope.recordStepResult(stepId, record);
+    store.recordStepResult(stepId, record);
     // The step's final record, for its result event ([ADR 0008]) — after the write, before the
     // outputs, as Mastra publishes before it returns the step's result (`handlers/step.ts:531-545`).
-    const observed = scope.observe({ kind: 'step-settled', stepId, path, ...withIndex({}, incoming), record });
+    const observed = settledEvent(record);
     if (observed !== undefined) await observed;
 
     // A foreach's aggregate record takes the deciding item's payload and its own start

@@ -18,6 +18,63 @@ export interface RunScopeOptions {
 }
 
 /**
+ * One pipeline item's store ([ADR 0015], maintainer decision 3): its input and the records of the
+ * stages it has run, as the twin's child run holds them. Its state snapshot is the runner's, reached
+ * through `openItem` / `closeItem`.
+ */
+class KernelItemRecords implements ItemRecords {
+  #initData: unknown = undefined;
+  readonly #records = new Map<string, StepRecord>();
+  #forgotten = false;
+
+  constructor(
+    private readonly runner: StepRunner,
+    private readonly path: EntryPath,
+    private readonly k: number,
+    private readonly drop: () => void,
+  ) {}
+
+  get initData(): unknown {
+    return this.#initData;
+  }
+
+  /**
+   * Stage 0's `start`: the item becomes the store's `initData`, records start empty, and the runner
+   * snapshots the run's state for it. Opening a store twice, or one already forgotten, is a defect of
+   * the net that called it — an item is admitted once — and throws, naming the item.
+   */
+  open(initData: unknown): void {
+    if (this.#forgotten) throw new Error(`pipeline item ${this.k} at [${this.path.join(', ')}] was opened after it was forgotten`);
+    if (this.#opened) throw new Error(`pipeline item ${this.k} at [${this.path.join(', ')}] was opened twice`);
+    this.#opened = true;
+    this.#initData = initData;
+    this.#records.clear();
+    this.runner.openItem?.(this.path, this.k);
+  }
+  #opened = false;
+
+  getStepResult(stepId: string): StepRecord | undefined {
+    return this.#records.get(stepId);
+  }
+
+  recordStepResult(stepId: string, record: StepRecord): void {
+    this.#records.set(stepId, record);
+  }
+
+  /**
+   * The item left the pipeline: the store is dropped from the scope (a later ask starts fresh) and
+   * the runner merges or discards the item's state. Once only — a second `forget` would merge the
+   * snapshot twice, or discard what was merged, so it throws.
+   */
+  forget(state: 'merge' | 'discard'): void {
+    if (this.#forgotten) throw new Error(`pipeline item ${this.k} at [${this.path.join(', ')}] was forgotten twice`);
+    this.#forgotten = true;
+    this.drop();
+    this.runner.closeItem?.(this.path, this.k, state);
+  }
+}
+
+/**
  * One run's scope: its runner, its input, its signal and its step records.
  *
  * The records are Mastra's own `stepResults` — the system of record Mastra persists in
@@ -187,11 +244,33 @@ export class KernelRunScope implements RunScope {
   }
 
   /**
-   * See `RunScope.itemRecords` ([ADR 0015]). Contract stub (M7b W0): W1 B builds the store. Reached
-   * only by a pipeline's actions, which nothing can compile yet.
+   * The pipelines' item stores ([ADR 0015]), by `(path, k)` — one per item for the scope's life,
+   * which is one segment: a pipeline is never resumed (`pipeline` refusal), and a restart builds a new
+   * scope, so nothing here is persisted or carried over. An entry lives from the first ask to its
+   * {@link ItemRecords.forget}.
+   */
+  readonly #items = new Map<string, KernelItemRecords>();
+
+  /**
+   * See `RunScope.itemRecords` ([ADR 0015]): created on first ask, the same store until it is
+   * forgotten, a fresh one afterwards. Its `open` and `forget` reach the runner's `openItem` /
+   * `closeItem` — no-ops when the runner has neither — so the item's state snapshot follows the
+   * store's life exactly.
    */
   itemRecords(path: EntryPath, k: number): ItemRecords {
-    throw new Error(`itemRecords([${path.join(', ')}], ${k}): not implemented (M7b W1)`);
+    if (!Number.isInteger(k) || k < 0) {
+      throw new Error(`itemRecords([${path.join(', ')}], ${String(k)}): an item index is a whole number ≥ 0`);
+    }
+    const key = `${path.join('.')}\u0000${k}`;
+    let store = this.#items.get(key);
+    if (store === undefined) {
+      store = new KernelItemRecords(this.runner, [...path], k, () => {
+        // Only the live store is dropped: a stale handle forgotten twice never removes its successor.
+        if (this.#items.get(key) === store) this.#items.delete(key);
+      });
+      this.#items.set(key, store);
+    }
+    return store;
   }
 
   /**

@@ -11,13 +11,15 @@ import type {
   BlockDecision,
   BuildOrRun,
   EntryDescription,
+  ForeachPipeline,
   QuotaRef,
   StepDescription,
   StepSource,
   WorkflowDescription,
 } from '../compiler/types.js';
 import { entryId, type ExecutionGraph, type SingleStepEntry, type StepFlowEntry } from './host.js';
-import { Decision, decisionOf, Quota, resourcesOf } from './resources.js';
+import { FOREACH_PIPELINE, Pipeline, pipelineOf } from './pipeline.js';
+import { BLOCK_DECISION, Decision, decisionOf, Quota, resourcesOf } from './resources.js';
 
 /**
  * Mastra's tag for `.branch()`. There is no `'branch'` entry type in `StepFlowEntry`; the
@@ -163,7 +165,7 @@ export function adaptStepFlow(
   const ctx: AdaptContext = { options, quotas: new Map() };
   const adapted = entries.map((entry, index) => adaptEntry(entry, index, ctx));
   refuseMisplacedConcurrency(entries, adapted);
-  refuseMisplacedDecision(entries);
+  refuseMisplacedBlueprints(entries);
   const checkpoints = checkpointsOf(entries, adapted);
   return {
     id: options.workflowId,
@@ -233,11 +235,28 @@ function innerSteps(entry: StepFlowEntry): { inner: SingleStepEntry; role: strin
       return entry.steps.map((inner) => ({ inner, role: 'a .branch() arm' }));
     case 'loop':
       return [{ inner: entry.step, role: `the body of a .${entry.loopType}()` }];
-    case 'foreach':
-      return [{ inner: entry.step, role: 'the body of a .foreach()' }];
+    case 'foreach': {
+      const stages = pipelineStagesOf(entry);
+      return stages !== undefined
+        ? stages.map((inner) => ({ inner, role: 'a pipeline stage' }))
+        : [{ inner: entry.step, role: 'the body of a .foreach()' }];
+    }
     default:
       return [];
   }
+}
+
+/**
+ * A pipeline-marked `.foreach()`'s stage entries ([ADR 0015]) — its minted body's step graph — or
+ * `undefined` for any other entry. Read only after `adaptEntry` has matched them to the minted
+ * stages (`foreachPipeline`); before that, a forged marker reads as no stages.
+ */
+function pipelineStagesOf(entry: StepFlowEntry): readonly SingleStepEntry[] | undefined {
+  if (entry.type !== 'foreach') return undefined;
+  const marker = pipelineOf(metadataOfEntry(entry));
+  if (!(marker instanceof Pipeline) || entry.step.type !== 'step' || entry.step.step !== marker.body) return undefined;
+  const graph: unknown = (marker.body as { stepGraph?: unknown }).stepGraph;
+  return Array.isArray(graph) ? (graph as SingleStepEntry[]) : undefined;
 }
 
 function builderOf(entry: StepFlowEntry): string {
@@ -368,9 +387,11 @@ function refuseMisplacedConcurrency(entries: readonly StepFlowEntry[], adapted: 
       const where =
         entry.type === 'parallel' || entry.type === MASTRA_BRANCH_ENTRY_TYPE
           ? `A bound on this block's arms goes in its own options: \`{ metadata: { concurrency: c } }\` on the .${builderOf(entry)}() call.`
-          : entry.type === 'foreach'
-            ? 'A bound on this block\'s items goes in its own options: `.foreach(step, { concurrency: c })`, which Mastra enforces.'
-            : `A .${builderOf(entry)}() runs its body one iteration at a time; there is no fan-out to bound.`;
+          : entry.type === 'foreach' && pipelineStagesOf(entry) !== undefined
+            ? 'A bound on a pipeline stage goes in the pipeline\'s own options: `pipeline(stages, { id, concurrency: [c0, c1, …] })`.'
+            : entry.type === 'foreach'
+              ? 'A bound on this block\'s items goes in its own options: `.foreach(step, { concurrency: c })`, which Mastra enforces.'
+              : `A .${builderOf(entry)}() runs its body one iteration at a time; there is no fan-out to bound.`;
       refuse(
         entry.type,
         enclosing.id,
@@ -543,12 +564,22 @@ function adaptEntry(entry: StepFlowEntry, index: number, ctx: AdaptContext): Ent
 
     case 'foreach': {
       const id = entry.id ?? entryId(entry.step);
-      return {
-        kind: 'foreach',
-        id,
-        body: adaptSingleStep(entry.step, ctx),
-        concurrency: foreachConcurrency(id, entry.opts),
+      // A pipeline's checks run first: its `opts.concurrency` must be Σc_j, so a resolver function
+      // there is `pipeline-value`, not the plain foreach's refusal.
+      const stages = foreachPipeline(entry, id);
+      const body = adaptSingleStep(entry.step, ctx);
+      const concurrency = foreachConcurrency(id, entry.opts);
+      if (stages === undefined) return { kind: 'foreach', id, body, concurrency };
+      // Each stage through the one single-step adapter, with the PARENT's options (maintainer
+      // decision 2): `retries ?? retryConfig.attempts`, `timeout` and `uses` apply unchanged, and a
+      // quota shared with a parent step is one quota (`ctx.quotas` is the workflow's).
+      const pipeline: ForeachPipeline = {
+        stages: stages.entries.map((stage) => adaptSingleStep(stage, ctx)),
+        bounds: [...stages.bounds],
       };
+      // Present only on a pipeline, so a plain .foreach() describes, keys the compile cache and
+      // hashes exactly as before.
+      return { kind: 'foreach', id, body, concurrency, pipeline };
     }
 
     default:
@@ -1022,7 +1053,7 @@ export function blockDecision(entry: StepFlowEntry, id: string): BlockDecision |
   }
   const ids = new Set<string>();
   steps.forEach((arm, i) => {
-    if (!armMatches(arm, minted[i])) {
+    if (!matchMinted(arm, minted[i])) {
       refuse(
         type,
         id,
@@ -1039,11 +1070,14 @@ export function blockDecision(entry: StepFlowEntry, id: string): BlockDecision |
 }
 
 /**
- * Whether entry arm `arm` is minted arm `minted`, by its kind (see {@link blockDecision}): a plain
- * step or nested workflow by identity; an agent or tool by its id, and its ref and options object by
- * identity, since Mastra's `toSingleStepEntry` keeps those and not the Step object.
+ * Whether step-flow entry `arm` is the minted step `minted`, by its kind (see {@link blockDecision}):
+ * a plain step or nested workflow by identity; an agent or tool by its id, and its ref and options
+ * object by identity, since Mastra's `toSingleStepEntry` keeps those and not the Step object. Shared
+ * by a decision's arms and a pipeline's stages ([ADR 0014], [ADR 0015]).
+ *
+ * @internal Exported for the tests.
  */
-function armMatches(arm: SingleStepEntry, minted: unknown): boolean {
+export function matchMinted(arm: SingleStepEntry, minted: unknown): boolean {
   if (minted === null || (typeof minted !== 'object' && typeof minted !== 'function')) return false;
   const m = minted as {
     readonly id?: unknown;
@@ -1066,48 +1100,197 @@ function armMatches(arm: SingleStepEntry, minted: unknown): boolean {
 }
 
 /**
- * `blueprint-position` ([ADR 0014]): a decision marker on any entry but a `.parallel()` call's own
- * options — including an arm's or a body's own `metadata`. And `blueprint-reused`: one minted
- * `Decision` on more than one `.parallel()` of `entries`. Workflow-wide, as
- * `refuseMisplacedConcurrency` is.
+ * A `.foreach()` entry's pipeline ([ADR 0015]), read from its `metadata` under `FOREACH_PIPELINE`:
+ * the body's stage entries, matched to the minted stages, and the bounds; `undefined` when it carries
+ * none, so a plain foreach describes, keys the compile cache and hashes exactly as before. Repeats
+ * the factory's refusals against a forged or altered entry, in its order:
  *
- * Identity is the value under the key, so a spread copy of the metadata (which carries the same
- * `Decision`) is caught as well as the same options object passed twice.
+ * - `blueprint-arms` — the value under the key is not a minted `Pipeline`;
+ * - `pipeline-empty` — no stages;
+ * - `pipeline-value` — a bound not a whole number ≥ 1, a bound vector whose length is not the stage
+ *   count, Σc_j above `MAX_FOREACH_LANES`, or the entry's `opts.concurrency` not Σc_j (altered by
+ *   hand — Mastra keeps the options object by reference, `workflow.ts:2630-2636` — or a resolver);
+ * - `blueprint-arms` — a stage listed twice, by object or by id, or a nested-workflow stage; the
+ *   entry's step not `{ type: 'step', step: pipeline.body }`; the body's step graph not exactly the
+ *   minted stages, matched by kind ({@link matchMinted}: a step by identity, an agent or tool by id,
+ *   ref and options identity).
  *
  * @internal Exported for the tests.
  */
-export function refuseMisplacedDecision(entries: readonly StepFlowEntry[]): void {
-  const fix =
-    'A decision marks a .parallel() call\'s own options only: `.parallel(...race(arms, options))` or ' +
-    '`.parallel(...quorum(k, arms, options))`.';
-  const seen = new Map<unknown, string>();
-  entries.forEach((entry, index) => {
-    const id = topLevelId(entry, index);
-    for (const { inner, role } of innerSteps(entry)) {
-      if (decisionOf(metadataOfSingle(inner)) === undefined) continue;
-      refuse(
-        entry.type,
-        id,
-        `blueprint-position: step '${entryId(inner)}' carries a race / quorum decision in its own metadata as ${role}. ${fix}`,
-      );
+export function foreachPipeline(
+  entry: StepFlowEntry,
+  id: string,
+): { readonly entries: readonly SingleStepEntry[]; readonly bounds: readonly number[] } | undefined {
+  const value = pipelineOf(metadataOfEntry(entry));
+  if (value === undefined) return undefined;
+  const type = entry.type;
+  if (!(value instanceof Pipeline) || !Array.isArray(value.stages) || !Array.isArray(value.bounds)) {
+    refuse(
+      type,
+      id,
+      "blueprint-arms: this .foreach()'s metadata carries a pipeline that init().pipeline did not make. Build it with " +
+        '`.foreach(...pipeline(stages, { id }))`.',
+    );
+  }
+  const minted: readonly unknown[] = value.stages;
+  const bounds: readonly unknown[] = value.bounds;
+  const s = minted.length;
+  if (s === 0) refuse(type, id, 'pipeline-empty: the pipeline has no stages; a pipeline needs at least one.');
+  if (bounds.length !== s) {
+    refuse(type, id, `pipeline-value: the pipeline has ${bounds.length} bound(s) for ${s} stage(s); it needs one per stage.`);
+  }
+  bounds.forEach((c, j) => {
+    if (typeof c !== 'number' || !Number.isSafeInteger(c) || c < 1) {
+      refuse(type, id, `pipeline-value: stage ${j}'s concurrency is ${describeValue(c)}; it must be a whole number of at least 1.`);
     }
-    const decision = decisionOf(metadataOfEntry(entry));
-    if (decision === undefined) return;
-    if (entry.type !== 'parallel') {
-      refuse(entry.type, id, `blueprint-position: a race / quorum decision is on ${positionOf(entry)}. ${fix}`);
-    }
-    const first = seen.get(decision);
-    if (first !== undefined) {
-      refuse(
-        entry.type,
-        id,
-        `blueprint-reused: this block carries the same race / quorum decision as block '${first}'. A decision ` +
-          'decides one block; call race / quorum again for each .parallel().',
-      );
-    }
-    seen.set(decision, id);
   });
+  const width = (bounds as readonly number[]).reduce((sum, c) => sum + c, 0);
+  if (width > MAX_FOREACH_LANES) {
+    refuse(
+      type,
+      id,
+      `pipeline-value: the stages' concurrency adds up to ${width} items in flight, above the ${MAX_FOREACH_LANES} this ` +
+        'engine supports. Mastra has no such limit.',
+    );
+  }
+  const fix = 'Spread the very result of pipeline into this .foreach() — `.foreach(...pipeline(stages, { id }))` — without changing it.';
+  const configured: unknown = entry.type === 'foreach' ? entry.opts?.concurrency : undefined;
+  if (configured !== width) {
+    refuse(
+      type,
+      id,
+      `pipeline-value: the .foreach()'s concurrency is ${typeof configured === 'function' ? 'a function' : describeValue(configured)}, ` +
+        `but its pipeline's stages admit ${width} items at once (the sum of their concurrency). ${fix}`,
+    );
+  }
+
+  const ids = new Set<unknown>();
+  minted.forEach((stage, j) => {
+    const st = stage as { id?: unknown; component?: unknown } | null;
+    if (st === null || (typeof st !== 'object' && typeof st !== 'function')) {
+      refuse(type, id, `blueprint-arms: stage ${j} of the pipeline is not a step. ${fix}`);
+    }
+    if (minted.indexOf(stage) !== j) {
+      refuse(type, id, `blueprint-arms: stage ${j} is the same step as stage ${minted.indexOf(stage)}; a pipeline lists each stage once.`);
+    }
+    if (ids.has(st.id)) {
+      refuse(type, id, `blueprint-arms: two stages have the id ${describeId(st.id)}; each stage is recorded under its id.`);
+    }
+    ids.add(st.id);
+    if (st.component === MASTRA_WORKFLOW_COMPONENT) {
+      refuse(type, id, `blueprint-arms: stage ${j} (${describeId(st.id)}) is a nested workflow; a pipeline stage is a step, an agent or a tool.`);
+    }
+  });
+
+  const step = entry.type === 'foreach' ? entry.step : undefined;
+  if (step === undefined || step.type !== 'step' || step.step !== value.body) {
+    refuse(type, id, `blueprint-arms: the .foreach()'s step is not the body its pipeline minted. ${fix}`);
+  }
+  const graph: unknown = (value.body as { stepGraph?: unknown }).stepGraph;
+  const entries = Array.isArray(graph) ? (graph as readonly StepFlowEntry[]) : [];
+  if (entries.length !== s) {
+    refuse(type, id, `blueprint-arms: the pipeline's body has ${entries.length} entr(ies), but its pipeline was minted with ${s} stage(s). ${fix}`);
+  }
+  entries.forEach((stage, j) => {
+    const single = stage.type === 'step' || stage.type === 'agent' || stage.type === 'tool';
+    if (!single || !matchMinted(stage, minted[j])) {
+      refuse(
+        type,
+        id,
+        `blueprint-arms: entry ${j} of the pipeline's body (${single ? `'${entryId(stage)}'` : `a '${stage.type}' entry`}) is not ` +
+          `the stage it was minted with at that position. ${fix}`,
+      );
+    }
+  });
+  return { entries: entries as readonly SingleStepEntry[], bounds: bounds as readonly number[] };
 }
+
+function describeId(id: unknown): string {
+  return typeof id === 'string' ? `'${id}'` : describeValue(id);
+}
+
+/**
+ * Where each blueprint's marker belongs: the entry type its builder spreads into, and how a refusal
+ * names it and its fix. `refuseMisplacedBlueprints` walks it.
+ */
+const BLUEPRINT_POSITIONS: readonly {
+  readonly key: symbol;
+  readonly type: StepFlowEntry['type'];
+  readonly what: string;
+  readonly unit: string;
+  readonly fix: string;
+}[] = [
+  {
+    key: BLOCK_DECISION,
+    type: 'parallel',
+    what: 'race / quorum decision',
+    unit: 'block',
+    fix:
+      "A decision marks a .parallel() call's own options only: `.parallel(...race(arms, options))` or " +
+      '`.parallel(...quorum(k, arms, options))`.',
+  },
+  {
+    key: FOREACH_PIPELINE,
+    type: 'foreach',
+    what: 'pipeline',
+    unit: '.foreach()',
+    fix: "A pipeline marks a .foreach() call's own options only: `.foreach(...pipeline(stages, { id }))`.",
+  },
+];
+
+/** The value under `key` in `metadata`, own keys only; `undefined` when absent. */
+function markerOf(metadata: unknown, key: symbol): unknown {
+  if (metadata === null || typeof metadata !== 'object') return undefined;
+  if (!Object.prototype.hasOwnProperty.call(metadata, key)) return undefined;
+  return (metadata as Record<symbol, unknown>)[key];
+}
+
+/**
+ * `blueprint-position` ([ADR 0014], [ADR 0015]): a blueprint marker on any entry but the one its
+ * builder spreads into — a decision on a `.parallel()`, a pipeline on a `.foreach()` — or on any inner
+ * step's own `metadata`: an arm, a body, a pipeline stage. And `blueprint-reused`: one minted
+ * `Decision` on more than one `.parallel()`, or one minted `Pipeline` on more than one `.foreach()`, of
+ * `entries`. Workflow-wide, as `refuseMisplacedConcurrency` is; one table, {@link BLUEPRINT_POSITIONS}.
+ *
+ * Identity is the value under the key, so a spread copy of the metadata (which carries the same
+ * marker) is caught as well as the same options object passed twice.
+ *
+ * @internal Exported for the tests.
+ */
+export function refuseMisplacedBlueprints(entries: readonly StepFlowEntry[]): void {
+  for (const { key, type, what, unit, fix } of BLUEPRINT_POSITIONS) {
+    const seen = new Map<unknown, string>();
+    entries.forEach((entry, index) => {
+      const id = topLevelId(entry, index);
+      for (const { inner, role } of innerSteps(entry)) {
+        if (markerOf(metadataOfSingle(inner), key) === undefined) continue;
+        refuse(
+          entry.type,
+          id,
+          `blueprint-position: step '${entryId(inner)}' carries a ${what} in its own metadata as ${role}. ${fix}`,
+        );
+      }
+      const marker = markerOf(metadataOfEntry(entry), key);
+      if (marker === undefined) return;
+      if (entry.type !== type) {
+        refuse(entry.type, id, `blueprint-position: a ${what} is on ${positionOf(entry)}. ${fix}`);
+      }
+      const first = seen.get(marker);
+      if (first !== undefined) {
+        refuse(
+          entry.type,
+          id,
+          `blueprint-reused: this ${unit} carries the same ${what} as ${unit} '${first}'. A ${what} marks one ${unit}; ` +
+            `call ${key === BLOCK_DECISION ? 'race / quorum' : 'pipeline'} again for each.`,
+        );
+      }
+      seen.set(marker, id);
+    });
+  }
+}
+
+/** The decision suite's name for {@link refuseMisplacedBlueprints}, which now covers every blueprint. @internal */
+export const refuseMisplacedDecision = refuseMisplacedBlueprints;
 
 /** A top-level entry's id, as `adaptEntry` names it. */
 function topLevelId(entry: StepFlowEntry, index: number): string {

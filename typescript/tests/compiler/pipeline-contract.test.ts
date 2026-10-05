@@ -4,12 +4,9 @@ import { createStep as mastraCreateStep } from '@mastra/core/workflows';
 import {
   compile,
   foreachGadget,
-  pipelineGadget,
   UnresumablePositionError,
-  type CompiledWorkflow,
   type EntryDescription,
   type Gadget,
-  type PipelineSite,
   type StepDescription,
   type WorkflowDescription,
 } from '../../src/compiler/index.js';
@@ -24,12 +21,10 @@ import { netDigest, unannotatedShapes } from '../fixtures/unannotated-shapes.js'
  * The `pipeline()` contract ([ADR 0015], M7b W0): the types and stubs W1 builds against. What it pins:
  * an unannotated workflow compiles to the very net, and the very hash, it did before the contract
  * landed; a description carrying a `pipeline` hashes apart from one without it (and by its bounds);
- * every stub throws `not implemented (M7b W1)` where it is called and is never reached without a
- * pipeline; the two new refusal names; and the surface's types — `Chained<S>` and the brand — as
+ * the verify side never reaches a pipeline rule without a pipeline (the W0 stubs, built in W1, are
+ * checked to be reached); the two new refusal names; and the surface's types — `Chained<S>` and the brand — as
  * `@ts-expect-error` under `npm run check`.
  */
-
-const NOT_YET = /not implemented \(M7b W1\)/;
 
 /**
  * Computed before the contract landed (libpetri 8.0.0 from npm, not linked): `structuralHash` and
@@ -105,30 +100,34 @@ describe('structuralHash carries the pipeline only when present', () => {
   });
 });
 
-describe('the stubs throw where called', () => {
-  it('compiling a pipeline reaches pipelineGadget, which throws', () => {
+describe('the W0 stubs are built (W1)', () => {
+  it('compiling a pipeline reaches pipelineGadget and records its site', () => {
     // Breaks if: foreachGadget stops delegating, and a pipeline silently compiles as a plain foreach.
-    expect(() => compile(piped([1, 1]))).toThrow(NOT_YET);
-    expect(() => pipelineGadget(piped([1]).entries[0]!, undefined as never, undefined as never)).toThrow(NOT_YET);
+    const compiled = compile(piped([1, 1]));
+    expect(compiled.pipelines.map((p) => [p.path, p.foreachId, p.bounds])).toEqual([[[0], 'per-doc', [1, 1]]]);
   });
 
-  it('RunScope.itemRecords', () => {
+  it('RunScope.itemRecords hands out an unopened store', () => {
     const scope = new KernelRunScope({ runner: new RecordingRunner(), initData: [] });
-    expect(() => scope.itemRecords([0], 0)).toThrow(NOT_YET);
+    const records = scope.itemRecords([0], 0);
+    expect(records.initData).toBeUndefined();
+    expect(scope.itemRecords([0], 0)).toBe(records);
   });
 
-  it('the verify stubs, given a net with a pipeline', () => {
-    const compiled = compile(unpiped(piped([1])));
-    const withSite: CompiledWorkflow = { ...compiled, pipelines: [{ path: [0], foreachId: 'per-doc' } as unknown as PipelineSite] };
-    expect(() => pipelineStructureViolations(withSite)).toThrow(NOT_YET);
-    expect(() => pipelineLaneAttempts(withSite)).toThrow(NOT_YET);
+  it('the verify side answers for a compiled pipeline', () => {
+    const compiled = compile(piped([1, 1]));
+    expect(pipelineStructureViolations(compiled)).toEqual([]);
+    expect(pipelineLaneAttempts(compiled).size).toBeGreaterThan(0);
   });
 
-  it('init() binds pipeline without calling it; calling it throws', () => {
+  it('init() binds pipeline without calling it; calling it mints the entry', () => {
     const { pipeline, createStep } = init();
     expect(typeof pipeline).toBe('function');
     const s = createStep({ id: 's', inputSchema: z.number(), outputSchema: z.number(), execute: async ({ inputData }) => inputData });
-    expect(() => pipeline([s], { id: 'p' })).toThrow(NOT_YET);
+    const [body, options] = pipeline([s], { id: 'p' });
+    expect(body.id).toBe('p');
+    expect(options.concurrency).toBe(1);
+    expect((pipelineOf(options.metadata) as { bounds: readonly number[] }).bounds).toEqual([1]);
   });
 });
 

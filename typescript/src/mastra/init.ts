@@ -290,9 +290,9 @@ export type PetriQuorum = <const TArms extends readonly PetriStep<string, any, a
 ) => [arms: TArms, options: DecisionEntryOptions];
 
 /**
- * `init().pipeline` ([ADR 0015]): a `.foreach()` over a chain of stages, compiled into the parent net
- * with `c_j` lanes per stage, each item handed lane to lane — stage 2 of item 1 runs while stage 1 of
- * item 2 does. Spread into Mastra's own `.foreach()`:
+ * `init().pipeline` ([ADR 0015]): a `.foreach()` over a chain of stages, each stage running at most
+ * `concurrency[j]` items at once; an item moves from stage to stage, so stage 2 of item 1 runs while
+ * stage 1 of item 2 does. Spread into Mastra's own `.foreach()`:
  *
  * ```ts
  * wf.foreach(...pipeline([fetchDoc, embed, store], { id: 'per-doc', concurrency: [2, 1, 1] }))

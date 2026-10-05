@@ -71,7 +71,7 @@ property. They compose because they are subnets over shared places.
 | `rateLimit(burst, per)` | one provider quota shared across *different* steps | no cross-step resource concept |
 | `race()` | first result wins, losers structurally excluded | `.branch()` is inclusive — every truthy arm runs and all join |
 | `quorum(k, n)` | proceed when k of n agree | joins are all-or-nothing |
-| `pipeline()` | stage 2 of item 1 while stage 1 of item 2 runs | join-before-next-index is the IR's defining property |
+| `pipeline(stages, { id, concurrency })` | a bound per stage, items handed stage to stage, so stage 2 of item 1 runs while stage 1 of item 2 does; spread into `.foreach()`, its stages compiled into the parent's net and its proofs ([ADR 0015](docs/adr/0015-pipeline.md), Layer 3) | `.foreach(nestedWorkflow)` overlaps stages but bounds only the items in flight, never a stage, and a stage's `limit` is each child run's own |
 | `supersede()` | new input invalidates in-flight work | a cancelled flag read inside an action is the classic stall |
 | `correlate(key)` | overlapping groups joined by identity | no way to pair results across concurrent groups |
 | `compensate()` | saga rollback | no rollback story; failure propagates |

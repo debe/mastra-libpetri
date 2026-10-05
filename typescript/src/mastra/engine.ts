@@ -7,7 +7,7 @@ import type { Clock } from 'libpetri';
 import type { DebugSessionRegistry } from 'libpetri/debug';
 import { compile } from '../compiler/compile.js';
 import { HostPreconditionError } from '../compiler/gadgets/leaf.js';
-import { resumeSeed, UnresumablePositionError, type ResumeSeed } from '../compiler/resume.js';
+import { pipelineRefusal, resumeSeed, UnresumablePositionError, type ResumeSeed } from '../compiler/resume.js';
 import { restartSeed, UnrestartablePositionError, type RestartSeed } from '../compiler/restart.js';
 import type { CheckpointEvent, CompiledWorkflow, StepRecord, WorkflowDescription } from '../compiler/types.js';
 import { runWorkflowDetailed, type RunReport, type TransitionFailure } from '../engine/kernel.js';
@@ -780,7 +780,8 @@ function shapeOf(entry: unknown): unknown {
  *
  * - `UnresumablePositionError` from the compiler — nothing resumable there, the workflow changed
  *   since the run suspended (Mastra resumes blindly; this engine refuses by name, decision 2), a
- *   nested workflow inside a `.foreach()`, or a stored shape the design does not resume.
+ *   nested workflow inside a `.foreach()`, a suspended `pipeline()` stage ([ADR 0015], `pipeline`),
+ *   or a stored shape the design does not resume.
  */
 function placeResume(params: ExecuteParams, compiled: CompiledWorkflow): { decoded: DecodedResume; seed: ResumeSeed } {
   const { workflowId, runId } = params;
@@ -789,7 +790,13 @@ function placeResume(params: ExecuteParams, compiled: CompiledWorkflow): { decod
   try {
     decoded = decodeResume(params, compiled);
   } catch (error) {
-    throw refusal(error, workflowId, runId, stepId);
+    // A stored position that does not decode, under a pipeline's body id, is still a pipeline's
+    // suspension ([ADR 0015]): refused by that name, not as `no-site`.
+    const piped =
+      error instanceof UnresumablePositionError && error.reason === 'no-site'
+        ? pipelineRefusal(compiled, error.path, params.resume?.steps ?? [])
+        : undefined;
+    throw refusal(piped ?? error, workflowId, runId, stepId);
   }
   let seed: ResumeSeed;
   try {
@@ -816,7 +823,7 @@ const REASONS: Record<UnresumablePositionError['reason'], (e: UnresumablePositio
   'no-site': (e) => `nothing at that position can be resumed (${e.message})`,
   'id-mismatch': () => 'the workflow changed since the run suspended',
   'foreach-nested': () => 'a nested workflow inside a .foreach() cannot be resumed yet',
-  // [ADR 0015]: never thrown until W1 C resolves it in `resumeSeed`.
+  // [ADR 0015], maintainer decision 4: resolved from `CompiledWorkflow.pipelines` by `resumeSeed`.
   pipeline: () => 'a suspended pipeline() stage cannot be resumed yet',
   unsupported: (e) => e.message,
 };

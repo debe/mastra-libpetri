@@ -21,6 +21,7 @@ import {
 import { budgetStructureViolations } from './budget.js';
 import { poolSinks, poolStructureViolations } from './pools.js';
 import { decisionStructureViolations } from './decision.js';
+import { pipelineStructureViolations } from './pipeline.js';
 import { initialCounts } from '../engine/kernel.js';
 import { dischargeBySiphon, emptySiphon, wholeMs } from './siphon.js';
 
@@ -305,7 +306,10 @@ function compareSiteKeys(a: string, b: string): number {
  * permits adds its quiescence claim to the set: `poolReturned(<pool>)` for slots and a `limit`,
  * `demandDrained(<demand>)` for a rate quota's bucket. So does `decision structure`
  * (`decisionStructureViolations`, [ADR 0014]): every `race` / `quorum` block's counted decision is
- * the shape its bounds, its exclusion and its liveness rest on — empty when there is none.
+ * the shape its bounds, its exclusion and its liveness rest on — empty when there is none — and
+ * `pipeline structure` (`pipelineStructureViolations`, [ADR 0015]): every `pipeline()`'s hand-offs,
+ * settles, drops and finishers the shape its bounds, its exclusions and the suspension-coverage
+ * exemption of its lane attempts rest on.
  *
  * **A bound on a place no run can mark is proven from the arcs.** `neverCanceled` in a segment no
  * cancel arrives in: `wf.cancel.request` and `wf.cancel` start empty and nothing marks them, so every
@@ -332,6 +336,7 @@ export async function verifyWorkflow(
       ['step budget structure', budgetStructureViolations],
       ['pool structure', poolStructureViolations],
       ['decision structure', decisionStructureViolations],
+      ['pipeline structure', pipelineStructureViolations],
       ['resume gate structure', resumeGateViolations],
       ['suspension coverage', suspensionCoverageViolations],
       ['resume timing structure', resumeTimingViolations],
