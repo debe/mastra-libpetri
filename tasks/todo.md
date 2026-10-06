@@ -727,7 +727,14 @@
         place without a body `stateSchema`, where a default-engine child does (`workflow.ts:3646-3648`);
         not reachable through `pipeline()` (the minted body carries the schema), a nested-workflow row
 - [x] `supersede()`: deferred to M8 (ADR 0016, decision 1 A, 2026-10-06); designs D1, S2, D2 on file
-- [ ] Second wave, after `pipeline()`: `compensate()`, `circuitBreaker()`,
+- [ ] `compensate` (`docs/adr/0017-compensate.md`), decisions taken 2026-10-06 (1 A, 2 A, 3 A, 4 A):
+  - [ ] W0 spike (scratch): the ladder through the real compile path, structure checks on; C4
+        proven or the terminal-release fallback; class counts and slowest query per fixture;
+        MUT5–MUT8 and a mutant per S rule; the Mastra pins (T0, T1, the rewrap, the child merge)
+  - [ ] W0 contract (lead); W1 net / claims / host / surface; W2 integration; W3 acceptance —
+        per the ADR's Plan
+  - [ ] Later wave: compensation of parallel and branch arms, foreach and pipeline items
+- [ ] Second wave, after `pipeline()`: `circuitBreaker()`,
       `queue(depth)`, `correlate(key)`
 - [ ] Each blueprint ships with its property: `limit` with `placeBound`, `circuitBreaker` with
       reachability of the open state, `correlate` with `joinedOrDeadLettered`. A blueprint
