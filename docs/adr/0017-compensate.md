@@ -247,8 +247,9 @@ t.comp.{j}.discharge.canceled      exit.canceled + level.j     -> wf.canceled
   paths; a record rewrite for a compensator that suspends dynamically (as `forgetSuspension`, row
   107). Persistence and result formatting are unchanged: the error comes from the held token
   (`mastra/result.ts:162-175`). `quotaRefsOf` (`compile.ts:543`) walks compensators since the W0
-  contract, pinned by `compensate-contract.test.ts`; the W0 spike's did not, so a quota used only on
-  a compensator went unregistered.
+  contract, pinned by `compensate-contract.test.ts`, for the up-front checks (a duplicate quota
+  id, the "where" text). A quota used only by a compensator is registered either way, lazily on
+  first use (`quotaMember`), so no run observes the difference (W2).
 
 ### Claims ([ADR 0009])
 
@@ -316,7 +317,7 @@ O(m²)); transitivity gives the rest.
   sixth kind.
 
 **Tested, not proven:** the compensator's input equals the forward output, including after
-rehydration; the order of records, events and `stepExecutionPath`; the detached signal; equal
+rehydration; the order of records and events, and `stepExecutionPath` equal to the twin's; the detached signal; equal
 `error` and tripwire shape against T0 (never identity: `formatResultError` builds a plain `Object`,
 `default.ts:613-628`); `onError`/`onFinish` see compensator records; the terminal row holds them; a
 dynamic suspend in a compensator rewritten `failed`; a cancel mid-rollback still finishes it; a
@@ -427,7 +428,10 @@ count only on `proven` or on a confirmed counterexample, never on `Unknown`.
 
 Fixtures, intercept mode (`*` marks a compensated step; "C1–C4" counts proven claims). Measured with
 six compensator exits, before amendment 3: the W1 net has one place and one transition fewer per
-compensator (m1 34 / 37, m2 44 / 52, m3 55 / 69) and the same classes and C1–C4 counts:
+compensator (m1 34 / 37, m2 44 / 52, m3 55 / 69; retries 64 / 72, foreach 70 / 110, budget
+45 / 52, timeouts 46 / 54, timed 48 / 56, checkpoint 46 / 56; `[a*,parallel(3),c*,d]` 63 / 74) and
+one claim fewer per compensator per segment (m1 1,075, m2 1,725, m3 3,220), the same classes and
+C1–C4 counts:
 
 | Fixture | Places / transitions | Segments / claims | Classes closed / cancel | Slowest query | C1–C4 |
 |---|---|---|---|---|---|
@@ -571,8 +575,9 @@ under `.mastra/src-extracted/src/workflows/`:
   sequential.
 - Rollback progress is not durable (decision 4). Restart from a checkpoint before `k_1` re-runs
   forward work; compensators must tolerate it.
-- The engine runs steps after a failure for the first time; every consumer of `steps`,
-  `stepExecutionPath` and step events on a failed run sees compensator records.
+- The engine runs steps after a failure for the first time; every consumer of `steps` and step
+  events on a failed run sees compensator records. `stepExecutionPath` stays the forward path,
+  equal to the twin's (W2 decision).
 - The emitter is host-free and the claims are generic over a ladder, so M10's consolidation with
   temporal-libpetri and adk-libpetri starts from code, not prose.
 
@@ -636,7 +641,7 @@ Planned tests:
 | # | Behaviour | Classification | Note |
 |---|---|---|---|
 | 119 | `compensate` | addition | No Mastra word. `init().createStep({ …, compensate })` (Layer 3): when the run fails, completed compensated top-level steps are undone newest first before it settles. The twin ignores the key; the failure propagates unchanged and the effects remain |
-| 120 | Steps run after a failure | addition | Compensator records in `steps`, `stepExecutionPath`, step events (`executionPath` the compensated entry's), the terminal row and the callbacks' `steps`. Mastra stops at the first non-success (`default.ts:925-929`) |
+| 120 | Steps run after a failure | addition | Compensator records in `steps`, step events (in rollback order, after the failure's), the terminal row and the callbacks' `steps`; `stepExecutionPath` stays the forward path, as the twin's (W2 decision). Mastra stops at the first non-success (`default.ts:925-929`) |
 | 121 | A failed step is not compensated | addition | Only completed steps are armed; a step that failed or timed out ([ADR 0013]) after applying its effect is not undone |
 | 122 | A compensator that fails | addition | Per decision 2: the rollback continues and the run's `error` stays the original; the failure is in the compensator's record |
 | 123 | Cancel and rollback | addition | A failure under cancel still compensates, a rollback is never preempted, compensators get a detached signal, the run ends `canceled`. A cancel with no failure, or of a suspended run, compensates nothing, as Mastra |
