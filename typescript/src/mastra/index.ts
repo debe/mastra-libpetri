@@ -32,6 +32,7 @@ export type {
 } from './init.js';
 export { Quota } from './resources.js';
 export { StepTimeoutError } from '../compiler/timeout.js';
+export { CompensatorSuspendedError } from './runner.js';
 export { StepPreemptedError } from '../compiler/preempt.js';
 export { QuorumNotMetError } from '../compiler/blueprints/first-k.js';
 export type { ArmStatus } from '../compiler/blueprints/first-k.js';

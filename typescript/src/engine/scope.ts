@@ -290,10 +290,15 @@ export class KernelRunScope implements RunScope {
    * (which by the clock contract resolves it and releases its timer), and the run listener is
    * removed. The `ready` predicate handed to the clock is `true` once disarmed — time-free — so a
    * clock that consults it does not move time for a deadline nobody waits on.
+   *
+   * **`detached`** ([ADR 0017]): a compensator's deadline does not hear the run's abort — neither a
+   * run abort while armed nor one that had already happened disarms it — so a compensator running
+   * after a cancel is still told to stop by its own timeout, and its record is the timeout's. Only
+   * `disarm()` and the deadline firing end it.
    */
-  armDeadline(ms: number, reason: unknown): AttemptDeadline {
+  armDeadline(ms: number, reason: unknown, options?: { readonly detached?: boolean }): AttemptDeadline {
     const clock = this.#clock;
-    const run = this.signal;
+    const run = options?.detached === true ? undefined : this.signal;
     const until = clock.now() + ms;
     const controller = new AbortController();
     let resolveExpired!: () => void;
@@ -312,7 +317,7 @@ export class KernelRunScope implements RunScope {
       if (turn !== undefined) clearTimeout(turn);
       turn = undefined;
       sleeping?.abort();
-      run.removeEventListener('abort', onRunAbort);
+      run?.removeEventListener('abort', onRunAbort);
     }
     const deadline: AttemptDeadline = {
       signal: controller.signal,
@@ -322,11 +327,11 @@ export class KernelRunScope implements RunScope {
       },
       disarm,
     };
-    if (run.aborted) {
+    if (run?.aborted === true) {
       disarmed = true;
       return deadline;
     }
-    run.addEventListener('abort', onRunAbort, { once: true });
+    run?.addEventListener('abort', onRunAbort, { once: true });
 
     const loop = async (): Promise<void> => {
       while (!disarmed && clock.now() < until) {
@@ -337,7 +342,7 @@ export class KernelRunScope implements RunScope {
       }
       if (disarmed) return;
       fired = true;
-      run.removeEventListener('abort', onRunAbort);
+      run?.removeEventListener('abort', onRunAbort);
       controller.abort(reason);
       resolveExpired();
     };

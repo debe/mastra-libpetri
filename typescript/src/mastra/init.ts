@@ -19,7 +19,10 @@ import type { DynamicArgument } from '@mastra/core/types';
 import { PetriExecutionEngine, type PetriEngineOptions } from './engine.js';
 import {
   attachResources,
+  compensateProblem,
+  isParamsStep,
   limit,
+  markParamsStep,
   Quota,
   quorum,
   race,
@@ -257,10 +260,19 @@ export interface PetriCreateStep {
   ): PetriStep<TWorkflowId, TState, TInput, TOutput, any, any, TRequestContext>;
 }
 
-/** `cloneStep` on the petri engine: Mastra's, over petri steps. */
-export type PetriCloneStep = <TStepId extends string>(
-  step: Step<string, any, any, any, any, any, PetriEngineType>,
-  opts: { id: TStepId },
+/**
+ * `cloneStep` on the petri engine: Mastra's, over petri steps. The clone keeps the original's `uses`,
+ * `timeout` and compensator ([ADR 0017]); `compensate` in the options gives it another compensator in
+ * place of the original's. A compensated step used twice in one workflow needs that: the copy's
+ * compensator would otherwise share the original's id (`compensate-ids`).
+ *
+ * ```ts
+ * const reserveAgain = cloneStep(reserve, { id: 'reserve-2', compensate: cloneStep(release, { id: 'release-2' }) });
+ * ```
+ */
+export type PetriCloneStep = <TStepId extends string, TOutput = any>(
+  step: Step<string, any, any, TOutput, any, any, PetriEngineType>,
+  opts: { id: TStepId } & Undoable<TOutput>,
 ) => PetriStep<TStepId, any, any, any, any, any>;
 
 /**
@@ -393,19 +405,18 @@ export function init(options: PetriInitOptions = {}): PetriFactories {
 
   const createStep = ((source: unknown, sourceOptions?: unknown) => {
     if (source instanceof Workflow) return source;
-    // [ADR 0017]: until W1 attaches it under STEP_RESOURCES, a `compensate` key is refused here rather
-    // than dropped by Mastra's fixed field list — a step that silently undoes nothing.
-    refuseCompensateUntilBuilt(source, sourceOptions);
     const create = mastraCreateStep as (s: unknown, o?: unknown) => object;
     if (sourceOptions !== undefined) {
       // An agent or tool source. Mastra keeps the options object as `__agentOptions` /
       // `__toolOptions` and later spreads it into `agent.stream()` (`run-agent-entry.ts:37`) and the
-      // serialized graph, so `uses` / `timeout` are stripped from a shallow copy — only when present:
-      // an options object without them reaches Mastra as it was given. Nothing binds to it.
-      const resources = resourcesIn(sourceOptions);
+      // serialized graph, so `uses` / `timeout` / `compensate` are stripped from a shallow copy — only
+      // when present: an options object without them reaches Mastra as it was given. Nothing binds to it.
       if (!carriesResourceKeys(sourceOptions)) return create(source, sourceOptions);
-      const { uses: _uses, timeout: _timeout, ...options } = sourceOptions as Record<string, unknown>;
+      const { uses: _uses, timeout: _timeout, compensate: _compensate, ...options } = sourceOptions as Record<string, unknown>;
       const step = create(source, options);
+      // Judged against the Step's own id, which is what Mastra records it under and what the
+      // messages name. Building the Step first has no effect a refusal would need to undo.
+      const resources = resourcesIn(sourceOptions, idOf(step));
       if (resources !== undefined) {
         attachResources(step, resources);
         attachResources(options, resources);
@@ -414,21 +425,36 @@ export function init(options: PetriInitOptions = {}): PetriFactories {
     }
     // A params object, or a processor. Mastra builds the Step from a fixed list of the params' fields
     // and binds `execute` to the params object itself (`workflow.ts:510-530`, the bind at `:523`), so
-    // the very object is passed on: `uses` and `timeout` never reach the Step, and `this` inside
-    // `execute` is the object the author wrote, exactly as on Mastra's own `createStep`.
-    const resources = resourcesIn(source);
+    // the very object is passed on: `uses`, `timeout` and `compensate` never reach the Step — nor its
+    // `serializedStepGraph` entry (`workflow.ts:629-640`) — and `this` inside `execute` is the object
+    // the author wrote, exactly as on Mastra's own `createStep`.
+    // The Step's own id, not the source's: a processor's Step is `processor:<id>` (`workflow.ts:738`).
     const step = create(source);
+    const resources = resourcesIn(source, idOf(step));
+    // A params-form step — no `component`, which only an agent, tool or processor step has — may
+    // compensate another ([ADR 0017], `compensate-value`).
+    if ((step as { component?: unknown }).component === undefined) markParamsStep(step);
     if (resources !== undefined) attachResources(step, resources);
     return step;
   }) as PetriCreateStep;
 
   // Mastra's `cloneStep` copies a fixed list of fields (`workflow.ts:1648-1666`) — not the
   // non-enumerable resources, nor an agent or tool step's `__agentOptions` / `__toolOptions` — so the
-  // clone gets the original's resources here.
-  const cloneStep = ((step: object, opts: { id: string }) => {
-    const clone = (mastraCloneStep as (s: object, o: { id: string }) => object)(step, opts);
-    const resources = resourcesOf(step);
+  // clone gets the original's resources here, its compensator ([ADR 0017]) included, and a clone of a
+  // params-form step is one too: `cloneStep(release, { id })` is how one undo serves two steps.
+  // `opts.compensate` replaces the compensator, judged as the petri `createStep` judges one; only
+  // `id` reaches Mastra.
+  const cloneStep = ((step: object, opts: { id: string; compensate?: unknown }) => {
+    const clone = (mastraCloneStep as (s: object, o: { id: string }) => object)(step, { id: opts.id });
+    const { compensate } = opts;
+    if (compensate !== undefined) {
+      const problem = compensateProblem(opts.id, compensate, clone, (step as { metadata?: unknown }).metadata);
+      if (problem !== undefined) throw new TypeError(`cloneStep('${opts.id}'): ${problem.code}: ${problem.why}`);
+    }
+    const original = resourcesOf(step);
+    const resources = compensate === undefined ? original : { ...original, compensate: compensate as object };
     if (resources !== undefined) attachResources(clone, resources);
+    if (isParamsStep(step)) markParamsStep(clone);
     return clone;
   }) as unknown as PetriCloneStep;
 
@@ -444,54 +470,49 @@ export function init(options: PetriInitOptions = {}): PetriFactories {
   };
 }
 
-/**
- * `compensate` on a params object, or on an agent's or tool's options ([ADR 0017]).
- *
- * Contract stub (M7b W0): W1 (surface) attaches the compensator under `STEP_RESOURCES` (stripping the
- * key from an agent's or tool's options copy, as `uses` / `timeout`) and refuses what it must
- * (`COMPENSATE_REFUSALS`). Until then a step declaring one throws; a step without the key never
- * reaches this.
- */
-function refuseCompensateUntilBuilt(source: unknown, sourceOptions: unknown): void {
-  const carrier = sourceOptions === undefined ? source : sourceOptions;
-  if (carrier === null || typeof carrier !== 'object') return;
-  const proto: unknown = Object.getPrototypeOf(carrier);
-  if (proto !== Object.prototype && proto !== null) return;
-  if (!Object.hasOwn(carrier, 'compensate') || (carrier as { compensate?: unknown }).compensate === undefined) return;
-  const id: unknown = (source as { id?: unknown } | null)?.id;
-  throw new Error(`createStep('${String(id)}'): compensate: not implemented (M7b W1)`);
+/** A built Step's id, for messages: the key Mastra records the step under. */
+function idOf(step: object): string {
+  return String((step as { id?: unknown }).id);
 }
 
 /**
- * Whether a plain object — a params object or an agent/tool options object — has a `uses` or
- * `timeout` key. An `Agent`, `Tool` or processor is a class instance whose own fields are not this
- * engine's to read.
+ * Whether a plain object — a params object or an agent/tool options object — has a `uses`,
+ * `timeout` or `compensate` key. An `Agent`, `Tool` or processor is a class instance whose own fields
+ * are not this engine's to read.
  */
 function carriesResourceKeys(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object') return false;
   const proto: unknown = Object.getPrototypeOf(value);
   if (proto !== Object.prototype && proto !== null) return false;
-  return Object.hasOwn(value, 'uses') || Object.hasOwn(value, 'timeout');
+  return Object.hasOwn(value, 'uses') || Object.hasOwn(value, 'timeout') || Object.hasOwn(value, 'compensate');
 }
 
 /**
- * The resources a `createStep` argument declares ([ADR 0012], [ADR 0013]): `undefined` when it
- * declares none — no `uses` (or an empty one) and no `timeout`. `uses` must be an array of quotas
- * minted by `init().limit` / `init().rateLimit`; anything else is refused here, since the brand's
- * type check does not reach a caller that casts. `timeout` is carried as given: the adapter refuses
- * a bad value as `timeout-value`, by the entry it names.
+ * The resources a `createStep` argument declares ([ADR 0012], [ADR 0013], [ADR 0017]): `undefined`
+ * when it declares none — no `uses` (or an empty one), no `timeout` and no `compensate`. `uses` must
+ * be an array of quotas minted by `init().limit` / `init().rateLimit`; anything else is refused here,
+ * since the brand's type check does not reach a caller that casts. `timeout` is carried as given: the
+ * adapter refuses a bad value as `timeout-value`, by the entry it names. `compensate` is refused here
+ * by everything a step can know of itself (`compensateProblem`: `compensate-value`, `-ids`,
+ * `-suspend`, `-checkpoint`); where it sits in a workflow (`compensate-position`) and the
+ * workflow-wide id rules are the adapter's. `forwardId` names the step being built.
  */
-function resourcesIn(value: unknown): StepResources | undefined {
+function resourcesIn(value: unknown, forwardId: string): StepResources | undefined {
   if (!carriesResourceKeys(value)) return undefined;
-  const { uses, timeout } = value as { uses?: unknown; timeout?: unknown };
+  const { uses, timeout, compensate, metadata } = value as { uses?: unknown; timeout?: unknown; compensate?: unknown; metadata?: unknown };
   if (uses !== undefined && (!Array.isArray(uses) || !uses.every((q) => q instanceof Quota))) {
     throw new TypeError('createStep: `uses` takes quotas made by init().limit or init().rateLimit');
   }
+  if (compensate !== undefined) {
+    const problem = compensateProblem(forwardId, compensate, undefined, metadata);
+    if (problem !== undefined) throw new TypeError(`createStep('${forwardId}'): ${problem.code}: ${problem.why}`);
+  }
   const quotas = (uses as readonly Quota[] | undefined) ?? [];
-  if (quotas.length === 0 && timeout === undefined) return undefined;
+  if (quotas.length === 0 && timeout === undefined && compensate === undefined) return undefined;
   return {
     ...(quotas.length === 0 ? {} : { quotas }),
     ...(timeout === undefined ? {} : { timeoutMs: timeout as number }),
+    ...(compensate === undefined ? {} : { compensate: compensate as object }),
   };
 }
 

@@ -19,7 +19,7 @@ import type {
 } from '../compiler/types.js';
 import { entryId, type ExecutionGraph, type SingleStepEntry, type StepFlowEntry } from './host.js';
 import { FOREACH_PIPELINE, Pipeline, pipelineOf } from './pipeline.js';
-import { BLOCK_DECISION, Decision, decisionOf, Quota, resourcesOf } from './resources.js';
+import { BLOCK_DECISION, compensateProblem, Decision, decisionOf, Quota, resourcesOf } from './resources.js';
 
 /**
  * Mastra's tag for `.branch()`. There is no `'branch'` entry type in `StepFlowEntry`; the
@@ -117,8 +117,9 @@ export type BlueprintRefusal = (typeof BLUEPRINT_REFUSALS)[number];
  *   entry (maintainer decision 4 A), so a restart from a checkpoint never has a completed compensated
  *   step behind it.
  *
- * Contract (M7b W0): the names are fixed here; W1 (surface) throws them, in `init()`'s `createStep`
- * and in this adapter.
+ * `init()`'s `createStep` throws every one a step can see of itself (`compensateProblem`,
+ * `resources.ts`); this adapter repeats those against the step flow and adds what only the workflow
+ * shows: position, the workflow-wide ids and the checkpoints (`refuseCompensateShapes`).
  */
 export const COMPENSATE_REFUSALS = [
   'compensate-position',
@@ -204,6 +205,7 @@ export function adaptStepFlow(
   refuseMisplacedConcurrency(entries, adapted);
   refuseMisplacedBlueprints(entries);
   const checkpoints = checkpointsOf(entries, adapted);
+  refuseCompensateShapes(entries, adapted);
   return {
     id: options.workflowId,
     entries: adapted,
@@ -517,7 +519,8 @@ function adaptEntry(entry: StepFlowEntry, index: number, ctx: AdaptContext): Ent
     case 'agent':
     case 'tool':
     case 'mapping':
-      return adaptSingleStep(entry, ctx);
+      // The one position a `compensate` may sit ([ADR 0017]): a top-level single step.
+      return adaptSingleStep(entry, ctx, 'top');
 
     case 'sleep':
       return adaptSleep(entry);
@@ -640,13 +643,14 @@ function adaptEntry(entry: StepFlowEntry, index: number, ctx: AdaptContext): Ent
  * This is also the only thing a `.parallel()` / `.branch()` arm or a loop / `.foreach()` body can
  * be (`types.d.ts:577,583,601,619`), so anything else in that position is refused.
  */
-function adaptSingleStep(entry: SingleStepEntry, ctx: AdaptContext): StepDescription {
+function adaptSingleStep(entry: SingleStepEntry, ctx: AdaptContext, position: 'top' | 'inner' = 'inner'): StepDescription {
   const { options } = ctx;
   const source = sourceOf(entry);
   const id = entryId(entry);
   const retries = effectiveRetries(entry, id, options);
   const retryDelayMs = retries > 0 ? retryDelay(entry.type, id, options) : 0;
-  const { timeoutMs, quotas } = stepResources(entry, id, ctx);
+  const { timeoutMs, quotas, compensator } = stepResources(entry, id, ctx);
+  const compensate = compensator === undefined ? undefined : describeCompensator(entry, id, compensator, position, ctx);
   return {
     kind: 'step',
     id,
@@ -657,7 +661,145 @@ function adaptSingleStep(entry: SingleStepEntry, ctx: AdaptContext): StepDescrip
     // keys the compile cache and hashes exactly as before M7.
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(quotas.length > 0 ? { quotas } : {}),
+    // Absent unless the petri createStep attached one ([ADR 0017]), so an uncompensated step
+    // describes, keys the compile cache and hashes exactly as before M7b's second wave.
+    ...(compensate !== undefined ? { compensate } : {}),
   };
+}
+
+/**
+ * A step's compensator ([ADR 0017]) as the compiler sees it: refused unless the step is a top-level
+ * single step (`compensate-position`; the last entry is the workflow-wide check's), and unless the
+ * compensator passes every check the petri `createStep` made of it (`compensateProblem`, repeated
+ * word for word against a carrier attached by hand or altered since). Then described as any step is,
+ * through {@link adaptSingleStep} with the parent's options (maintainer decision 1): retries are
+ * `compensator.retries ?? retryConfig.attempts` (`handlers/step.ts:314`), the retry delay the
+ * workflow's, and its own `timeout` and `uses` apply — a quota shared with a forward step is one
+ * quota, and a different object under one id is `quota-id-collision`, as anywhere in the workflow.
+ */
+function describeCompensator(
+  entry: SingleStepEntry,
+  id: string,
+  compensator: object,
+  position: 'top' | 'inner',
+  ctx: AdaptContext,
+): StepDescription {
+  if (position !== 'top' || entry.type === 'mapping') {
+    refuse(
+      entry.type,
+      id,
+      `compensate-position: step '${id}' carries compensate, but only a step added with .then() at the top ` +
+        'level of the workflow can be undone: not a .parallel() or .branch() arm (race and quorum included), ' +
+        'not the body of a .dowhile(), .dountil() or .foreach(), and not a pipeline stage. Add the step with ' +
+        '.then(), or move the undo into the enclosing step.',
+    );
+  }
+  const forward = entry.type === 'step' ? entry.step : undefined;
+  const problem = compensateProblem(id, compensator, forward, metadataOfSingle(entry));
+  if (problem !== undefined) refuse(entry.type, id, `${problem.code}: ${problem.why}`);
+  return adaptSingleStep({ type: 'step', step: compensator as Extract<SingleStepEntry, { type: 'step' }>['step'] }, ctx);
+}
+
+/**
+ * The workflow-wide `compensate` refusals ([ADR 0017]), over the top-level entries and their
+ * descriptions, once each step's own checks have passed:
+ *
+ * - `compensate-position` — the last top-level entry carries one: nothing after it can fail, so its
+ *   undo could never run.
+ * - `compensate-ids` — a compensator's id is the id of a step of the workflow (an entry, an arm, a
+ *   body, a pipeline stage) or of another compensator; or a step that carries `compensate` appears
+ *   more than once. Mastra records each step under its id and keeps the latest, so either way one
+ *   record would stand for two steps, and an undo would read, or overwrite, the wrong one.
+ * - `compensate-checkpoint` — `metadata.checkpoint: true` on an entry at or after the first step that
+ *   carries `compensate` (maintainer decision 4), the last entry included: a restart from it would
+ *   skip the undo of a step that already ran.
+ *
+ * Scoped to this workflow, as `quota-id-collision` is: a nested workflow is its own run, adapted on
+ * its own.
+ */
+function refuseCompensateShapes(entries: readonly StepFlowEntry[], adapted: readonly EntryDescription[]): void {
+  const first = adapted.findIndex((d) => d.kind === 'step' && d.compensate !== undefined);
+  if (first < 0) return;
+  const last = adapted.length - 1;
+  const lastEntry = adapted[last]!;
+  if (lastEntry.kind === 'step' && lastEntry.compensate !== undefined) {
+    refuse(
+      entries[last]!.type,
+      lastEntry.id,
+      `compensate-position: step '${lastEntry.id}' carries compensate, but it is the last step of the workflow, ` +
+        'so nothing after it can fail and its compensator could never run. Remove compensate from it.',
+    );
+  }
+
+  const graphIds = new Map<string, number>();
+  const count = (id: string) => graphIds.set(id, (graphIds.get(id) ?? 0) + 1);
+  for (const d of adapted) {
+    count(d.id);
+    switch (d.kind) {
+      case 'parallel':
+      case 'branch':
+        d.arms.forEach((arm) => count(arm.id));
+        break;
+      case 'loop':
+        if (d.body.id !== d.id) count(d.body.id);
+        break;
+      case 'foreach':
+        if (d.body.id !== d.id) count(d.body.id);
+        d.pipeline?.stages.forEach((stage) => count(stage.id));
+        break;
+      default:
+        break;
+    }
+  }
+  const compensatorIds = new Map<string, string>();
+  adapted.forEach((d, index) => {
+    if (d.kind !== 'step' || d.compensate === undefined) return;
+    const type = entries[index]!.type;
+    if ((graphIds.get(d.id) ?? 0) > 1) {
+      refuse(
+        type,
+        d.id,
+        `compensate-ids: step '${d.id}' carries compensate and its id appears more than once in the workflow. Mastra ` +
+          'records each step under its id and keeps the latest, so its undo could read the wrong output. Give each ' +
+          `further use its own id and its own compensator: cloneStep(step, { id, compensate: cloneStep(compensator, { id }) }), ` +
+          `where step is '${d.id}' and compensator is its compensate '${d.compensate.id}' (a clone keeps the compensator, ` +
+          'so without compensate its id would collide in turn).',
+      );
+    }
+    const u = d.compensate.id;
+    if (graphIds.has(u)) {
+      refuse(
+        type,
+        d.id,
+        `compensate-ids: its compensate has the id '${u}', which a step of this workflow already has. Mastra records ` +
+          'each step under its id, so the undo would replace that step\'s record. Give the compensator its own id ' +
+          `with cloneStep(compensator, { id }), and pass that copy as compensate where step '${d.id}' is built.`,
+      );
+    }
+    const other = compensatorIds.get(u);
+    if (other !== undefined) {
+      refuse(
+        type,
+        d.id,
+        `compensate-ids: its compensate has the id '${u}', as step '${other}''s does. Mastra records each step under ` +
+          `its id, so one undo's record would replace the other's. Give step '${d.id}' its own copy, ` +
+          'cloneStep(compensator, { id }), as compensate: to createStep, or to cloneStep(step, { id, compensate }) when ' +
+          `'${d.id}' is itself a copy.`,
+      );
+    }
+    compensatorIds.set(u, d.id);
+  });
+
+  for (let index = first; index <= last; index++) {
+    if (!checkpointMark(metadataOfEntry(entries[index]!), entries[index]!.type, adapted[index]!.id)) continue;
+    refuse(
+      entries[index]!.type,
+      adapted[index]!.id,
+      `compensate-checkpoint: it is marked metadata.checkpoint, at or after step '${adapted[first]!.id}', which ` +
+        'carries compensate. A restart from this checkpoint would skip the undo of a step that already ran. Mark a ' +
+        'checkpoint only before the first step that carries compensate.',
+    );
+  }
 }
 
 /**
@@ -700,7 +842,7 @@ function stepResources(
   entry: SingleStepEntry,
   id: string,
   ctx: AdaptContext,
-): { readonly timeoutMs?: number; readonly quotas: readonly QuotaRef[] } {
+): { readonly timeoutMs?: number; readonly quotas: readonly QuotaRef[]; readonly compensator?: object } {
   const carrier = carrierOf(entry);
   if (carrier === undefined) return { quotas: [] };
   const resources = resourcesOf(carrier);
@@ -749,7 +891,14 @@ function stepResources(
     }
     quotas.push(ref);
   }
-  return { ...(timeoutMs !== undefined ? { timeoutMs: timeoutMs as number } : {}), quotas };
+  const compensator: unknown = resources.compensate;
+  return {
+    ...(timeoutMs !== undefined ? { timeoutMs: timeoutMs as number } : {}),
+    quotas,
+    // `null` or a primitive under the key is still a compensate the author asked for: carried on, so
+    // `compensateProblem` refuses it by name (`compensate-value`).
+    ...(compensator !== undefined ? { compensator: compensator as object } : {}),
+  };
 }
 
 /** The object a single step's resources are attached to, or `undefined` for a `.map()`. */
@@ -813,7 +962,21 @@ function quotaRef(quota: unknown, type: string, id: string): QuotaRef {
 function refuseUnattachedResources(entry: SingleStepEntry, id: string, carrier: object): void {
   const proto: unknown = Object.getPrototypeOf(carrier);
   if (proto !== Object.prototype && proto !== null) return;
-  const { uses, timeout } = carrier as { uses?: unknown; timeout?: unknown };
+  const { uses, timeout, compensate } = carrier as { uses?: unknown; timeout?: unknown; compensate?: unknown };
+  if (compensate !== undefined) {
+    // [ADR 0017]: the compensate counterpart of `uses-position` — a declarative .agent() / .tool(), or a
+    // step built by hand or by Mastra's own factories, whose `compensate` nothing attached.
+    const what = entry.type === 'step' ? 'step' : `${entry.type}'s options`;
+    refuse(
+      entry.type,
+      id,
+      `compensate-position: this ${what} carries compensate, but it never passed through the petri createStep, so ` +
+        'nothing attached it and the step would never be undone. Mastra passes the options of a declarative .agent() / ' +
+        `.tool() entry, and of its own createStep, through unread. Build the step with init().createStep(` +
+        `${entry.type === 'tool' ? 'tool, { compensate }' : entry.type === 'agent' ? 'agent, { compensate }' : '{ …, compensate }'}) ` +
+        'and add it with .then().',
+    );
+  }
   const asks = [
     ...((Array.isArray(uses) ? uses.length > 0 : uses !== undefined) ? ['`uses`'] : []),
     ...(timeout !== undefined ? ['`timeout`'] : []),

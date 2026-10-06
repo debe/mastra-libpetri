@@ -30,6 +30,7 @@ import { runScorersForStep, type RunScorersParams } from './scorers.js';
 import type { StepSpans } from './spans.js';
 import { toMastraStepResult } from './step-result.js';
 import { attemptGate, reportedVerdict, type AttemptGate } from './attempt-gate.js';
+import { compensatorOf } from './resources.js';
 
 /** `validateStepInput`'s result: the input every attempt uses, and the error that fails them all. */
 interface ValidatedInput {
@@ -353,7 +354,10 @@ export class MastraStepRunner implements StepRunner {
    * that metadata, so it is what is kept. Resume labels go to {@link resumeLabels}.
    */
   async run(stepId: string, input: unknown, call: StepCall): Promise<StepOutcome> {
-    const entry = call.pipelineItem === undefined ? this.#resolveStep(call.path, stepId) : this.#resolveStage(call.path, stepId).entry;
+    const entry =
+      call.pipelineItem !== undefined ? this.#resolveStage(call.path, stepId).entry
+      : call.detached === true ? this.#resolveCompensator(call.path, stepId)
+      : this.#resolveStep(call.path, stepId);
     const foreachIndex = call.foreachIndex;
     const step = this.#runnable(entry);
     const nested = step.component === NESTED_WORKFLOW;
@@ -449,6 +453,8 @@ export class MastraStepRunner implements StepRunner {
     // a discarded attempt never touches the run's labels, so it can neither name a step whose record
     // is not `suspended` nor erase a label of the same name another step wrote.
     const pending: [string, ResumeLabel][] = [];
+    // A compensator's attempt ([ADR 0017]); read inside `execute`, where `call` names another thing.
+    const detached = call.detached === true;
     // What a label names. A pipeline stage's names what the twin's does ([ADR 0015]): the child run
     // re-suspends the nested step under the same labels (`workflow.ts:3087`), which the parent's
     // `suspend` records as the body at the item (`handlers/step.ts:399-411`) — so `Run.resume({ label
@@ -500,10 +506,15 @@ export class MastraStepRunner implements StepRunner {
               validateInputs: this.#o.validateInputs,
             });
             if (suspendError) throw suspendError;
-            // Whether they stand is the verdict's, frozen when the step settles ([ADR 0014]).
-            for (const label of labelsOf(options)) {
-              pending.push([label, labelTarget]);
-              if (!gate.decisive) this.#resumeLabels[label] = labelTarget;
+            // Whether they stand is the verdict's, frozen when the step settles ([ADR 0014]). A
+            // compensator's never do ([ADR 0017], row 125): its suspension is rewritten `failed`
+            // below, so a label naming it would name a step nothing can resume — and writing one
+            // could overwrite a live label of the same name.
+            if (!detached) {
+              for (const label of labelsOf(options)) {
+                pending.push([label, labelTarget]);
+                if (!gate.decisive) this.#resumeLabels[label] = labelTarget;
+              }
             }
             suspension = { data: suspendData };
             // Marks the attempt suspended; its stamped copy of the data is replaced below.
@@ -568,8 +579,20 @@ export class MastraStepRunner implements StepRunner {
     if (verdict.kind !== 'own') {
       return { ...toOutcome({ ...raw, payload: inputData }), verdict: reportedVerdict(verdict, true) };
     }
-    for (const [label, target] of pending) this.#resumeLabels[label] = target;
     const frozen = gate.decisive ? { verdict: reportedVerdict(verdict, true) } : {};
+    if (detached && raw['status'] === 'suspended') {
+      // [ADR 0017], row 125: a rollback is never resumable, so a compensator that suspends
+      // dynamically (a declared schema is refused, `compensate-suspend`) is **unresolved**: its
+      // outcome is rewritten `failed`, non-retryable — a retry would only suspend again — and the
+      // rollback continues past it (maintainer decision 2). As a failed step's, its `setState` is
+      // dropped and no scorer runs; it named no resume label (see `suspend` above), so none is left
+      // to forget. The suspend data rides on the error.
+      if (suspension === undefined) throw new Error(`step '${stepId}' suspended without calling the suspend it was given`);
+      const { suspendPayload: _sp, suspendOutput: _so, suspendedAt: _sa, ...rest } = raw;
+      const error = new CompensatorSuspendedError(stepId, call.path, suspension.data);
+      return { ...toOutcome({ ...rest, status: 'failed', error, nonRetryable: true, payload: inputData }), ...frozen };
+    }
+    for (const [label, target] of pending) this.#resumeLabels[label] = target;
     // Applied once the step has run without failing, suspended and bailed included, as the
     // default engine applies `contextMutations.stateUpdate` whenever the attempt returned.
     // A pipeline stage's update goes to its item's snapshot ([ADR 0015]), the run's at the item's merge.
@@ -1081,6 +1104,26 @@ export class MastraStepRunner implements StepRunner {
   }
 
   /**
+   * A compensator ([ADR 0017]): the call is `detached` and its view path `[k]` is the entry it
+   * compensates — a top-level `.then()` step — so the step to run is not the one at the path but the
+   * compensator that entry's step carries under `STEP_RESOURCES` (on the Step, or on an agent's or
+   * tool's options), checked against the id. Resolved as a plain `step` entry: `compensate-value`
+   * refuses a workflow, an agent or a tool as a compensator.
+   */
+  #resolveCompensator(path: EntryPath, stepId: string): SingleStepEntry {
+    const top = path.length === 1 ? this.#o.graph.steps[path[0]!] : undefined;
+    // The carrier the adapter read it from (`adapt.ts` `carrierOf`): the Step of a `step` entry, the
+    // options of a declarative `agent` / `tool` entry — what `createStep(agent | tool, { compensate })`
+    // becomes once added with `.then()`.
+    const carrier = top?.type === 'step' ? top.step : top?.type === 'agent' || top?.type === 'tool' ? top.options : undefined;
+    const compensator = carrier === undefined ? undefined : compensatorOf(carrier);
+    if (compensator === undefined || (compensator as { readonly id?: unknown }).id !== stepId) {
+      throw new Error(`no compensator '${stepId}' for the step at path ${path.join('-')} in workflow '${this.#o.workflowId}'`);
+    }
+    return { type: 'step', step: compensator as MastraStep } as PlainStepEntry;
+  }
+
+  /**
    * A pipeline stage ([ADR 0015]): the `.foreach()` at the view path, whose body is the minted nested
    * workflow, and the body's single-step entry with the stage's id — never the item, which is the
    * call's input. `index` is the stage's position in the body.
@@ -1117,6 +1160,26 @@ export class MastraStepRunner implements StepRunner {
       },
       has: (_, key) => typeof key === 'string' && (view.getStepResult(key) !== undefined || key === 'input'),
     });
+  }
+}
+
+/**
+ * A compensator suspended dynamically ([ADR 0017], `docs/divergences.md` row 125): a rollback is never
+ * resumable, so its outcome is recorded `failed` with this error, non-retryable, and the rollback
+ * continues; the run keeps its original error (maintainer decision 2). `suspendPayload` is the data
+ * `suspend` was called with, validated; `path` the view path, the compensated entry's `[k]`.
+ */
+export class CompensatorSuspendedError extends Error {
+  override readonly name = 'CompensatorSuspendedError';
+  constructor(
+    readonly stepId: string,
+    readonly path: EntryPath,
+    readonly suspendPayload: unknown,
+  ) {
+    super(
+      `compensator '${stepId}' (undoing the step at [${path.join(', ')}]) suspended; a rollback cannot be resumed, ` +
+        'so the suspension is recorded as a failure and the rollback continues',
+    );
   }
 }
 

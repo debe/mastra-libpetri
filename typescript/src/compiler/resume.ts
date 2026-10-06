@@ -1,5 +1,6 @@
 import type { EntryPath } from './names.js';
 import { foreachSeed } from './resume-foreach.js';
+import { ladderToken } from './restart.js';
 import type {
   ArmResume,
   ArmSite,
@@ -73,6 +74,12 @@ export class UnresumablePositionError extends Error {
  *   38-109,350-392,415-509`). See {@link siblingVerdict}.
  * - **Foreach.** Delegated to {@link foreachSeed}. A nested workflow as the body is refused as
  *   `foreach-nested`, by the site's `nested` flag or a multi-id `steps` list.
+ * - **Compensation ladder** ([ADR 0017]). The kernel also seeds the level token for the site's
+ *   top-level index `path[0]` through `ladderToken` (`restart.ts`), its stack rebuilt from the
+ *   stored records; a resume whose stack cannot be rebuilt — a compensated entry before the site with
+ *   no stored `success` record — is refused here as `unsupported`, before anything runs or persists.
+ *   Checked after the kind-specific refusals, so a site refused for its own kind (`foreach-nested`,
+ *   an unresumable sibling) keeps that reason.
  */
 export function resumeSeed(compiled: CompiledWorkflow, request: ResumeRequest): ResumeSeed {
   const { path } = request;
@@ -103,6 +110,19 @@ export function resumeSeed(compiled: CompiledWorkflow, request: ResumeRequest): 
     );
   }
 
+  // The kind-specific seed first, so its refusals (`foreach-nested`, a sibling's `unsupported`) keep
+  // their reasons; the ladder's stack is checked only for a site that is otherwise resumable.
+  const seed = siteSeed(compiled, site, request);
+  try {
+    ladderToken(compiled, site.path[0]!, (id) => request.records.get(id));
+  } catch (error) {
+    throw new UnresumablePositionError('unsupported', path, `cannot resume at [${path.join(', ')}]: ${(error as Error).message}`);
+  }
+  return seed;
+}
+
+/** The seed of one registered site, by kind; throws the kind's own refusals. */
+function siteSeed(compiled: CompiledWorkflow, site: ResumeSite, request: ResumeRequest): ResumeSeed {
   switch (site.kind) {
     case 'entry': {
       const value: FlowToken = { data: storedPayload(request, site.stepId), resumed: true };
