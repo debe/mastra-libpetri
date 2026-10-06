@@ -762,11 +762,16 @@
         survives a run cancel (`armDeadline(…, { detached })`); agent and tool forward steps
         resolve their compensator; `cloneStep(step, { id, compensate })`. Two clause mutants are
         equivalent (N8, N14)
-  - [ ] W2 integration (`tests/engine/compensate.test.ts`, `compensate-next.test.ts`,
+  - [x] W2 integration (`tests/engine/compensate.test.ts` 23, `compensate-next.test.ts` 14,
+        `compensate-blueprints.test.ts` 17 shapes up to m = 12, about 10 s; each reviewed twice;
+        `stepExecutionPath` stays the forward path, lead decision). Was:
         `tests/verify/compensate-blueprints.test.ts`); also pin that a forward step's deadline is
         disarmed by a run abort (mutant N2, `detached` for every step, survives); a restart over
         an unrebuildable stack reports `no-position` (a dedicated reason is open)
   - [ ] W3 acceptance per the ADR's Plan
+  - [ ] Open from W2: resume after a cancel of a suspended run is unpinned on both engines; row 124
+        spans unasserted (`@mastra/observability` is no dependency); `quotaRefsOf` walking
+        compensators is pinned only at the compiler (M19 is unobservable at runtime)
   - [ ] Later wave: compensation of parallel and branch arms, foreach and pipeline items
 - [ ] Second wave, after `pipeline()`: `circuitBreaker()`,
       `queue(depth)`, `correlate(key)`
