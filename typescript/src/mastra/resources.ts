@@ -145,6 +145,140 @@ export function resourcesOf(step: unknown): StepResources | undefined {
 }
 
 /**
+ * The compensator attached to a step-flow step ([ADR 0017]) — the Step object
+ * `init().createStep({ compensate })` was given, by identity — looked up as {@link resourcesOf} looks
+ * (the Step, then its `__agentOptions` / `__toolOptions`, or a declarative entry's `options` itself);
+ * `undefined` when none. What the runner resolves a compensator path to, and what the adapter
+ * describes into `StepDescription.compensate`.
+ */
+export function compensatorOf(step: unknown): object | undefined {
+  return resourcesOf(step)?.compensate;
+}
+
+/**
+ * Every Step object the petri `createStep` built from a **params object** (not an agent, tool,
+ * processor or workflow), and every petri `cloneStep` of one ([ADR 0017]): the only steps that may
+ * be a compensator (`compensate-value`). A step made by Mastra's own `createStep` has no params-form
+ * mark Mastra could give it — its `component` is `undefined`, as a petri one's — so membership here is
+ * what tells the two apart at run time, where the brand does not reach.
+ */
+const paramsSteps = new WeakSet<object>();
+
+/** Records `step` as a petri params-form step. Called by `init()`'s `createStep` and `cloneStep` only. */
+export function markParamsStep(step: object): void {
+  paramsSteps.add(step);
+}
+
+/** Whether `value` is a Step the petri `createStep` built from a params object, or a petri clone of one. */
+export function isParamsStep(value: unknown): boolean {
+  return value !== null && typeof value === 'object' && paramsSteps.has(value);
+}
+
+/** A {@link compensateProblem}: the refusal's name and its reason, in Mastra's words. */
+export interface CompensateProblem {
+  readonly code: 'compensate-value' | 'compensate-ids' | 'compensate-suspend' | 'compensate-checkpoint';
+  readonly why: string;
+}
+
+/**
+ * What is wrong with `compensator` as the compensator of step `forwardId` ([ADR 0017]), judged on the
+ * two objects alone — everything visible at `createStep`, so `init()` throws it there and the adapter
+ * repeats it, word for word, against a carrier that slipped past (attached by hand, or altered).
+ * `undefined` when nothing is. In order:
+ *
+ * - `compensate-value` — not a step at all; a nested workflow (M8); an agent or tool step; a step not
+ *   built by the petri `createStep` from a params object (Mastra's own `createStep`, a hand-made
+ *   object); `forward` itself; a step carrying its own `compensate`.
+ * - `compensate-ids` — the compensator's id is the forward step's own: both would be recorded under
+ *   one key, and the undo's record would replace the step it undoes.
+ * - `compensate-suspend` — a compensator declaring `suspendSchema` or `resumeSchema`: an undo cannot
+ *   be suspended and resumed; it runs to an end once the workflow has failed.
+ * - `compensate-checkpoint` — `metadata.checkpoint` set on the compensator, which is never an entry of
+ *   the workflow and so has no point after it to resume from; or `true` on the forward step's own
+ *   metadata (`forwardMetadata`), which would let a restart begin after a step that may need undoing.
+ *
+ * Position (`compensate-position`) and the workflow-wide id rules are the adapter's alone: no step
+ * knows where it will be added.
+ */
+export function compensateProblem(
+  forwardId: string,
+  compensator: unknown,
+  forward: object | undefined,
+  forwardMetadata: unknown,
+): CompensateProblem | undefined {
+  const fix =
+    'A compensator is a step built by init().createStep({ id, inputSchema, outputSchema, execute }) whose ' +
+    `input schema accepts '${forwardId}''s output.`;
+  if (compensator === null || typeof compensator !== 'object') {
+    return { code: 'compensate-value', why: `its compensate is ${typeof compensator === 'function' ? 'a function' : String(compensator)}, not a step. ${fix}` };
+  }
+  const c = compensator as { id?: unknown; component?: unknown; suspendSchema?: unknown; resumeSchema?: unknown; metadata?: unknown };
+  const name = typeof c.id === 'string' ? `'${c.id}'` : 'a step with no id';
+  if (c.component === 'WORKFLOW') {
+    return { code: 'compensate-value', why: `its compensate is the workflow ${name}; a nested workflow cannot undo a step yet. ${fix}` };
+  }
+  if (c.component === 'AGENT' || c.component === 'TOOL') {
+    return {
+      code: 'compensate-value',
+      why: `its compensate is the ${c.component === 'AGENT' ? 'agent' : 'tool'} step ${name}; an agent or tool cannot undo a step. Call it from the execute of a step instead. ${fix}`,
+    };
+  }
+  if (forward !== undefined && compensator === forward) {
+    return { code: 'compensate-value', why: `its compensate is the step itself; a step cannot undo itself. ${fix}` };
+  }
+  if (!isParamsStep(compensator)) {
+    return {
+      code: 'compensate-value',
+      why: `its compensate, ${name}, was not built by init().createStep from a params object (Mastra's own createStep, or a hand-made object, is not one). ${fix}`,
+    };
+  }
+  if (compensatorOf(compensator) !== undefined) {
+    return {
+      code: 'compensate-value',
+      why: `its compensate, ${name}, has a compensate of its own; an undo is not undone in turn. Give ${name} none.`,
+    };
+  }
+  if (c.id === forwardId) {
+    return {
+      code: 'compensate-ids',
+      why: `its compensate has the step's own id '${forwardId}'; Mastra records each step under its id, so the undo would replace the record of the step it undoes. Give the compensator its own id: cloneStep(compensator, { id }) makes a copy under a new one.`,
+    };
+  }
+  if (c.suspendSchema !== undefined || c.resumeSchema !== undefined) {
+    const which = [c.suspendSchema !== undefined ? 'suspendSchema' : undefined, c.resumeSchema !== undefined ? 'resumeSchema' : undefined]
+      .filter((x) => x !== undefined)
+      .join(' and ');
+    return {
+      code: 'compensate-suspend',
+      why: `its compensate, ${name}, declares ${which}, but an undo runs after the workflow has failed and cannot be suspended or resumed. Remove them from ${name}.`,
+    };
+  }
+  if (markedCheckpoint(c.metadata)) {
+    return {
+      code: 'compensate-checkpoint',
+      why: `its compensate, ${name}, carries metadata.checkpoint, but a compensator is not a step of the workflow and has no point after it to restart from. Remove the key from ${name}.`,
+    };
+  }
+  if (forwardMetadata !== null && typeof forwardMetadata === 'object' && (forwardMetadata as { checkpoint?: unknown }).checkpoint === true) {
+    return {
+      code: 'compensate-checkpoint',
+      why:
+        'it carries both compensate and metadata.checkpoint, but no checkpoint may follow a step that can be undone: a restart from it would skip ' +
+        'the undo of a step that already ran. Mark a checkpoint before the first step that carries compensate, or none.',
+    };
+  }
+  return undefined;
+}
+
+/** `metadata.checkpoint` set to anything but `undefined` or `false`. */
+function markedCheckpoint(metadata: unknown): boolean {
+  if (metadata === null || typeof metadata !== 'object') return false;
+  if (!Object.prototype.hasOwnProperty.call(metadata, 'checkpoint')) return false;
+  const value: unknown = (metadata as { checkpoint?: unknown }).checkpoint;
+  return value !== undefined && value !== false;
+}
+
+/**
  * Where `init().race` / `init().quorum` keep a block's minted decision ([ADR 0014]): a key of the
  * fresh `metadata` object they put in the `.parallel()` call's options. Mastra keeps `metadata` by
  * reference in the step flow entry (`toEntryOptionFields`, `workflow.ts:647-653`), so the adapter

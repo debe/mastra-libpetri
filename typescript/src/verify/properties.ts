@@ -22,6 +22,8 @@ import { budgetStructureViolations } from './budget.js';
 import { poolSinks, poolStructureViolations } from './pools.js';
 import { decisionStructureViolations } from './decision.js';
 import { pipelineStructureViolations } from './pipeline.js';
+import { compensateStructureViolations } from './compensate.js';
+import { ladderLevel } from '../compiler/blueprints/compensate.js';
 import { initialCounts } from '../engine/kernel.js';
 import { dischargeBySiphon, emptySiphon, wholeMs } from './siphon.js';
 
@@ -127,6 +129,12 @@ function cancels(segment: Segment): boolean {
  * equals its `closed` or `resume@site` segment's; a pre-aborted run's is the successor, after
  * `t.cancel.arrive`, of its `+cancel` segment's — the signal marked instead of the request.
  *
+ * **The compensation ladder's level** ([ADR 0017], W0 amendment 4): with a ladder, one token in
+ * `wf.comp.level.a`, `a = |{j : k_j < at}|` for the top-level index `at` the segment starts at — `0`
+ * fresh, the boundary's index for `restart@p`, the site's `path[0]` for `resume@s`. `initialCounts`
+ * adds it from `ladderLevel`, the one seed the kernel's fresh, resume and restart seeds share; this
+ * function checks it against `ladderLevel` for the segment's own index, and throws on a mismatch.
+ *
  * Throws on a site key the workflow does not register.
  */
 export function segmentInitialMarking(compiled: CompiledWorkflow, segment: Segment): ReadonlyMap<Place<unknown>, number> {
@@ -134,7 +142,19 @@ export function segmentInitialMarking(compiled: CompiledWorkflow, segment: Segme
     typeof segment === 'string' ? compiled.entryPlace
     : 'restart' in segment ? boundaryOf(compiled, segment.restart).place
     : siteOf(compiled, segment.resume).place;
-  return initialCounts(compiled, start, cancels(segment) ? compiled.cancelRequest : undefined);
+  const counts = initialCounts(compiled, start, cancels(segment) ? compiled.cancelRequest : undefined);
+  // [ADR 0017]: `initialCounts` adds the ladder's level from `ladderLevel`, the one seed. Checked
+  // here as well, so a proof can never start from a marking with no level token, or two.
+  const site = compiled.compensations;
+  if (site !== undefined) {
+    const at = typeof segment === 'string' ? 0 : 'restart' in segment ? segment.restart : siteOf(compiled, segment.resume).path[0];
+    const want = ladderLevel(site, at).place;
+    const seeded = [...counts].filter(([p]) => site.levels.includes(p.name)).map(([p, n]) => `${p.name}=${n}`);
+    if (seeded.length !== 1 || seeded[0] !== `${want}=1`) {
+      throw new Error(`segment ${segmentLabel(segment)} of '${compiled.net.name}' seeds the ladder with [${seeded.join(', ')}]; ladderLevel says ${want}=1`);
+    }
+  }
+  return counts;
 }
 
 /**
@@ -309,7 +329,12 @@ function compareSiteKeys(a: string, b: string): number {
  * the shape its bounds, its exclusion and its liveness rest on — empty when there is none — and
  * `pipeline structure` (`pipelineStructureViolations`, [ADR 0015]): every `pipeline()`'s hand-offs,
  * settles, drops and finishers the shape its bounds, its exclusions and the suspension-coverage
- * exemption of its lane attempts rest on.
+ * exemption of its lane attempts rest on — and `compensate structure`
+ * (`compensateStructureViolations`, [ADR 0017]): the compensation ladder's arming, raise, rungs,
+ * finish and discharges the shape C1–C4 and the compensators' coverage exemption rest on, and the
+ * four things no behavioural claim sees (termination and at-most-once, cancel-free compensators,
+ * outcome routing, reverse order). With a ladder the completion set adds C1, `rolledBack`:
+ * `quiescentCount(wf.comp.level.1..m, 0, 0)`.
  *
  * **A bound on a place no run can mark is proven from the arcs.** `neverCanceled` in a segment no
  * cancel arrives in: `wf.cancel.request` and `wf.cancel` start empty and nothing marks them, so every
@@ -337,6 +362,7 @@ export async function verifyWorkflow(
       ['pool structure', poolStructureViolations],
       ['decision structure', decisionStructureViolations],
       ['pipeline structure', pipelineStructureViolations],
+      ['compensate structure', compensateStructureViolations],
       ['resume gate structure', resumeGateViolations],
       ['suspension coverage', suspensionCoverageViolations],
       ['resume timing structure', resumeTimingViolations],
@@ -414,6 +440,9 @@ export async function verifyWorkflow(
 /**
  * The completion set for one segment, in the order `verifyWorkflow` proves it — each property's
  * name and query. Exported so a caller can re-ask one query under other options.
+ *
+ * Throws when a compensation site's levels `1..m` are not exactly `m` places of the net: C1 would
+ * count fewer places than it names, vacuously so when none resolve ([ADR 0017]).
  */
 export function completionProperties(compiled: CompiledWorkflow, segment: Segment): readonly (readonly [string, SmtProperty])[] {
   const t = compiled.terminals;
@@ -442,6 +471,22 @@ export function completionProperties(compiled: CompiledWorkflow, segment: Segmen
     if (pool.kind === 'permits') continue;
     if (pool.kind === 'bucket') out.push([`demandDrained(${pool.demand.name})`, quiescentCount([pool.demand], 0, 0)]);
     else out.push([`poolReturned(${pool.place.name})`, quiescentCount([pool.place], pool.seed, pool.seed)]);
+  }
+  // C1 `rolledBack` ([ADR 0017]): no completed compensated step is left armed at rest — no token in
+  // `wf.comp.level.1..m` in any quiescent marking. Quiescent only, so it cannot see a rollback that
+  // never rests: termination and at-most-once are `compensateStructureViolations` S1 and S3. C2–C4
+  // are exclusions the ladder declares (`exclusions`).
+  // Every level name must resolve: a missing one would drop out of the count, and a site whose
+  // levels 1..m all miss would make C1 vacuous — so a mismatch throws, as the seed's does.
+  const ladder = compiled.compensations;
+  if (ladder !== undefined) {
+    const named = ladder.levels.slice(1);
+    const armed = [...compiled.net.places].filter((p) => named.includes(p.name)) as Place<unknown>[];
+    if (named.length !== ladder.m || armed.length !== ladder.m) {
+      const found = new Set(armed.map((p) => p.name));
+      throw new Error(`'${compiled.net.name}': rolledBack counts levels 1..${ladder.m}; the site names [${named.join(', ')}] and the net has [${named.filter((l) => found.has(l)).join(', ')}]`);
+    }
+    out.push(['rolledBack', quiescentCount(armed, 0, 0)]);
   }
   return out;
 }

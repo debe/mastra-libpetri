@@ -51,8 +51,10 @@ export interface RunScope {
    * Arms one step attempt's deadline `ms` from now on the run's clock ([ADR 0013], [TIME-015]):
    * its signal aborts with `reason` when it fires. A run abort before then disarms it, so the step's
    * own outcome stands. Nothing reads the machine clock, so a ManualClock advance fires it.
+   * `detached` — a compensator's attempt ([ADR 0017]) — does not listen to the run's abort: only
+   * `disarm()` and expiry end it, so a rollback after a cancel still times out.
    */
-  armDeadline(ms: number, reason: unknown): AttemptDeadline;
+  armDeadline(ms: number, reason: unknown, options?: { readonly detached?: boolean }): AttemptDeadline;
   /**
    * Preempts the deciding block at `path` ([ADR 0014]): aborts its one controller, with `reason` —
    * a `StepPreemptedError` the block's action built — so every attempt of its arms still running

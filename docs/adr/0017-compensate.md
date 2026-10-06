@@ -100,7 +100,12 @@ createWorkflow({ ... }).then(reserve).then(charge).then(ship).commit();
   `typescript/src/mastra/init.ts:365-391`), so W1 must attach `compensate` there under
   `STEP_RESOURCES` (`mastra/resources.ts:14,103-112`) beside `uses` and `timeout` ([ADR 0012],
   [ADR 0013]); `cloneStep` keeps it, and for an agent or tool source it is stripped from the options copy
-  with `uses`/`timeout`, as `__agentOptions`/`__toolOptions` are. A forced `cloneWorkflow` copies
+  with `uses`/`timeout`, as `__agentOptions`/`__toolOptions` are. *W1:* the petri
+  `cloneStep(step, { id, compensate })` replaces the compensator, judged against the new id, so a
+  compensated step used twice is `cloneStep(step, { id, compensate: cloneStep(undo, { id }) })`;
+  a plain clone keeps the compensator and a second use is refused (`compensate-ids`). On an agent
+  or tool forward step the compensator rides the declarative entry's options, and the runner
+  resolves it from there. A forced `cloneWorkflow` copies
   `stepGraph` by reference (`create.ts:105-135`), so the symbol survives into the clone, where
   `DefaultExecutionEngine` ignores it (T0). It cannot be an entry option, because `.then(step)`
   takes none (`workflow.ts:1941`).
@@ -230,8 +235,9 @@ t.comp.{j}.discharge.canceled      exit.canceled + level.j     -> wf.canceled
   ladder adds no inhibited place (the entry gates still inhibit `wf.cancel`, and `parallel` keeps
   its own `err-seen`/`susp-seen`); VER-004 splits only
   `t.cancel.arrive` (W0: `inFlightTransitions`, both modes).
-- **Seeds.** One shared function, `ladderLevel`, is called by `segmentInitialMarking`
-  (`verify/properties.ts:132`) and by the kernel's fresh, resume and restart seeds; it adds
+- **Seeds.** One shared function, `ladderLevel`, is called through the kernel's `initialCounts` —
+  which `segmentInitialMarking` (`verify/properties.ts:132`) also uses — for fresh, resume and
+  restart seeds; it adds
   `level.a` with `a = |{j : k_j < top-level index of the seed}|`, its stack rebuilt from the stored
   records through the run scope's existing record API (`engine/scope.ts:77-108`, read, not edited). `verify` proves `restart@p` at every boundary seeded this
   way. A restart from a marked checkpoint seeds `level.0`, because decision 4 A refuses every
@@ -281,7 +287,9 @@ O(m²)); transitivity gives the rest.
 
 - **S1.** `arm_j` takes exactly {arming_j, level.{j-1}} and gives exactly {successor(k_j),
   level.j}; arming_j's only producer is entry k_j's `next`; `level.j` (j ≥ 1) has no producers but
-  `arm_j` and `settle_{j+1}.*`.
+  `arm_j` and `settle_{j+1}.*`; successor(k_j)'s only producer is `arm_j`, so no transition of
+  entry k_j (a retry's success, say) gets past the rung unarmed (W1 review: that bypass passes
+  every behavioural claim).
 - **S2.** Every top-level `exits.failed` is `wf.comp.failure`; `raise` is its only consumer. A
   top-level entry's outputs stay in its interior, its `next`, its arming, the ladder's exits, or
   pools.
@@ -296,7 +304,8 @@ O(m²)); transitivity gives the rest.
   `wf.comp` place; compensator leaves carry no signal.
 - **S6.** Each `discharge_j.<kind>` moves exactly one `exit.<kind>` and `level.j` to its own
   `wf.settle.<kind>` (`done` to `settleDone`); only `discharge_j.canceled` produces a terminal
-  (`wf.canceled`); nothing in the ladder consumes, resets, inhibits or reads a terminal.
+  (`wf.canceled`); nothing in the ladder consumes, resets, inhibits or reads a terminal;
+  `wf.settle.<kind>` for the four non-canceled kinds has no producer but its m+1 discharges.
 - **S7.** Compensator attempts are exempt from suspension coverage (`compensatorAttempts`, as
   `pipelineLaneAttempts`): the exempt attempts are exactly the compensators' chains, which leave
   only by their own exits.
@@ -416,7 +425,9 @@ every segment; `level.2` with `failure` and `level.1` with `fault` can be marked
 and `wf.comp.failure`, so C4 is tested against a cancel that really arrives mid-rollback. Claims
 count only on `proven` or on a confirmed counterexample, never on `Unknown`.
 
-Fixtures, intercept mode (`*` marks a compensated step; "C1–C4" counts proven claims):
+Fixtures, intercept mode (`*` marks a compensated step; "C1–C4" counts proven claims). Measured with
+six compensator exits, before amendment 3: the W1 net has one place and one transition fewer per
+compensator (m1 34 / 37, m2 44 / 52, m3 55 / 69) and the same classes and C1–C4 counts:
 
 | Fixture | Places / transitions | Segments / claims | Classes closed / cancel | Slowest query | C1–C4 |
 |---|---|---|---|---|---|

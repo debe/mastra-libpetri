@@ -7,7 +7,6 @@ import {
   hasCompensation,
   ladderLevel,
   type CompensationSite,
-  type CompiledWorkflow,
   type Ladder,
   type LadderArgs,
   type StepDescription,
@@ -29,7 +28,7 @@ import { netDigest, unannotatedShapes, type Shape } from '../fixtures/unannotate
  * The `compensate` contract ([ADR 0017], M7b W0): the types and stubs W1 builds against. What it pins:
  * an unannotated workflow compiles to the very net, and the very hash, it did before the contract
  * landed, and carries no `compensations`; `compile()` reaches the ladder exactly when some step carries
- * a `compensate`, and its stubs throw where called (the ladder, the seed, the verify side, the petri
+ * a `compensate`, and W1 has replaced its stubs (the ladder, the seed, the verify side, the petri
  * `createStep`); with a pass-through ladder standing in for W1's, `structuralHash` carries the
  * compensator only when present and `quotaRefsOf` registers a quota only a compensator uses; the five
  * refusal names; and the surface's types — `Undoable` and the brand — as `@ts-expect-error` under
@@ -37,7 +36,7 @@ import { netDigest, unannotatedShapes, type Shape } from '../fixtures/unannotate
  */
 
 /**
- * When set, `compensateLadder` is a pass-through ladder (below) instead of the W0 stub: the spine is
+ * When set, `compensateLadder` is a pass-through ladder (below) instead of W1's: the spine is
  * today's, the site a placeholder. Lets the compile wiring be pinned before W1 builds the net.
  */
 const ladderMode = vi.hoisted(() => ({ passThrough: false, calls: 0 }));
@@ -169,54 +168,71 @@ describe('an unannotated workflow is untouched', () => {
   });
 });
 
-describe('the W0 stubs throw where called (M7b W1)', () => {
-  it('compiling a compensated step reaches compensateLadder', () => {
-    expect(() => compile(saga())).toThrow("compensateLadder('saga'): not implemented (M7b W1)");
+describe('the ladder is built (M7b W1, net)', () => {
+  it('compiling a compensated step reaches compensateLadder, which builds the ladder', () => {
+    // Breaks if: compile() stops reaching the ladder for a keyed description, or the ladder records
+    // no site. The net itself is pinned by `compensate.test.ts`.
+    const before = ladderMode.calls;
+    const compiled = compile(saga());
+    expect(ladderMode.calls).toBe(before + 1);
+    expect(compiled.compensations?.m).toBe(1);
+    expect(compiled.compensations?.compensators.map((c) => [c.k, c.forwardId, c.stepId])).toEqual([[0, 'a', 'undo-a']]);
   });
 
-  it('a compensate key anywhere reaches the ladder, whose refusal W1 builds — never silently ignored', () => {
+  it('a compensate key anywhere reaches the ladder, which refuses it by name — never silently ignored', () => {
     // Breaks if: hasCompensation looks at top-level steps only, so a key on an arm, a body, a stage
     // or a compensator compiles as if it were not there.
     const undo = step('undo');
     const keyed = step('x', { compensate: undo });
-    const positions: WorkflowDescription[] = [
-      { id: 'arm', entries: [{ kind: 'parallel', id: 'p', arms: [keyed, step('y')] }, step('z')] },
-      { id: 'branch', entries: [{ kind: 'branch', id: 'b', arms: [step('y'), keyed] }, step('z')] },
-      { id: 'loop', entries: [{ kind: 'loop', id: 'l', body: keyed, loopType: 'dountil', iterationBound: 2 }, step('z')] },
-      { id: 'foreach', entries: [{ kind: 'foreach', id: 'f', body: keyed, concurrency: 1 }, step('z')] },
-      {
-        id: 'stage',
-        entries: [{ kind: 'foreach', id: 'f', body: step('f', { source: 'workflow' }), concurrency: 1, pipeline: { stages: [keyed], bounds: [1] } }, step('z')],
-      },
-      { id: 'last', entries: [step('a'), keyed] },
+    const positions: [WorkflowDescription, string][] = [
+      [{ id: 'arm', entries: [{ kind: 'parallel', id: 'p', arms: [keyed, step('y')] }, step('z')] }, 'compensate-position'],
+      [{ id: 'branch', entries: [{ kind: 'branch', id: 'b', arms: [step('y'), keyed] }, step('z')] }, 'compensate-position'],
+      [{ id: 'loop', entries: [{ kind: 'loop', id: 'l', body: keyed, loopType: 'dountil', iterationBound: 2 }, step('z')] }, 'compensate-position'],
+      [{ id: 'foreach', entries: [{ kind: 'foreach', id: 'f', body: keyed, concurrency: 1 }, step('z')] }, 'compensate-position'],
+      [
+        {
+          id: 'stage',
+          entries: [{ kind: 'foreach', id: 'f', body: step('f', { source: 'workflow' }), concurrency: 1, pipeline: { stages: [keyed], bounds: [1] } }, step('z')],
+        },
+        'compensate-position',
+      ],
+      [{ id: 'last', entries: [step('a'), keyed] }, 'compensate-position'],
+      [{ id: 'nested', entries: [step('a', { compensate: step('u', { compensate: undo }) }), step('z')] }, 'compensate-value'],
     ];
-    for (const description of positions) {
+    for (const [description, code] of positions) {
       expect(hasCompensation(description)).toBe(true);
-      expect(() => compile(description)).toThrow(`compensateLadder('${description.id}'): not implemented (M7b W1)`);
+      const before = ladderMode.calls;
+      expect(() => compile(description)).toThrow(new RegExp(`^workflow '${description.id}': .*\\(${code}\\)$`));
+      expect(ladderMode.calls).toBe(before + 1);
     }
   });
 
-  it('ladderLevel, the one seed, is a stub', () => {
-    const site = { m: 1, levels: ['wf.comp.level.0', 'wf.comp.level.1'], compensators: [] } as unknown as CompensationSite;
-    expect(() => ladderLevel(site, 0)).toThrow('ladderLevel(m=1, at=0): not implemented (M7b W1)');
+  it('ladderLevel, the one seed, is built', () => {
+    const site = compile(saga()).compensations!;
+    expect(ladderLevel(site, 0)).toEqual({ level: 0, place: 'wf.comp.level.0', stack: [] });
+    expect(ladderLevel(site, 1)).toEqual({ level: 1, place: 'wf.comp.level.1', stack: ['a'] });
+  });
+});
+
+describe('the other W0 stubs are built (M7b W1, claims and surface)', () => {
+  it('the verify side answers for a net with a ladder: no structure violation, the compensators\' attempts exempt', () => {
+    // Breaks if: the ladder and the structure rules disagree on a sound net, or the coverage
+    // exemption is not exactly the compensators' attempts (S7). Each rule's mutant lives in
+    // `tests/verify/compensate.test.ts`.
+    const compiled = compile(saga({ retries: 1 }));
+    expect(compensateStructureViolations(compiled)).toEqual([]);
+    expect([...compensatorAttempts(compiled)].sort()).toEqual(compiled.compensations!.compensators.flatMap((c) => c.attempts).sort());
   });
 
-  it('the verify side throws for a net with a ladder', () => {
-    const forged = { ...compile(bare(saga())), compensations: { m: 1 } } as unknown as CompiledWorkflow;
-    expect(() => compensateStructureViolations(forged)).toThrow('compensateStructureViolations: not implemented (M7b W1)');
-    expect(() => compensatorAttempts(forged)).toThrow('compensatorAttempts: not implemented (M7b W1)');
-  });
-
-  it("the petri createStep refuses the key until W1 attaches it, on a params object and on a tool's options", () => {
-    // Breaks if: the key reaches Mastra's createStep, which drops it — a step that undoes nothing.
+  it("the petri createStep accepts the key, on a params object and on a tool's options", () => {
+    // Breaks if: the key is still refused, or its presence changes the step's id. Where it is
+    // attached is `tests/mastra/compensate-surface.test.ts`'s.
     const { createStep } = init();
     const S = z.object({ s: z.string() });
     const undo = createStep({ id: 'undo', inputSchema: S, outputSchema: z.void(), execute: async () => undefined });
-    expect(() =>
-      createStep({ id: 'reserve', inputSchema: S, outputSchema: S, execute: async ({ inputData }) => inputData, compensate: undo }),
-    ).toThrow("createStep('reserve'): compensate: not implemented (M7b W1)");
+    expect(createStep({ id: 'reserve', inputSchema: S, outputSchema: S, execute: async ({ inputData }) => inputData, compensate: undo }).id).toBe('reserve');
     const tool = createTool({ id: 'charge', description: 'charges', inputSchema: S, outputSchema: S, execute: async (input) => input });
-    expect(() => createStep(tool, { compensate: undo })).toThrow("createStep('charge'): compensate: not implemented (M7b W1)");
+    expect(createStep(tool, { compensate: undo }).id).toBe('charge');
     // Without the key, or with it undefined, nothing changes.
     expect(createStep({ id: 'plain', inputSchema: S, outputSchema: S, execute: async ({ inputData }) => inputData }).id).toBe('plain');
     expect(createStep({ id: 'undef', inputSchema: S, outputSchema: S, execute: async ({ inputData }) => inputData, compensate: undefined }).id).toBe('undef');
@@ -272,7 +288,7 @@ describe('the surface names', () => {
 });
 
 /**
- * The types, checked by `npm run check` (never run: the key is refused until W1). `Undoable`: the
+ * The types, checked by `npm run check` (never run). `Undoable`: the
  * compensator's input must accept the forward step's output; a default-engine compensator is a type
  * error (the brand), as for `race` and `pipeline`.
  */

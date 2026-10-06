@@ -696,7 +696,7 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     // the signal's reason and, should it fire, the attempt's failure.
     const expiry =
       timeout === undefined ? undefined : new StepTimeoutError(stepId, path, timeout.ms, attempt, incoming.foreachIndex);
-    const deadline = timeout === undefined ? undefined : scope.armDeadline(timeout.ms, expiry);
+    const deadline = timeout === undefined ? undefined : scope.armDeadline(timeout.ms, expiry, detached === true ? { detached: true } : undefined);
     const call = async (): Promise<StepOutcome> => {
       const result = await scope.runner.run(stepId, incoming.data, {
         ...view,
@@ -728,7 +728,8 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
     let deadlineFirst = false;
     if (deadline !== undefined) {
       // The step against its deadline. A run abort before expiry disarms the deadline — `expired`
-      // then never resolves — so the step's own outcome stands. Once it fires the outcome is the
+      // then never resolves — so the step's own outcome stands; a compensator's (`detached`) is not
+      // disarmed by it ([ADR 0017]), so its timeout still fires after a cancel. Once it fires the outcome is the
       // timeout, but the action still waits for the step to settle: it never abandons it, so the
       // permit and quotas stay held and a retry never overlaps its predecessor.
       const winner = await Promise.race([running.then(() => 'step' as const), deadline.expired.then(() => 'deadline' as const)]);

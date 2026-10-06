@@ -25,7 +25,8 @@ import type {
 import type { EntryPath } from '../compiler/names.js';
 import { KernelRunScope } from './scope.js';
 import type { ResumeSeed } from '../compiler/resume.js';
-import type { RestartSeed } from '../compiler/restart.js';
+import { ladderToken, type RestartSeed } from '../compiler/restart.js';
+import { ladderLevel } from '../compiler/blueprints/compensate.js';
 
 /** Present only when non-empty — see {@link RunOutcome}. */
 type Residue = { readonly residue?: readonly string[] };
@@ -355,9 +356,17 @@ function tee(primary: EventStore, secondary: EventStore, onError: (error: unknow
  * run that is not pre-aborted is refused by the one-token-of-work check instead. This does not
  * check a seed independently: the kernel and the verifier both read it from the compiled pools, and
  * the guarantee is that they share these counts.
+ *
+ * **The compensation ladder** ([ADR 0017]): with `compiled.compensations`, one token at the level
+ * {@link ladderLevel} names for the segment's top-level index — `level.a`, `a = |{j : k_j < at}|` —
+ * last in the map. `at` is read off `start`: `0` at the entry place, `index` at a restart boundary,
+ * `path[0]` at a resume site, which is exactly the index the kernel seeds with, so a run whose level
+ * token is not at the segment's level is refused. A `start` that is none of these, on a workflow with
+ * a ladder, throws. Without a ladder, the counts are exactly as before.
  */
 export function initialCounts(
-  compiled: Pick<CompiledWorkflow, 'pools'>,
+  compiled: Pick<CompiledWorkflow, 'pools'> &
+    Partial<Pick<CompiledWorkflow, 'compensations' | 'entryPlace' | 'boundaries' | 'resumeSites' | 'net'>>,
   start: Place<unknown>,
   cancel?: Place<unknown>,
 ): ReadonlyMap<Place<unknown>, number> {
@@ -365,7 +374,34 @@ export function initialCounts(
   counts.set(start, 1);
   if (cancel !== undefined) counts.set(cancel, 1);
   for (const pool of compiled.pools) counts.set(pool.place, pool.seed);
+  const site = compiled.compensations;
+  if (site !== undefined) {
+    const at = topLevelIndexOf(compiled, start);
+    if (at === undefined) {
+      throw new Error(`compiled workflow '${compiled.net?.name ?? '?'}': '${start.name}' is neither the entry place, a restart boundary nor a resume site, so its ladder level is unknown`);
+    }
+    counts.set(placeNamed(compiled, ladderLevel(site, at).place), 1);
+  }
   return counts;
+}
+
+/**
+ * The top-level index a segment starting at `start` begins at ([ADR 0017]): `0` for the entry place,
+ * the boundary's `index`, or the resume site's `path[0]`; `undefined` for any other place. Matched by
+ * name, the vocabulary's identity.
+ */
+function topLevelIndexOf(compiled: Partial<Pick<CompiledWorkflow, 'entryPlace' | 'boundaries' | 'resumeSites'>>, start: Place<unknown>): number | undefined {
+  if (compiled.entryPlace?.name === start.name) return 0;
+  const boundary = compiled.boundaries?.find((b) => b.place.name === start.name);
+  if (boundary !== undefined) return boundary.index;
+  for (const site of compiled.resumeSites?.values() ?? []) if (site.place.name === start.name) return site.path[0];
+  return undefined;
+}
+
+/** The net's place called `name`; throws when the net has none — a ladder site from another compile. */
+function placeNamed(compiled: Partial<Pick<CompiledWorkflow, 'net'>>, name: string): Place<unknown> {
+  for (const p of compiled.net?.places ?? []) if (p.name === name) return p;
+  throw new Error(`compiled workflow '${compiled.net?.name ?? '?'}' has no place '${name}'`);
 }
 
 /**
@@ -380,6 +416,11 @@ export function initialCounts(
  *   boundary's place (entry `index`'s input), instead of the entry place. Exclusive with a resume.
  * - Every way: `k` permits when a budget was compiled in, and the cancel **signal** when the run's
  *   signal had already fired.
+ * - With a compensation ladder ([ADR 0017]), every way: one level token at the level
+ *   `ladderToken` names for the segment's top-level index — `0` fresh, the boundary's `index` on a
+ *   restart, the site's `path[0]` on a resume — carrying the stack of compensated outputs, rebuilt
+ *   from the carried-in `stepResults` (empty on a fresh run). The run scope is built from those same
+ *   records, so the stack is what `getStepResult` would read.
  *
  * **Checked, then returned.** Every check runs before any executor is built, so a refused run
  * starts nothing:
@@ -391,8 +432,9 @@ export function initialCounts(
  *    pre-aborted. A pre-aborted run's marking is therefore **not** the one a `+cancel` segment is
  *    proven from: it is that marking's successor after `t.cancel.arrive` (the request moved to the
  *    signal), so it is reachable from the proven one, which is what the `+cancel` proof covers.
- * 3. A resumed or restarted segment holds exactly one token outside the permits and the cancel signal, at its
- *    site — which (2) cannot see when a site is registered on the cancel place itself.
+ * 3. A resumed or restarted segment holds exactly one token outside the permits, the cancel signal
+ *    and the ladder's level token, at its site — which (2) cannot see when a site is registered on
+ *    the cancel place itself.
  * 4. An entry site's seed, and every restart seed, is a `FlowToken` (a non-null object with `data`). The verifier is
  *    value-blind, so a proof says nothing about a malformed seed; without this a `null` seed fails
  *    inside the step's first attempt. An arm's `ArmResume` and a foreach's `ForeachResume` are
@@ -401,7 +443,7 @@ export function initialCounts(
 export function initialMarking(
   compiled: CompiledWorkflow,
   input: unknown,
-  options: Pick<RunOptions, 'clock' | 'signal' | 'resume' | 'restart'>,
+  options: Pick<RunOptions, 'clock' | 'signal' | 'resume' | 'restart' | 'stepResults'>,
 ): Map<Place<unknown>, Token<unknown>[]> {
   const { resume, restart, signal } = options;
   if (resume !== undefined && restart !== undefined) {
@@ -447,6 +489,15 @@ export function initialMarking(
   for (const pool of compiled.pools) {
     initial.set(pool.place, [...(initial.get(pool.place) ?? []), ...Array.from({ length: pool.seed }, () => seed(null))]);
   }
+  // The ladder's level token ([ADR 0017]), at the segment's top-level index, its stack rebuilt from
+  // the carried-in records. `initialCounts` derives the same level from `start`, so the two meet in
+  // the check below.
+  const at = resume !== undefined ? resume.site.path[0]! : restart !== undefined ? restart.site.index : 0;
+  const ladder = ladderToken(compiled, at, (id) => options.stepResults?.get(id));
+  const ladderPlace = ladder === undefined ? undefined : placeNamed(compiled, ladder.place);
+  if (ladder !== undefined && ladderPlace !== undefined) {
+    initial.set(ladderPlace, [...(initial.get(ladderPlace) ?? []), seed<readonly unknown[]>(ladder.value)]);
+  }
 
   const segment =
     resume !== undefined ? `resume@${resume.site.path.join('.')}` : restart !== undefined ? `restart@${restart.site.index}` : 'closed';
@@ -455,13 +506,13 @@ export function initialMarking(
     const pooled = new Set<Place<unknown>>(compiled.pools.map((pool) => pool.place));
     let work = 0;
     for (const [p, tokens] of initial) {
-      if (p === compiled.cancel || pooled.has(p)) continue;
+      if (p === compiled.cancel || p === ladderPlace || pooled.has(p)) continue;
       work += tokens.length;
     }
     if (work !== 1 || initial.get(start)?.length !== 1) {
       const what = resume !== undefined ? 'a resumed segment must start from exactly one token at its site' : 'a restarted segment must start from exactly one token at its boundary';
       throw new Error(
-        `compiled workflow '${compiled.net.name}': ${what} '${start.name}', found ${work} outside the permits and the cancel signal`,
+        `compiled workflow '${compiled.net.name}': ${what} '${start.name}', found ${work} outside the permits and the cancel signal${ladderPlace === undefined ? '' : ' and the ladder'}`,
       );
     }
   }

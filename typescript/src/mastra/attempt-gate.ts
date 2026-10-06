@@ -56,6 +56,16 @@ export type GateVerdict =
  * Without a deadline and without a preemption the gate is transparent: `controller` is the run's,
  * the verdict is always `own` and `writer` returns its argument — so a step that is neither timed nor
  * an arm of a `race` / `quorum` runs exactly as before M7.
+ *
+ * **A compensator's attempt** (`StepCall.detached`, [ADR 0017]) is **detached from the run's abort**,
+ * as Temporal's detached cancellation scope is: neither `StepCall.abortSignal` nor the run's
+ * controller is a source, so the step's signal fires only on its own deadline, and a step that
+ * honours `abortSignal` still runs its undo after a cancel. With no deadline (a compensator is never
+ * an arm, so it has no preemption) the signal is the gate's own and never fires; the gate is not
+ * decisive, the verdict is always `own`, and `writer` returns its argument. Either way
+ * `controller.abort()` still aborts the **run's** controller — a compensator's `abort()` cancels the
+ * run as any step's does, and the rollback, which no cancel preempts, still finishes. Without
+ * `detached` nothing here changes.
  */
 export interface AttemptGate {
   readonly identity: AttemptIdentity;
@@ -74,7 +84,7 @@ const OWN: GateVerdict = Object.freeze({ kind: 'own' });
 /** Builds the gate for one runner call ([ADR 0013], [ADR 0014]). */
 export function attemptGate(
   stepId: string,
-  call: Pick<StepCall, 'path' | 'foreachIndex' | 'attempt' | 'abortSignal' | 'deadline' | 'preempt'>,
+  call: Pick<StepCall, 'path' | 'foreachIndex' | 'attempt' | 'abortSignal' | 'deadline' | 'preempt' | 'detached'>,
   run: AbortController,
 ): AttemptGate {
   const identity: AttemptIdentity = {
@@ -85,6 +95,30 @@ export function attemptGate(
   };
   const deadline = call.deadline;
   const preempt = call.preempt;
+  // [ADR 0017]: a compensator's attempt does not hear the run's abort; see the interface.
+  const detached = call.detached === true;
+  if (deadline === undefined && preempt === undefined && detached) {
+    // A signal of the gate's own, linked to nothing: it never fires. `abort()` is still the run's.
+    const own = new AbortController();
+    const controller = {
+      get signal(): AbortSignal {
+        return own.signal;
+      },
+      abort(reason?: unknown): void {
+        run.abort(reason);
+      },
+    } as AbortController;
+    return {
+      identity,
+      controller,
+      decisive: false,
+      verdict: () => OWN,
+      freeze: () => OWN,
+      expired: () => false,
+      writer: (stream) => stream,
+      release: () => {},
+    };
+  }
   if (deadline === undefined && preempt === undefined) {
     // Transparent: the run's own controller, exactly what the runner handed the executor before M7.
     return {
@@ -109,7 +143,7 @@ export function attemptGate(
   const noteFirst = (signal: AbortSignal): void => {
     first ??= sourceOf(signal);
   };
-  const runAborted = (): boolean => call.abortSignal.aborted || run.signal.aborted;
+  const runAborted = (): boolean => !detached && (call.abortSignal.aborted || run.signal.aborted);
   const firstFired = (): Source | undefined =>
     first ??
     (runAborted() ? 'run' : deadline?.aborted === true ? 'deadline' : preempt?.aborted === true ? 'preempt' : undefined);
@@ -117,7 +151,7 @@ export function attemptGate(
   // One signal the step sees, aborted by whichever source fires first, with that source's reason.
   // Sources in precedence order, so when several had fired before the call the step reads the run's.
   const attempt = new AbortController();
-  const sources = [...new Set([call.abortSignal, run.signal, deadline, preempt])].filter(
+  const sources = [...new Set([...(detached ? [] : [call.abortSignal, run.signal]), deadline, preempt])].filter(
     (source): source is AbortSignal => source !== undefined,
   );
   const unlink: (() => void)[] = [];
