@@ -18,7 +18,7 @@
 | [0014](0014-race-and-quorum.md) | `race` and `quorum(k)` are a counted decision on a `.parallel()`, and every loser is aborted and waited for | accepted |
 | [0015](0015-pipeline.md) | `pipeline()` compiles a `.foreach()` over a chain of stages into the parent net, one bound per stage, items handed lane to lane | accepted |
 | [0016](0016-supersede.md) | `supersede()` is deferred: one Mastra run has no new input to supersede; a speculative latest-wins block is designed, measured and kept on file | deferred |
-| [0017](0017-compensate.md) | `compensate` is a step option: a run that fails undoes its completed top-level steps, newest first, before it settles | proposed |
+| [0017](0017-compensate.md) | `compensate` is a step option: a run that fails undoes its completed top-level steps, newest first, before it settles | accepted |
 
 Each ADR has Context / Decision / Consequences / Evidence; Evidence names the test that pins the
 behaviour it rests on. Amendments are recorded in the existing ADR, tagged with the milestone

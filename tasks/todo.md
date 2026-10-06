@@ -727,7 +727,7 @@
         place without a body `stateSchema`, where a default-engine child does (`workflow.ts:3646-3648`);
         not reachable through `pipeline()` (the minted body carries the schema), a nested-workflow row
 - [x] `supersede()`: deferred to M8 (ADR 0016, decision 1 A, 2026-10-06); designs D1, S2, D2 on file
-- [ ] `compensate` (`docs/adr/0017-compensate.md`), decisions taken 2026-10-06 (1 A, 2 A, 3 A, 4 A):
+- [x] `compensate` (`docs/adr/0017-compensate.md`), decisions taken 2026-10-06 (1 A, 2 A, 3 A, 4 A):
   - [x] W0 spike (scratch, 2026-10-06): see the ADR's Amendment — intercept mode replaced the read
         arc, `undoing_j` carries the stack, five compensator exits plus S8; C4 proven in every
         segment; MUT5–MUT8 and a mutant per S rule; the Mastra pins (T0, T1, the rewrap, the merge)
@@ -764,11 +764,10 @@
         equivalent (N8, N14)
   - [x] W2 integration (`tests/engine/compensate.test.ts` 23, `compensate-next.test.ts` 14,
         `compensate-blueprints.test.ts` 17 shapes up to m = 12, about 10 s; each reviewed twice;
-        `stepExecutionPath` stays the forward path, lead decision). Was:
-        `tests/verify/compensate-blueprints.test.ts`); also pin that a forward step's deadline is
-        disarmed by a run abort (mutant N2, `detached` for every step, survives); a restart over
-        an unrebuildable stack reports `no-position` (a dedicated reason is open)
-  - [ ] W3 acceptance per the ADR's Plan
+        `stepExecutionPath` stays the forward path, lead decision); a forward step's deadline
+        disarmed by a run abort is pinned (N2 killed). Still open: a restart over an unrebuildable
+        stack reports `no-position` (a dedicated reason is the maintainer's call)
+  - [x] W3: ADR 0017 accepted with Evidence; rows 119–129 `fixed (M7b)`; README row; CI green
   - [ ] Open from W2: resume after a cancel of a suspended run is unpinned on both engines; row 124
         spans unasserted (`@mastra/observability` is no dependency); `quotaRefsOf` walking
         compensators is pinned only at the compiler (M19 is unobservable at runtime)

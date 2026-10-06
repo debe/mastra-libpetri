@@ -1,6 +1,6 @@
 # ADR 0017 — `compensate` is a step option: a run that fails undoes its completed top-level steps, newest first, before it settles
 
-Status: proposed (2026-10-06, M7b second wave). Maintainer decisions taken (below): 1 A, 2 A,
+Status: accepted (2026-10-06, M7b second wave). Maintainer decisions taken (below): 1 A, 2 A,
 3 A, 4 A; 5 A and 6 A follow from 1 A. Spikes in scratch only; libpetri 8.0.0 from npm, not linked
 (`scripts/link-libpetri.sh --check`: "not linked"), z3 4.13.0. Mastra `@mastra/core` 1.67.0
 (`scripts/mastra-pin`); Mastra paths are under `.mastra/src-extracted/src/workflows/`. Repo
@@ -581,7 +581,46 @@ under `.mastra/src-extracted/src/workflows/`:
 - The emitter is host-free and the claims are generic over a ladder, so M10's consolidation with
   temporal-libpetri and adk-libpetri starts from code, not prose.
 
-## Evidence planned
+## Evidence
+
+Contract in W0 (`87747e3`, merged `57a1610`); built in W1 (`5f68beb`, merged `62ed4c9`) and
+integrated in W2 (`10b8790`, merged `1c83ede`); CI green on `1c83ede` (run 37471707335: `typescript`, 4 `proofs` shards, 8 `corpus` shards). libpetri
+8.0.0 from npm, not linked; z3 4.13.0.
+
+- `tests/compiler/compensate-contract.test.ts` — ten unannotated shapes keep their nets and hashes;
+  the hash carries a step's `compensate` only when present; a compensator-only quota is registered.
+- `tests/compiler/compensate.test.ts` — the exact `t.comp.*` list and every ladder arc; the stack's
+  push and pop; 1-bounded from the arcs; no ladder inhibitor, read or reset; VER-004 splits only
+  `t.cancel.arrive`; sweeps feed `wf.comp.exit.canceled`; class counts against the Amendment; the
+  refusals at every position, the same keyed object reused as an arm or body included.
+- `tests/verify/compensate.test.ts` — S1–S8 with a mutant per clause (two clause deletions are
+  equivalent and argued), the partial bypass of `arm_j` that every behavioural claim misses; C1–C4
+  and every family on m1, m2, m3 and beside `foreach(2)`.
+- `tests/mastra/runner-compensate.test.ts`, `tests/mastra/compensate-surface.test.ts`,
+  `tests/mastra/adapt-compensate.test.ts` — the detached signal and the detached deadline, the
+  dynamic-suspend rewrite, seeds at nested resume paths, agent and tool carriers; the key, the
+  `Undoable` type errors, all five refusals, `cloneStep(step, { id, compensate })`.
+- `tests/engine/compensate.test.ts` — 23 cases end to end on Mastra's `Run` under a ManualClock:
+  newest-first rollback before the terminal row, `onFinish` then `onError`; inputs; error and
+  tripwire shape against Mastra's own clone; a failed step not undone; a compensator that fails,
+  bails, suspends or aborts; a saga that succeeds, bails, or suspends then resumes and fails; cancel
+  with and without a failure; a compensator's deadline surviving the cancel and a forward step's
+  disarmed by it; retries; tool and agent steps; reuse through `cloneStep`; restart from a
+  checkpoint before `k_1`; a `limit(1)` shared with a compensator.
+- `tests/engine/compensate-next.test.ts` — petri against a forced `cloneWorkflow` (T0: nothing
+  undone, equal shape) and the `onError` recipe (T1: inputs, order, callback order, and the
+  double rollback when T1 is put on a petri workflow); the row 128 state facts on both engines.
+- `tests/verify/compensate-blueprints.test.ts` — 17 shapes through `init()`, m up to 12, the
+  per-compensator cost (+17 / +53, then +13 / +40) proven, retries immediate, timed and inherited
+  from `retryConfig`, run budget 1, a timeout, `limit(1)`, beside `parallel(3)` and `foreach(2)`,
+  a checkpoint before `k_1`; every family in every default segment, about 10 s alone, slowest
+  query 0.25–0.30 s (`deadlockFree`@cancel, smt, the timed shape).
+
+Not covered, and recorded: `Run.cancel()` spans mid-rollback beyond the W0 pin (row 124,
+`@mastra/observability` is no dependency); a petri child rolling back then failing its parent;
+resume after a cancel of a suspended run.
+
+### Design-round spike
 
 libpetri 8.0.0 from npm, not linked; every figure quoted with its provenance.
 
@@ -604,53 +643,10 @@ Every claim held; mutants MUT6 (arm skips the lower level), MUT7 (finish without
 (failure bypasses `raise`) caught behaviourally, MUT5 by structure only (S1 and S3, per W0), A0's
 coverage mutant passes every family (the reason A0 is rejected).
 
-Planned tests:
+## Divergence rows
 
-- `tests/compiler/compensate-contract.test.ts` — unannotated workflows keep their nets and hashes;
-  the hash carries a step's `compensate` only when present.
-- `tests/compiler/compensate.test.ts` — the exact transition list (five settle kinds,
-  `discharge_j.canceled`, no `release`); 1-bounded from the arcs; no `t.comp.*` transition has an
-  inhibitor, and the inhibited places are those of the bare spine; VER-004 splits
-  only `t.cancel.arrive`; every top-level, checkpoint and foreach sweep feeds
-  `wf.comp.exit.canceled`.
-- `tests/verify/compensate.test.ts` — S1–S8, a mutant per rule, each also run against the
-  behavioural claims with the result recorded (MUT5 caught by S1 and S3; MUT5, S5, S6 and the
-  terminal-release S6t pass every behavioural claim); S2 as "a top-level entry's outputs stay in
-  its interior, its `next`, its arming, the ladder's exits, or pools"; S7 as "exempt attempts are
-  exactly the compensators' chains, which leave only by their own exits"; C1–C4; the coverage
-  exemption, not vacuous; `ladderLevel` the one seed for `segmentInitialMarking` and the kernel.
-- `tests/mastra/compensate-surface.test.ts`, `tests/mastra/adapt-compensate.test.ts` — the key, the
-  `Undoable` and brand type errors as `@ts-expect-error`, all five refusals, agent/tool carriers,
-  a quota used only on a compensator registered.
-- `tests/mastra/runner-compensate.test.ts` — the detached signal; the dynamic-suspend rewrite;
-  compensator inputs from the token and from rehydrated records.
-- `tests/engine/compensate.test.ts` — end to end on Mastra's `Run` under a ManualClock: failure at
-  each position, a failing compensator, tripwire, bail, suspend then resume then fail, cancel before,
-  during and after a failure, `Run.cancel()` mid-rollback (span tree), `limit(1)` and run budget 1,
-  a petri child workflow rolling back then failing its parent (rewrap at `workflow.ts:3093-3110`;
-  the `:3054` merge discarded).
-- `tests/engine/compensate-next.test.ts` — petri, forced `cloneWorkflow` (T0) and the `onError`
-  recipe (T1): status, equal error and tripwire shape, forward records, compensator inputs and
-  order; T1's callback order (persist, `onFinish`, `onError`, resolve).
-- `tests/verify/compensate-blueprints.test.ts` — shapes through `init()`: m = 1, 2, 5, 12; retries
-  immediate and timed; run budget 1; beside `parallel(3)` and `foreach(2)`; checkpoint before
-  `k_1`; every family in every default segment, slowest query recorded.
-
-## Divergence rows planned
-
-| # | Behaviour | Classification | Note |
-|---|---|---|---|
-| 119 | `compensate` | addition | No Mastra word. `init().createStep({ …, compensate })` (Layer 3): when the run fails, completed compensated top-level steps are undone newest first before it settles. The twin ignores the key; the failure propagates unchanged and the effects remain |
-| 120 | Steps run after a failure | addition | Compensator records in `steps`, step events (in rollback order, after the failure's), the terminal row and the callbacks' `steps`; `stepExecutionPath` stays the forward path, as the twin's (W2 decision). Mastra stops at the first non-success (`default.ts:925-929`) |
-| 121 | A failed step is not compensated | addition | Only completed steps are armed; a step that failed or timed out ([ADR 0013]) after applying its effect is not undone |
-| 122 | A compensator that fails | addition | Per decision 2: the rollback continues and the run's `error` stays the original; the failure is in the compensator's record |
-| 123 | Cancel and rollback | addition | A failure under cancel still compensates, a rollback is never preempted, compensators get a detached signal, the run ends `canceled`. A cancel with no failure, or of a suspended run, compensates nothing, as Mastra |
-| 124 | `Run.cancel()` mid-rollback | addition | Mastra ends the whole span tree at once (`workflow.ts:3602`); compensators keep running and their spans land under an ended tree. Pinned with `@mastra/observability` 1.18.3 (W0, both engines): after `Run.cancel()`, child spans and new `workflow_step` spans under the ended run span are created, ended and exported without a throw; `DefaultSpan.end` returns early once ended |
-| 125 | A compensator that suspends | refused (M7b) | `compensate-suspend` for a declared schema; a dynamic `suspend()` is unresolved, its record rewritten `failed` and its labels forgotten (row 107 precedent) |
-| 126 | Crash mid-rollback | replaced | Not durable (row 55): restart re-runs from the start or a checkpoint before `k_1`; compensated steps and compensators must be idempotent |
-| 127 | No rollback on a stranded run or host precondition failure | addition | Rows 66 and 84 reject before any terminal |
-| 128 | State | — | Not rolled back, as Mastra: completed steps' writes persist and the failing step's own `setState` is dropped (`handlers/step.ts:574-577`); a compensator's `setState` applies. A failed petri child merges nothing into its parent: `setState(res.state)` runs (`workflow.ts:3054`), then the parent step throws and the write is discarded, the child's completed steps' writes included. A child's state merges only when it succeeds |
-| 129 | Compensate shapes refused | refused (M7b) | `compensate-position`, `compensate-value`, `compensate-ids`, `compensate-suspend`, `compensate-checkpoint`, as listed in Decision |
+Rows 119–129 in `docs/divergences.md`, `fixed (M7b)`; their current text, amended through W2, is
+there.
 
 ## Plan (mirrors ADR 0015's waves)
 
