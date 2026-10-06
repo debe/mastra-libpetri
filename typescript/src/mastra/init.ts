@@ -161,6 +161,31 @@ export interface PetriStepResources {
 }
 
 /**
+ * The compensator a petri step may carry ([ADR 0017]) — Layer 3, so only on the petri `createStep`,
+ * behind the brand ([ADR 0002]); Mastra has no word for it. `TOutput` is the forward step's output:
+ * the compensator's input must accept it, since its `inputData` is exactly that output, so a
+ * compensator whose `inputSchema` does not is a type error on the key — as is a default-engine
+ * compensator (the brand), as for `race` and `pipeline`.
+ *
+ * ```ts
+ * const release = createStep({ id: 'release-seat', inputSchema: Seat, outputSchema: z.void(), execute });
+ * const reserve = createStep({ id: 'reserve-seat', inputSchema: Req, outputSchema: Seat, execute, compensate: release });
+ * ```
+ *
+ * When a later top-level entry fails or trips, each earlier completed compensated top-level `.then()`
+ * step has its compensator run **once, newest first**, before the run settles, the terminal row and
+ * `onFinish` / `onError`; the run keeps the original error (maintainer decision 2). Refused
+ * (`COMPENSATE_REFUSALS`): anywhere but a top-level `.then()` step that is not the last entry; a
+ * compensator that is not a petri params-form step, or carries its own `compensate`; an id collision;
+ * a compensator declaring `suspendSchema` / `resumeSchema`; a checkpoint at or after the first
+ * compensated entry. On `DefaultExecutionEngine` the key is not there to see (T0): the failure
+ * propagates and nothing is undone.
+ */
+export interface Undoable<TOutput> {
+  readonly compensate?: PetriStep<string, any, TOutput, any, any, any, any>;
+}
+
+/**
  * `createStep` on the petri engine: Mastra's overloads, one for one, each returning a
  * {@link PetriStep}, plus one Mastra has no need for — a petri workflow passed as a step. Mastra
  * nests a workflow by handing it to `.then()` directly, but a `Workflow` declares its own `execute`
@@ -178,7 +203,8 @@ export interface PetriCreateStep {
     TRequestContextSchema extends PublicSchema | undefined = undefined,
   >(
     params: StepParams<TStepId, TStateSchema, TInputSchema, TOutputSchema, TResumeSchema, TSuspendSchema, TRequestContextSchema> &
-      PetriStepResources,
+      PetriStepResources &
+      Undoable<InferPublicSchema<TOutputSchema>>,
   ): PetriStep<
     TStepId,
     TStateSchema extends PublicSchema ? InferPublicSchema<TStateSchema> : unknown,
@@ -194,7 +220,8 @@ export interface PetriCreateStep {
       structuredOutput?: never;
       retries?: number;
       scorers?: DynamicArgument<MastraScorers>;
-    } & PetriStepResources,
+    } & PetriStepResources &
+      Undoable<{ text: string }>,
   ): PetriStep<TStepId, unknown, { prompt: string }, { text: string }, unknown, unknown>;
   <TStepId extends string, TStepOutput>(
     agent: SubAgent<TStepId, any> | Agent<TStepId, any>,
@@ -203,7 +230,8 @@ export interface PetriCreateStep {
       retries?: number;
       scorers?: DynamicArgument<MastraScorers>;
       metadata?: StepMetadata;
-    } & PetriStepResources,
+    } & PetriStepResources &
+      Undoable<TStepOutput>,
   ): PetriStep<TStepId, unknown, { prompt: string }, TStepOutput, unknown, unknown>;
   <
     TSchemaIn,
@@ -220,7 +248,8 @@ export interface PetriCreateStep {
       scorers?: DynamicArgument<MastraScorers>;
       metadata?: StepMetadata;
       actor?: ActorSignal;
-    } & PetriStepResources,
+    } & PetriStepResources &
+      Undoable<TSchemaOut>,
   ): PetriStep<TId, unknown, TSchemaIn, TSchemaOut, TSuspend, TResume, TRequestContext>;
   <TProcessorId extends string>(processor: ProcessorSource<TProcessorId>): ProcessorStep<TProcessorId>;
   <TWorkflowId extends string, TState, TInput, TOutput, TRequestContext extends Record<string, any> | unknown>(
@@ -364,6 +393,9 @@ export function init(options: PetriInitOptions = {}): PetriFactories {
 
   const createStep = ((source: unknown, sourceOptions?: unknown) => {
     if (source instanceof Workflow) return source;
+    // [ADR 0017]: until W1 attaches it under STEP_RESOURCES, a `compensate` key is refused here rather
+    // than dropped by Mastra's fixed field list — a step that silently undoes nothing.
+    refuseCompensateUntilBuilt(source, sourceOptions);
     const create = mastraCreateStep as (s: unknown, o?: unknown) => object;
     if (sourceOptions !== undefined) {
       // An agent or tool source. Mastra keeps the options object as `__agentOptions` /
@@ -410,6 +442,24 @@ export function init(options: PetriInitOptions = {}): PetriFactories {
     quorum: quorum as PetriQuorum,
     pipeline: bindPipeline(createWorkflow),
   };
+}
+
+/**
+ * `compensate` on a params object, or on an agent's or tool's options ([ADR 0017]).
+ *
+ * Contract stub (M7b W0): W1 (surface) attaches the compensator under `STEP_RESOURCES` (stripping the
+ * key from an agent's or tool's options copy, as `uses` / `timeout`) and refuses what it must
+ * (`COMPENSATE_REFUSALS`). Until then a step declaring one throws; a step without the key never
+ * reaches this.
+ */
+function refuseCompensateUntilBuilt(source: unknown, sourceOptions: unknown): void {
+  const carrier = sourceOptions === undefined ? source : sourceOptions;
+  if (carrier === null || typeof carrier !== 'object') return;
+  const proto: unknown = Object.getPrototypeOf(carrier);
+  if (proto !== Object.prototype && proto !== null) return;
+  if (!Object.hasOwn(carrier, 'compensate') || (carrier as { compensate?: unknown }).compensate === undefined) return;
+  const id: unknown = (source as { id?: unknown } | null)?.id;
+  throw new Error(`createStep('${String(id)}'): compensate: not implemented (M7b W1)`);
 }
 
 /**

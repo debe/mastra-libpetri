@@ -21,6 +21,7 @@ import { branchGadget } from './gadgets/branch.js';
 import { loopGadget } from './gadgets/loop.js';
 import { foreachGadget } from './gadgets/foreach.js';
 import { checkpointGadget, notStartedAt } from './gadgets/checkpoint.js';
+import { compensateLadder, hasCompensation } from './blueprints/compensate.js';
 import type { Gadget, GadgetContext, GadgetResult, NestedOptions } from './gadgets/types.js';
 import type {
   BailToken,
@@ -213,6 +214,26 @@ export function compile(description: WorkflowDescription, options: CompileOption
   };
   const settleDone = settleOf('done', terminals.done, () => ({ started: true }));
 
+  // **The compensation ladder** ([ADR 0017]), only when some step carries a `compensate`: every
+  // top-level entry then emits into the ladder's exits (its failure raised into `wf.comp.failure`,
+  // every other outcome intercepted into `wf.comp.exit.*`), each compensated entry's success arms a
+  // level, and the ladder discharges into the settle stage above. Without one, `ladder` is undefined
+  // and every line below emits exactly today's spine.
+  const ladder = hasCompensation(description)
+    ? compensateLadder({
+        description,
+        checkpoints,
+        names,
+        settles: topLevelExits,
+        settleDone,
+        terminals,
+        cancel,
+        transition: (t) => transitions.push(t),
+        place: (p) => extraPlaces.push(p),
+      })
+    : undefined;
+  const spineExits: Exits = ladder?.exits ?? topLevelExits;
+
   const emit = (
     entry: EntryDescription,
     path: EntryPath,
@@ -234,6 +255,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
       preempt: nested.preempt,
       // [ADR 0015]: only a pipeline stage's lane body carries it; every other entry emits as before.
       item: nested.item,
+      // [ADR 0017]: only a compensator leaf carries it; every other entry emits as before.
+      detached: nested.detached,
       permits,
       stepAttempt: (transitionName) => {
         stepAttempts.push(transitionName);
@@ -294,7 +317,7 @@ export function compile(description: WorkflowDescription, options: CompileOption
   // unmarked entry emits exactly what it did before, so an unmarked workflow is today's net.
   const last = description.entries.length - 1;
   const marked = new Set(checkpoints);
-  let next: Place<FlowToken> = settleDone;
+  let next: Place<FlowToken> = ladder?.done ?? settleDone;
   const nextOf: string[] = [];
   for (let i = last; i >= 0; i--) {
     const entry = description.entries[i]!;
@@ -305,17 +328,34 @@ export function compile(description: WorkflowDescription, options: CompileOption
     let successOf = next;
     if (marked.has(i)) {
       // i < last, so entry i + 1 exists: its never-started cancel is what the sweep reports.
-      const checkpoint = checkpointGadget(i, next, cancel, terminals.canceled, notStartedAt(description.entries[i + 1]!, i + 1), names);
+      // With a ladder ([ADR 0017]) the sweep's cancel is intercepted like every top-level one.
+      const checkpoint = checkpointGadget(i, next, cancel, spineExits.canceled, notStartedAt(description.entries[i + 1]!, i + 1), names);
       for (const t of checkpoint.transitions) {
         transitions.push(t);
         transitionToEntry.set(t.name, { path: [i], id: entry.id });
       }
       successOf = checkpoint.place;
     }
-    next = emit(entry, [i], successOf, topLevelExits, i === last, { cancel }).inPlace;
+    // A compensated entry's success arms its level first ([ADR 0017]); `k_j` never carries a
+    // checkpoint (`compensate-checkpoint`), so the two never meet.
+    if (ladder !== undefined) successOf = ladder.armAt(i, successOf);
+    next = emit(entry, [i], successOf, spineExits, i === last, { cancel }).inPlace;
     const site = entrySite(entry, i, next);
     if (site) registerSite(site);
   }
+
+  // The rollback, the discharges and the compensator leaves ([ADR 0017]), once the spine exists.
+  // A compensator is emitted as any step is — attempts, chain and quotas registered — at its own
+  // path `[n + j - 1]`, viewed at the entry it compensates, with no cancel signal and detached.
+  const compensation = ladder?.finish({
+    entryInputs: [next.name, ...nextOf.slice(0, last)],
+    emit: (step, path, viewPath, done, exits) => {
+      const before = stepAttempts.length;
+      const result = emit(step, path, done, exits, false, { viewPath, detached: true });
+      return { inPlace: result.inPlace, attempts: stepAttempts.slice(before) };
+    },
+  });
+  if (compensation !== undefined) exclusions.push(...compensation.exclusions);
 
   // **One refill per rate quota** ([ADR 0012]), whatever number of steps use it: fusion merges places,
   // not transitions, so a refill per member would refill the one bucket once per using step. It is
@@ -464,6 +504,8 @@ export function compile(description: WorkflowDescription, options: CompileOption
     checkpoints,
     decisions,
     pipelines,
+    // [ADR 0017]: present only with a ladder, so an unannotated result has exactly today's keys.
+    ...(compensation !== undefined ? { compensations: compensation.site } : {}),
     structuralHash: structuralHash(description, checkpoints, names.names()),
   };
 }
@@ -537,8 +579,9 @@ function registerQuota(quotas: Map<string, QuotaPlaces>, names: NameVocabulary, 
 
 /**
  * Every step's quota refs, read left to right through the description — arms, loop and foreach
- * bodies and pipeline stages ([ADR 0015]) included — with where each was seen. A step naming one id twice is refused: one attempt
- * would take two tokens of one quota in one firing, which no author means.
+ * bodies, pipeline stages ([ADR 0015]) and compensators ([ADR 0017]) included — with where each was
+ * seen. A step naming one id twice is refused: one attempt would take two tokens of one quota in one
+ * firing, which no author means.
  */
 function quotaRefsOf(description: WorkflowDescription): readonly (readonly [QuotaRef, string])[] {
   const out: (readonly [QuotaRef, string])[] = [];
@@ -549,6 +592,9 @@ function quotaRefsOf(description: WorkflowDescription): readonly (readonly [Quot
       seen.add(ref.id);
       out.push([ref, `entry ${path} ('${s.id}')`]);
     }
+    // [ADR 0017]: a compensator draws on quotas at the run scope too, right after the step it
+    // undoes; without this a quota used only by a compensator would never be registered (W0).
+    if (s.compensate !== undefined) step(s.compensate, `${path} compensator`);
   };
   description.entries.forEach((entry, i) => {
     switch (entry.kind) {
@@ -640,6 +686,9 @@ function structuralHash(description: WorkflowDescription, checkpoints: readonly 
     ...(s.quotas !== undefined && s.quotas.length > 0
       ? [{ quotas: s.quotas.map((q) => (q.kind === 'limit' ? [q.id, q.kind, q.n] : [q.id, q.kind, q.burst, q.perMs])) }]
       : []),
+    // M7b ([ADR 0017]): the compensator joins the shape only when present — its retries, timeout and
+    // quotas change no name of the forward step, so the names alone would not separate them.
+    ...(s.compensate !== undefined ? [{ compensate: step(s.compensate) }] : []),
   ];
   const block = (arms: readonly StepDescription[], c: number | undefined): readonly unknown[] =>
     c !== undefined && c < arms.length ? [{ concurrency: c }] : [];

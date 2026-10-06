@@ -94,6 +94,43 @@ export const BLUEPRINT_REFUSALS = [
 /** One of {@link BLUEPRINT_REFUSALS}. */
 export type BlueprintRefusal = (typeof BLUEPRINT_REFUSALS)[number];
 
+/**
+ * The refusals of the `compensate` step option ([ADR 0017]) — Layer 3, a step option beside `uses`
+ * and `timeout` (whose carrier refusal is `uses-position`), so neither a {@link LAYER2_METADATA_KEYS}
+ * entry nor a blueprint marker: the compensator rides on the Step under `STEP_RESOURCES`, which no
+ * string key names and the default engine never reads. Thrown at `createStep` where the problem is
+ * visible there, and repeated here against the step flow; each is a prefix of
+ * `UnsupportedWorkflowError.reason`, as every refusal's name is, and recorded in `docs/divergences.md`
+ * (row 129).
+ *
+ * - `compensate-position` — the key on anything but a top-level `.then()` step: a parallel, branch,
+ *   race or quorum arm, a loop or foreach body, a pipeline stage, a declarative `.agent()` / `.tool()`
+ *   whose options never passed through the petri `createStep`; or on the last top-level entry, where
+ *   nothing after it can fail, so its compensator could never run.
+ * - `compensate-value` — a compensator that is not a petri params-form step: a workflow (M8), an agent
+ *   or tool, a default-engine step, the forward step itself, or one carrying its own `compensate`.
+ * - `compensate-ids` — a compensator id colliding with a graph id or another compensator, or one
+ *   compensated step used twice (records are latest-per-id, so two undos would read one output).
+ * - `compensate-suspend` — a compensator declaring `suspendSchema` or `resumeSchema`: a rollback is
+ *   never resumable (a dynamic `suspend()` is unresolved, its record rewritten `failed`, row 125).
+ * - `compensate-checkpoint` — `metadata.checkpoint` on an entry at or after the first compensated
+ *   entry (maintainer decision 4 A), so a restart from a checkpoint never has a completed compensated
+ *   step behind it.
+ *
+ * Contract (M7b W0): the names are fixed here; W1 (surface) throws them, in `init()`'s `createStep`
+ * and in this adapter.
+ */
+export const COMPENSATE_REFUSALS = [
+  'compensate-position',
+  'compensate-value',
+  'compensate-ids',
+  'compensate-suspend',
+  'compensate-checkpoint',
+] as const;
+
+/** One of {@link COMPENSATE_REFUSALS}. */
+export type CompensateRefusal = (typeof COMPENSATE_REFUSALS)[number];
+
 export interface AdaptOptions {
   /** The workflow's id — `ExecutionGraph.id`, which is `Workflow.id`. */
   readonly workflowId: string;

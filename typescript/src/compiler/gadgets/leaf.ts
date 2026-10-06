@@ -86,6 +86,11 @@ export const MAX_RETRIES = 100;
  * k` and no `foreachIndex`, and no `step-settled` event is raised — a stage is a step of the twin's
  * child run, whose events the parent's stream never sees. The outcome tokens keep `foreachIndex = k`,
  * so the hand-offs and settles know the item.
+ *
+ * **A compensator** ([ADR 0017]) — `ctx.detached` set, by the compiler only, for the ladder's
+ * compensator leaves, which it emits with no cancel signal — emits exactly the same transitions and
+ * arcs; every attempt's runner call carries `StepCall.detached`, so the step's signal is not the
+ * run's. Without `ctx.detached` the leaf emits and acts exactly as before.
  */
 export const stepGadget: Gadget = (entry, next, ctx) => {
   if (entry.kind !== 'step') throw new Error(`stepGadget received a '${entry.kind}' entry`);
@@ -113,7 +118,7 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
   }
 
   const source = entry.source ?? 'step';
-  const { names, path, viewPath, exits, cancel, permits, preempt, item } = ctx;
+  const { names, path, viewPath, exits, cancel, permits, preempt, item, detached } = ctx;
   const inPlace = place<FlowToken>(names.entryIn(path, entry.id));
   const transitions: Transition[] = [];
   if (cancel !== undefined) transitions.push(sweep(names.entryTransition(path, entry.id, 'cancel'), inPlace, cancel, exits, entry.id, viewPath));
@@ -211,6 +216,7 @@ export const stepGadget: Gadget = (entry, next, ctx) => {
           ...(timeoutMs !== undefined && timedOut !== undefined ? { timeout: { ms: timeoutMs, ...timedOut } } : {}),
           ...(preempt === undefined ? {} : { preempt }),
           ...(item === true ? { item: true as const } : {}),
+          ...(detached === true ? { detached: true as const } : {}),
         }),
       );
     if (attempt === 0 && cancel !== undefined && demands.length === 0) run.inhibitor(cancel);
@@ -586,6 +592,11 @@ interface StepActionSpec {
    * incoming token's `foreachIndex`; see {@link stepGadget}. Absent everywhere else.
    */
   readonly item?: true;
+  /**
+   * A compensator's attempt ([ADR 0017]): the runner call carries `StepCall.detached`. Changes the
+   * call only, never an arc or a record. Absent everywhere else.
+   */
+  readonly detached?: true;
 }
 
 /**
@@ -618,7 +629,7 @@ const OUTCOME_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'bai
  * duplicate tokens and satisfy none of the `xor`'s branches.
  */
 export function stepAction(spec: StepActionSpec): TransitionAction {
-  const { stepId, path, source, attempt, from, next, exits, retry, permits, returned = [], timeout, preempt, item } = spec;
+  const { stepId, path, source, attempt, from, next, exits, retry, permits, returned = [], timeout, preempt, item, detached } = spec;
   return async (tctx) => {
     const incoming = tctx.input(from) as RetryToken;
     // The permit — and every quota token ([ADR 0012]) — goes back with whichever branch is
@@ -700,6 +711,8 @@ export function stepAction(spec: StepActionSpec): TransitionAction {
         startedAt: fresh,
         ...(deadline === undefined ? {} : { deadline: deadline.signal }),
         ...(preemption === undefined ? {} : { preempt: preemption }),
+        // A compensator ([ADR 0017]): its signal is not the run's; the runner unlinks it.
+        ...(detached === true ? { detached: true as const } : {}),
       });
       if (result === null || typeof result !== 'object' || !OUTCOME_STATUSES.has((result as { status: unknown }).status as string)) {
         throw new Error(`runner returned an unrecognised outcome for step '${stepId}': ${describe(result)}`);

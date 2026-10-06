@@ -728,11 +728,36 @@
         not reachable through `pipeline()` (the minted body carries the schema), a nested-workflow row
 - [x] `supersede()`: deferred to M8 (ADR 0016, decision 1 A, 2026-10-06); designs D1, S2, D2 on file
 - [ ] `compensate` (`docs/adr/0017-compensate.md`), decisions taken 2026-10-06 (1 A, 2 A, 3 A, 4 A):
-  - [ ] W0 spike (scratch): the ladder through the real compile path, structure checks on; C4
-        proven or the terminal-release fallback; class counts and slowest query per fixture;
-        MUT5–MUT8 and a mutant per S rule; the Mastra pins (T0, T1, the rewrap, the child merge)
-  - [ ] W0 contract (lead); W1 net / claims / host / surface; W2 integration; W3 acceptance —
-        per the ADR's Plan
+  - [x] W0 spike (scratch, 2026-10-06): see the ADR's Amendment — intercept mode replaced the read
+        arc, `undoing_j` carries the stack, five compensator exits plus S8; C4 proven in every
+        segment; MUT5–MUT8 and a mutant per S rule; the Mastra pins (T0, T1, the rewrap, the merge)
+  - [x] W0 contract (lead, 2026-10-06): `StepDescription.compensate`; `CompensationSite` /
+        `CompensatorSite` / `CompensatorExitKind` / `DischargeKind` and the optional
+        `CompiledWorkflow.compensations`; `StepCall.detached`, with `GadgetContext.detached` /
+        `NestedOptions.detached` threaded through the leaf to the runner call; the ladder's
+        interface (`compensateLadder`, `Ladder`, `LadderArgs`, `LadderFinish`) wired into
+        `compile()` — spine exits, `armAt`, the checkpoint sweep's canceled place, `finish` with
+        compensators emitted at `[n + j - 1]`, viewed at `[k_j]`, no signal, detached — reached
+        only when `hasCompensation`; the seed `ladderLevel(site, at): LadderSeed`;
+        `quotaRefsOf` walking compensators; `structuralHash` carrying `compensate` only when
+        present; `StepResources.compensate` (kept by `attachResources`); `Undoable<TOutput>` on
+        every `createStep` overload; `COMPENSATE_REFUSALS` (five names) in `adapt.ts`;
+        `compensateStructureViolations` and `compensatorAttempts` in `src/verify/compensate.ts`.
+        Stubs throw `not implemented (M7b W1)`: `compensateLadder`, `ladderLevel`, the two verify
+        functions on a net with a ladder, and the petri `createStep` on a `compensate` key.
+        Pinned by `tests/compiler/compensate-contract.test.ts`: ten unannotated shapes compile to
+        the net and hash they had at `467c0a9`. Lead keeps `src/compiler/types.ts`,
+        `src/compiler/gadgets/types.ts`, `src/compiler/compile.ts`, `src/compiler/index.ts`,
+        `src/mastra/index.ts`, `src/verify/index.ts`, ADR 0017, `tasks/todo.md`,
+        `docs/divergences.md`, `README.md`. The contract also touched two files no W1 agent
+        owns: `src/compiler/gadgets/leaf.ts` (the `detached` plumbing only) and
+        `src/verify/structure.ts` (resume-gate rule 6 and checkpoint rule 3 accept
+        `compensations.exits.canceled`; suspension coverage exempts `compensatorAttempts`), both
+        inert without a ladder. Left to W1: registering "compensate structure" and C1–C4 in
+        `properties.ts` and `ladderLevel` in `segmentInitialMarking` (claims); the kernel's
+        seeds (host); the compensator leaf's `exits.canceled` (no signal, so no producer — S8 must
+        not flag it) (net)
+  - [ ] W1 net / claims / host / surface; W2 integration; W3 acceptance — per the ADR's Plan
   - [ ] Later wave: compensation of parallel and branch arms, foreach and pipeline items
 - [ ] Second wave, after `pipeline()`: `circuitBreaker()`,
       `queue(depth)`, `correlate(key)`

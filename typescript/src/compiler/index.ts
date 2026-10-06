@@ -9,6 +9,8 @@ export type { ArmPreemption, Gadget, GadgetContext, GadgetResult, NestedOptions 
 export { firstKGadget, QuorumNotMetError, settledBound } from './blueprints/first-k.js';
 export type { ArmStatus } from './blueprints/first-k.js';
 export { pipelineGadget } from './blueprints/pipeline.js';
+export { compensateLadder, hasCompensation, ladderLevel } from './blueprints/compensate.js';
+export type { Ladder, LadderArgs, LadderFinish, LadderSeed } from './blueprints/compensate.js';
 export {
   NameVocabulary,
   pathSegment,
@@ -77,6 +79,10 @@ export type {
   ForeachPipeline,
   PipelineSite,
   PipelineLaneSite,
+  CompensationSite,
+  CompensatorSite,
+  CompensatorExitKind,
+  DischargeKind,
 } from './types.js';
 export { resumeSeed, UnresumablePositionError } from './resume.js';
 export { HostPreconditionError } from './gadgets/leaf.js';
