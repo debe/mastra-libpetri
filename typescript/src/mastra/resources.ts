@@ -14,13 +14,24 @@ import type { QuotaRef } from '../compiler/types.js';
 export const STEP_RESOURCES: unique symbol = Symbol('mastra-libpetri.stepResources');
 
 /**
- * A step's resources as attached: the quota objects it draws on, in declaration order, and its
- * per-attempt deadline in milliseconds. The adapter reads them into `StepDescription.quotas` and
- * `StepDescription.timeoutMs`.
+ * A step's resources as attached: the quota objects it draws on, in declaration order, its
+ * per-attempt deadline in milliseconds, and its compensator. The adapter reads them into
+ * `StepDescription.quotas`, `StepDescription.timeoutMs` and `StepDescription.compensate`.
  */
 export interface StepResources {
   readonly quotas?: readonly Quota[];
   readonly timeoutMs?: number;
+  /**
+   * The step's compensator ([ADR 0017]): the petri params-form Step object `createStep({ compensate
+   * })` was given, **kept by identity** — the adapter refuses anything else (`compensate-value`) and
+   * describes it, with the parent's options, into `StepDescription.compensate`. Kept here, not on
+   * the params, because Mastra's `createStep` builds the Step from a fixed field list and drops
+   * unknown keys (`workflow.ts:510-530`, row 102) and `serializedStepGraph` emits none
+   * (`workflow.ts:629-640`), so the key would reach neither the Step nor the persisted graph; a
+   * forced `cloneWorkflow` keeps the Step by reference, so the default engine never sees it (T0).
+   * For an agent or tool source it is stripped from the options copy with `uses` / `timeout`.
+   */
+  readonly compensate?: object;
 }
 
 /** Guards {@link Quota}'s constructor: only {@link limit} and {@link rateLimit} mint quotas. */
@@ -108,6 +119,7 @@ export function attachResources(target: object, resources: StepResources): void 
   const frozen: StepResources = Object.freeze({
     ...(resources.quotas === undefined ? {} : { quotas: Object.freeze([...resources.quotas]) }),
     ...(resources.timeoutMs === undefined ? {} : { timeoutMs: resources.timeoutMs }),
+    ...(resources.compensate === undefined ? {} : { compensate: resources.compensate }),
   });
   Object.defineProperty(target, STEP_RESOURCES, { value: frozen, enumerable: false, configurable: true, writable: false });
 }

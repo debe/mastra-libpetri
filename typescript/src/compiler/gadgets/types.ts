@@ -127,6 +127,14 @@ export interface GadgetContext {
    */
   readonly item: true | undefined;
   /**
+   * `true` when this entry is a compensator ([ADR 0017]): every attempt hands the runner
+   * `StepCall.detached`, so the step's signal is not linked to the run's abort. Only the compiler sets
+   * it, through `NestedOptions.detached` when the ladder emits a compensator leaf — always with no
+   * cancel signal. `undefined` everywhere else, and then the leaf emits and acts exactly as before.
+   * Only the leaf reads it; it changes the runner call, never an arc.
+   */
+  readonly detached: true | undefined;
+  /**
    * One step occurrence's member of a quota place ([ADR 0012]) — the leaf calls it for each
    * `StepDescription.quotas` entry: `role: 'pool'` for every quota (a `limit`'s pool, a `rateLimit`'s
    * bucket), and `'spent'` / `'demand'` for a `rateLimit` only (asking either of a `limit` throws).
@@ -202,6 +210,11 @@ export interface NestedOptions {
    * Absent (every other step), the leaf emits and acts exactly as before.
    */
   readonly item?: true;
+  /**
+   * The step is a compensator ([ADR 0017]); only the compiler passes it, for the ladder's compensator
+   * leaves, which it emits with no `cancel` (structure rule S5). See `GadgetContext.detached`.
+   */
+  readonly detached?: true;
 }
 
 /**

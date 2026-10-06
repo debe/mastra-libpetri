@@ -52,6 +52,21 @@ export interface StepDescription {
    * emits exactly today's attempt.
    */
   readonly quotas?: readonly QuotaRef[];
+  /**
+   * The step's compensator ([ADR 0017]) — Layer 3, from the petri `createStep({ compensate })`,
+   * adapted with the parent's options (`retries` resolved as `compensator.retries ??
+   * retryConfig.attempts`, its own `timeoutMs` and `quotas`). When a later top-level entry ends
+   * `failed` or `tripwire`, it runs **once**, newest first, with this step's output as its input,
+   * before the run settles. Only a top-level `.then()` step that is not the last entry may carry one
+   * (`compensate-position`); the compensator is a single params-form step with no `compensate` of
+   * its own (`compensate-value`), no id shared with the graph or another compensator
+   * (`compensate-ids`), no `suspendSchema` / `resumeSchema` (`compensate-suspend`), and no
+   * checkpoint may sit at or after the first compensated entry (`compensate-checkpoint`). The
+   * compiler throws on any of these, naming the step, in case a hand-built description slips past
+   * the adapter. Absent on every step, the workflow compiles, and hashes, exactly as before M7b's
+   * second wave.
+   */
+  readonly compensate?: StepDescription;
 }
 
 /**
@@ -452,6 +467,16 @@ export interface StepCall extends RunView {
    * `(path, pipelineItem)`.
    */
   readonly pipelineItem?: number;
+  /**
+   * The attempt is a compensator's ([ADR 0017]): present exactly when the leaf was emitted with
+   * `GadgetContext.detached`, on every attempt of the compensator, retries included. The runner then
+   * hands the step a signal **not linked to the run's abort** — only to the attempt's own
+   * {@link deadline}, when it has one — as Temporal's detached cancellation scope does, so a step
+   * that honours `abortSignal` still runs its undo after a cancel. `abortSignal` stays the run's,
+   * for the record; the gate (`attemptGate`) ignores it as a source for this attempt. `path` is the
+   * view path `[k]`, the compensated entry's, and `stepId` the compensator's own id.
+   */
+  readonly detached?: true;
 }
 
 /**
@@ -1242,6 +1267,118 @@ export interface CompiledWorkflow {
    * exempt from suspension coverage (`pipelineLaneAttempts`), held instead by its structure rule 7.
    */
   readonly pipelines: readonly PipelineSite[];
+  /**
+   * The compensation ladder ([ADR 0017]), present exactly when some top-level step carries a
+   * `compensate`. Absent — every unannotated workflow — the net, the object and the hash are
+   * exactly as before M7b's second wave. Its compensator attempts are exempt from suspension
+   * coverage (`compensatorAttempts`), held instead by the ladder's structure rules S3 and S7.
+   */
+  readonly compensations?: CompensationSite;
   /** Stable over structure alone, so it keys a compile cache across runs. */
   readonly structuralHash: string;
+}
+
+/**
+ * How a compensator's leaf can end ([ADR 0017], W0 amendment 3): five kinds, not six — a compensator
+ * is emitted without the cancel signal, so it never produces `canceled`, and a `settle_j.canceled`
+ * would be a dead transition (structure rule S8).
+ */
+export type CompensatorExitKind = 'done' | 'failed' | 'bailed' | 'suspended' | 'paused';
+
+/**
+ * The non-failed top-level outcomes the ladder intercepts and discharges ([ADR 0017], W0 amendment
+ * 1, intercept mode): each lands in `wf.comp.exit.<kind>` and `discharge_j.<kind>` moves it, with
+ * `level.j`, into `wf.settle.<kind>` (`done` into the success settle place) or, for `canceled`, into
+ * `wf.canceled`.
+ */
+export type DischargeKind = 'done' | 'bailed' | 'suspended' | 'paused' | 'canceled';
+
+/**
+ * The compensation ladder as the verifier, the seeds and the runner see it ([ADR 0017], amended by
+ * the W0 spike): its places and transitions, by name, as `compiler/blueprints/compensate.ts`
+ * emitted them, so `verify/compensate.ts` can check them on the arcs (S1–S8), `verify/properties.ts`
+ * can name C1–C4 and seed `level.a`, and the kernel can seed and rebuild the stack — declared by the
+ * blueprint, never derived from the arcs the check inspects.
+ *
+ * Top-level entries `0..n-1`, compensated entries `k_1 < … < k_m`, `m ≥ 1`. Every place is
+ * 1-bounded. No ladder transition has an arc on `wf.cancel` (S5) or carries an inhibitor, so under
+ * [VER-004] the only split stays `t.cancel.arrive`; a cancel is decided only at the existing
+ * `wf.settle.*` pairs, after a rollback ([ADR 0004], maintainer decision 3).
+ *
+ * ```text
+ * t.comp.{j}.arm               arming_j + level.{j-1}  -> successor(k_j) + level.j     (push out(k_j))
+ * t.comp.raise                 failure                 -> fault + pending
+ * t.comp.{j}.start             pending + level.j       -> u_j.in {top} + undoing_j {rest of the stack}
+ * t.comp.{j}.settle.{kind}     u_j.<kind> + undoing_j  -> level.{j-1} + pending   (five kinds)
+ * t.comp.finish                pending + level.0 + fault -> wf.settle.failed      (the held token)
+ * t.comp.{j}.discharge.{kind}  exit.<kind> + level.j   -> wf.settle.<kind>        (done -> settleDone)
+ * t.comp.{j}.discharge.canceled  exit.canceled + level.j -> wf.canceled
+ * ```
+ *
+ * `discharge_j.*` is emitted for every level `j = 0..m`. Every top-level `exits.failed` is
+ * `wf.comp.failure`, every other top-level exit — every top-level, checkpoint and foreach sweep
+ * included — the matching `wf.comp.exit.*`, so `wf.canceled` is produced only by the settle pairs
+ * and `discharge_j.canceled`, and nothing in the ladder consumes, resets, inhibits or reads a
+ * terminal (S6).
+ */
+export interface CompensationSite {
+  /** The number of compensated entries, `m ≥ 1`. */
+  readonly m: number;
+  /** `wf.comp.level.0..m`: one token while the run is live, carrying the stack `[out(k_1) … out(k_j)]`. */
+  readonly levels: readonly string[];
+  /** `wf.comp.failure`: every top-level entry's `exits.failed`. `raise` is its only consumer (S2). */
+  readonly failure: string;
+  /** `wf.comp.fault`: the held original `FailureToken`, from `raise` to `finish`. */
+  readonly fault: string;
+  /** `wf.comp.pending`: a rollback is under way. */
+  readonly pending: string;
+  /** `t.comp.raise`. */
+  readonly raise: string;
+  /** `t.comp.finish`: the only producer of `wf.settle.failed` (S4). */
+  readonly finish: string;
+  /** `wf.comp.exit.<kind>`: the intercepted non-failed top-level exits. */
+  readonly exits: Readonly<Record<DischargeKind, string>>;
+  /** `discharges[j][kind]` = `t.comp.{j}.discharge.{kind}`, for `j` in `0..m`. */
+  readonly discharges: readonly Readonly<Record<DischargeKind, string>>[];
+  /** `compensators[j - 1]` is `u_j`, in ascending `k`. */
+  readonly compensators: readonly CompensatorSite[];
+}
+
+/**
+ * One rung of a {@link CompensationSite}: compensated entry `k_j` and its compensator `u_j`. Every
+ * field but the numbers and ids is a name.
+ *
+ * `u_j` is emitted at path `[n + j - 1]` (W0 amendment 5) — `s.<n+j-1>.<id>.*` / `t.<n+j-1>.<id>.*`,
+ * past every top-level interior, so the barrier family is unchanged — with view path `[k]`, no cancel
+ * signal and `NestedOptions.detached`.
+ */
+export interface CompensatorSite {
+  /** The rung, `1..m`. */
+  readonly j: number;
+  /** The compensated entry's top-level index, `k_j`. */
+  readonly k: number;
+  /** The compensated (forward) step's id: whose stored output rebuilds this rung of the stack. */
+  readonly forwardId: string;
+  /** The compensator's step id. */
+  readonly stepId: string;
+  /** The compensator's naming path, `[n + j - 1]`. */
+  readonly path: EntryPath;
+  /** The compensator's view path, `[k]`: what its events and records carry as `executionPath`. */
+  readonly viewPath: EntryPath;
+  /** `wf.comp.{j}.arming`: entry `k_j`'s success; its only producer is that entry (S1). */
+  readonly arming: string;
+  /** `t.comp.{j}.arm`. */
+  readonly arm: string;
+  /** `t.comp.{j}.start`: the only producer of {@link inPlace} and {@link undoing} (S3). */
+  readonly start: string;
+  /** The compensator leaf's input place. */
+  readonly inPlace: string;
+  /** `wf.comp.{j}.undoing`: the rest of the stack while `u_j` runs (W0 amendment 2). */
+  readonly undoing: string;
+  /** The compensator leaf's exits by kind. */
+  readonly exits: Readonly<Record<CompensatorExitKind, string>>;
+  /** `t.comp.{j}.settle.{kind}`, each the only consumer of its exit (S3). */
+  readonly settles: Readonly<Record<CompensatorExitKind, string>>;
+  /** The compensator's step attempts, retries included: exempt from suspension coverage (S7). */
+  readonly attempts: readonly string[];
 }

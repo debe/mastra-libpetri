@@ -1,6 +1,7 @@
 import type { Place, Transition } from 'libpetri';
 import type { CompiledWorkflow } from '../compiler/types.js';
 import { pipelineLaneAttempts } from './pipeline.js';
+import { compensatorAttempts } from './compensate.js';
 
 /**
  * Checks, from the arcs alone, the cancellation invariants no verified property can see.
@@ -106,15 +107,17 @@ const describeTiming = (t: Transition): string => {
  *    the net map records for the entry at that path.
  * 6. **A sweep goes where the fresh entry's sweep goes**: every output place of a site's sweep is
  *    the enclosing canceled exit — for every site, since every site is at a top-level entry's path
- *    (`[i]` or `[i, a]`), that is the top-level exit `compile` wires to `wf.canceled` — and it has
- *    at least one. A sweep re-routed to `wf.done` still drains to exactly one terminal and never
+ *    (`[i]` or `[i, a]`), that is the top-level exit `compile` wires to `wf.canceled`, or to
+ *    `wf.comp.exit.canceled` under a compensation ladder ([ADR 0017]) — and it has at least one. A sweep re-routed to `wf.done` still drains to exactly one terminal and never
  *    marks `wf.canceled` where no cancel arrives, so every proof stays proven; only this sees it.
  *
  * Returns one line per violation; empty means sound, and is empty for a workflow with no sites.
  */
 export function resumeGateViolations(compiled: CompiledWorkflow): readonly string[] {
   const cancel = compiled.cancel.name;
-  const canceled = compiled.terminals.canceled.name;
+  // With a compensation ladder ([ADR 0017], intercept mode) the top-level canceled exit is
+  // `wf.comp.exit.canceled`, which `discharge_j.canceled` moves into `wf.canceled`.
+  const canceled = compiled.compensations?.exits.canceled ?? compiled.terminals.canceled.name;
   const out: string[] = [];
   const transitions = [...compiled.net.transitions];
   const placeNames = new Set([...compiled.net.places].map((p) => p.name));
@@ -190,11 +193,16 @@ export function resumeGateViolations(compiled: CompiledWorkflow): readonly strin
  * `pipelineStructureViolations` rule 7 holds each lane's suspended exit to its own settle or drop,
  * and every outcome of a lane attempt to its lane's exits or its own chain, so a suspension that
  * escaped the pipeline would fail there.
+ *
+ * **Exempt: every compensator's attempts** ({@link compensatorAttempts}, [ADR 0017], S7). A
+ * compensator that suspends is unresolved — its settle returns the level and the rollback goes on —
+ * and no resume site is registered for it. They are not unchecked: `compensateStructureViolations`
+ * S3 and S7 hold each compensator exit to its own settle.
  */
 export function suspensionCoverageViolations(compiled: CompiledWorkflow): readonly string[] {
   const out: string[] = [];
   const reported = new Set<string>();
-  const exempt = new Set([...decidingArmAttempts(compiled), ...pipelineLaneAttempts(compiled)]);
+  const exempt = new Set([...decidingArmAttempts(compiled), ...pipelineLaneAttempts(compiled), ...compensatorAttempts(compiled)]);
   for (const name of compiled.stepAttempts) {
     if (exempt.has(name)) continue;
     const entry = compiled.netMap.transitionToEntry.get(name);
@@ -324,7 +332,8 @@ const checkpointSweepName = (index: number): string => `t.${index}.checkpoint-ca
  * 2. it consumes exactly one place, the checkpoint place, and its only output is entry `i + 1`'s
  *    boundary — the write sits on the success path between the two entries and nowhere else;
  * 3. its **sweep** `t.<i>.checkpoint-cancel` exists, reads `wf.cancel`, consumes the same place, and
- *    its only output is `wf.canceled` — the run ends unwritten, as every other sweep does
+ *    its only output is `wf.canceled`, or `wf.comp.exit.canceled` under a compensation ladder
+ *    ([ADR 0017]) — the run ends unwritten, as every other sweep does
  *    (`resumeGateViolations`, rule 6). Not entry `i + 1`'s boundary, as ADR 0010 first drew it: a
  *    sweep leading back into work kept the cancel signal live downstream, and liveness witnesses went
  *    from ~100 ms to `unknown` at 30 s (`gadgets/checkpoint.ts`). A sweep re-routed to `wf.done` still
@@ -405,7 +414,8 @@ export function checkpointStructureViolations(compiled: CompiledWorkflow): reado
       if (!readsPlace(sweep, cancel)) out.push(`sweep '${sweep.name}' does not read '${cancel}'`);
       const swept = sweep.inputSpecs.map((spec) => spec.place.name);
       if (swept.length !== 1 || swept[0] !== at) out.push(`sweep '${sweep.name}' consumes [${swept.join(', ')}]; it consumes exactly '${at}', as its checkpoint does`);
-      const canceled = compiled.terminals.canceled.name;
+      // [ADR 0017]: with a ladder, a checkpoint sweep is intercepted like every top-level one.
+      const canceled = compiled.compensations?.exits.canceled ?? compiled.terminals.canceled.name;
       const so = outputs(sweep);
       if (so.length === 0 || !so.every((p) => p === canceled)) out.push(`sweep '${sweep.name}' outputs into [${so.join(', ')}]; its only output is '${canceled}'`);
     }

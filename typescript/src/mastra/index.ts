@@ -27,6 +27,7 @@ export type {
   PetriRateLimit,
   PetriStep,
   PetriStepResources,
+  Undoable,
   PetriWorkflow,
 } from './init.js';
 export { Quota } from './resources.js';
@@ -44,12 +45,13 @@ export {
   adaptStepFlow,
   adaptExecutionGraph,
   BLUEPRINT_REFUSALS,
+  COMPENSATE_REFUSALS,
   LAYER2_METADATA_KEYS,
   MASTRA_BRANCH_ENTRY_TYPE,
   MASTRA_WORKFLOW_COMPONENT,
   UnsupportedWorkflowError,
 } from './adapt.js';
-export type { AdaptOptions, BlueprintRefusal, Layer2MetadataKey } from './adapt.js';
+export type { AdaptOptions, BlueprintRefusal, CompensateRefusal, Layer2MetadataKey } from './adapt.js';
 export { isMastraWorkflow, nestedWorkflows, verifyMastraWorkflow, workflowsIn } from './verify.js';
 export type { MastraVerification, MastraVerifyOptions, VerifiableWorkflow } from './verify.js';
 export { entryId, suspendTracingContext } from './host.js';
