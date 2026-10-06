@@ -17,6 +17,7 @@
 | [0013](0013-step-timeout.md) | A step timeout is a timed-out output branch, raced inside the attempt on the run's clock | accepted |
 | [0014](0014-race-and-quorum.md) | `race` and `quorum(k)` are a counted decision on a `.parallel()`, and every loser is aborted and waited for | accepted |
 | [0015](0015-pipeline.md) | `pipeline()` compiles a `.foreach()` over a chain of stages into the parent net, one bound per stage, items handed lane to lane | accepted |
+| [0016](0016-supersede.md) | `supersede()` is deferred: one Mastra run has no new input to supersede; a speculative latest-wins block is designed, measured and kept on file | deferred |
 
 Each ADR has Context / Decision / Consequences / Evidence; Evidence names the test that pins the
 behaviour it rests on. Amendments are recorded in the existing ADR, tagged with the milestone

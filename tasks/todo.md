@@ -726,7 +726,8 @@
   - [ ] M8 note: a petri child under a default-engine parent does not write the parent's state in
         place without a body `stateSchema`, where a default-engine child does (`workflow.ts:3646-3648`);
         not reachable through `pipeline()` (the minted body carries the schema), a nested-workflow row
-- [ ] Second wave, after `pipeline()`: `supersede()`, `compensate()`, `circuitBreaker()`,
+- [x] `supersede()`: deferred to M8 (ADR 0016, decision 1 A, 2026-10-06); designs D1, S2, D2 on file
+- [ ] Second wave, after `pipeline()`: `compensate()`, `circuitBreaker()`,
       `queue(depth)`, `correlate(key)`
 - [ ] Each blueprint ships with its property: `limit` with `placeBound`, `circuitBreaker` with
       reachability of the open state, `correlate` with `joinedOrDeadLettered`. A blueprint
@@ -735,6 +736,10 @@
       `limit` inside `pipeline` is a bounded pipeline, and neither needs special-casing
 
 ## M8 — Agents, tools and networks
+- [ ] `supersede()` (`docs/adr/0016-supersede.md`): needs an input channel into a running run, which Mastra's
+      workflows lack and its agent layer has (`sendSignal`). Start from D2's contract sketch (an
+      acknowledged closed union decided by a transition firing) or D1 (the speculative
+      poll/render block, measured at 77 / 262 classes); decisions 2–6 open
 - [ ] `{type:'agent'}` / `{type:'tool'}` entries: tool-call dispatch is a round in the net
       (`dispatch / collect / resume` with a `rounds` budget place), not a host loop; multi-agent
       networks compose as subnets over shared places; audit `agent/durable/` and `harness/`
