@@ -757,7 +757,16 @@
         `properties.ts` and `ladderLevel` in `segmentInitialMarking` (claims); the kernel's
         seeds (host); the compensator leaf's `exits.canceled` (no signal, so no producer — S8 must
         not flag it) (net)
-  - [ ] W1 net / claims / host / surface; W2 integration; W3 acceptance — per the ADR's Plan
+  - [x] W1 net / claims / host / surface (merged `62ed4c9`), each reviewed with mutants and fixed:
+        S1 confines successor(k_j) to `arm_j`, S6 the settle producers; a compensator's deadline
+        survives a run cancel (`armDeadline(…, { detached })`); agent and tool forward steps
+        resolve their compensator; `cloneStep(step, { id, compensate })`. Two clause mutants are
+        equivalent (N8, N14)
+  - [ ] W2 integration (`tests/engine/compensate.test.ts`, `compensate-next.test.ts`,
+        `tests/verify/compensate-blueprints.test.ts`); also pin that a forward step's deadline is
+        disarmed by a run abort (mutant N2, `detached` for every step, survives); a restart over
+        an unrebuildable stack reports `no-position` (a dedicated reason is open)
+  - [ ] W3 acceptance per the ADR's Plan
   - [ ] Later wave: compensation of parallel and branch arms, foreach and pipeline items
 - [ ] Second wave, after `pipeline()`: `circuitBreaker()`,
       `queue(depth)`, `correlate(key)`
